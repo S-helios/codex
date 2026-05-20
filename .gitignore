@@ -33,6 +33,8 @@ result
 CLAUDE.md
 .claude/
 AGENTS.override.md
+# learn fork: track the root CLAUDE.md as the AI entry-point for annotation tasks
+!/CLAUDE.md
 
 # caches
 .cache/

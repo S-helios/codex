@@ -1,3 +1,31 @@
+//! Codex 单次 Turn 的执行核心 —— 真正的 agent loop 所在。
+//!
+//! 【文件职责】
+//!   1. `run_turn`：单次 Turn 的入口与外层循环（pre-compact → skills/plugins
+//!      注入 → 多次 sampling + 工具执行 → stop hooks → 收尾）；
+//!   2. `run_sampling_request` / `try_run_sampling_request`：内层 sampling 主
+//!      体，处理流式响应、并发工具调用、断流重试、context-window 超限；
+//!   3. plan-mode 流式状态机：`AssistantMessageStreamParsers` /
+//!      `PlanModeStreamState` / `ProposedPlanItemState`；
+//!   4. 自动压缩三件套：`auto_compact_token_status` /
+//!      `run_pre_sampling_compact` / `run_auto_compact`；
+//!   5. ToolRouter 构造：`built_tools`。
+//!
+//! 【外层 vs 内层】
+//! ```text
+//! run_turn (本文件)                ← 外层：Turn 级编排
+//!   loop {
+//!     run_sampling_request          ← 内层：sampling + 重试
+//!       try_run_sampling_request    ← 真正消费流式事件 + 派发工具调用
+//!     }
+//!     根据结果：压缩 / 继续 / stop hook / 收尾
+//!   }
+//! ```
+//!
+//! 【阅读建议】先看 `run_turn` 主框架，再跳到 `run_sampling_request` 看重试
+//! 策略，最后读 `try_run_sampling_request` 中的 `match event` 大块，那里覆
+//! 盖了所有流式事件类型。Plan mode 相关代码可在第一遍阅读时跳过。
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -128,6 +156,17 @@ use tracing::warn;
 /// - If the model sends only an assistant message, we record it in the
 ///   conversation history and consider the turn complete.
 ///
+/// 单次 Turn 的入口：把用户输入投递给模型，然后循环 sampling 直至 Turn 结束。
+///
+/// 每轮 sampling 模型会返回二者之一：
+///   1. 工具调用请求 → 执行后把结果送回模型，进入下一轮 sampling；
+///   2. assistant 消息 → 记录到历史，Turn 视为结束（除非 stop hook 强制继续）。
+///
+/// 理论上单次 sampling 可返回多种 item，实践中通常每次只返回一种。
+///
+/// 副作用：往 session 追加消息历史、发各种事件、刷 token 用量、可能触发自动
+///   压缩、可能触发 hooks 链。
+/// 返回：最后一条 assistant 消息文本（None 表示 Turn 被中断或失败）。
 pub(crate) async fn run_turn(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -136,8 +175,13 @@ pub(crate) async fn run_turn(
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
 ) -> Option<String> {
+    // `ModelClientSession` 是 Turn 级生命周期：复用同一个 client session 跨越
+    // 本 Turn 内所有 sampling / 重试，以共享 WebSocket + sticky routing。
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    // ── Step 1：Turn 前的预压缩 ───────────────────────────────────────
+    // 预压缩在「context updates + 新用户消息记录之前」执行，因此 TODO 提示
+    // 需要把这两项的预估 token 也算进来判断是否提前触发压缩。
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
@@ -450,6 +494,20 @@ pub(crate) async fn run_turn(
     last_agent_message
 }
 
+/// 解析用户输入中的 skill / plugin / connector 提及，构造对应的「Turn 范围注入项」。
+///
+/// 流程：
+///   1. 列出已启用插件 + 用户消息里 `plugin://` 显式提及；
+///   2. 必要时拉 MCP 工具清单（仅当 apps_enabled 或有 plugin 提及）；
+///   3. 计算可用 connectors；构 skill name / connector slug 映射；
+///   4. 解析显式 skill 提及，必要时弹出 MCP 依赖安装提示；
+///   5. 构造 skill 注入项 + 转 ContextualUserFragment；
+///   6. 构造 plugin 注入项；
+///   7. 收集 explicitly_enabled connectors（供后续 merge_connector_selection）；
+///   8. 埋点（app mentioned / plugin used）。
+///
+/// 返回 (注入项列表, 显式启用的 connector id 集合)；任一关键步骤被 cancel
+/// 都会返回 None，外层应早退。
 #[expect(
     clippy::await_holding_invalid_type,
     reason = "MCP tool listing borrows the read guard across cancellation-aware await"
@@ -638,6 +696,14 @@ struct PreSamplingCompactResult {
     reset_client_session: bool,
 }
 
+/// 自动压缩判断需要的 token 状态快照。两套数字共存：
+///   - active_context_tokens：当前活跃上下文总用量（与 scope 无关）；
+///   - auto_compact_scope_tokens：按 `model_auto_compact_token_limit_scope`
+///     折算后参与限额比较的那部分用量。
+/// 两种 scope：
+///   - `Total`             → 总量直接对比模型 auto_compact 限额；
+///   - `BodyAfterPrefix`   → 减去 prefill 基线后再对比，避免长 system 前缀
+///                            把限额吃光。
 #[derive(Debug)]
 struct AutoCompactTokenStatus {
     // Full active context usage, independent of the configured auto-compact scope.
@@ -704,6 +770,10 @@ async fn auto_compact_token_status(
     }
 }
 
+/// Turn 开始前的自动压缩入口：
+///   1. 若上一轮用了更大窗口模型，先用旧模型 inline 压一次（避免直接超限）；
+///   2. 若当前 scope 限额或可用 context window 已耗尽，再压一次。
+/// 任一步真正执行了压缩都需要重置 WebSocket session（缓存的 prefix 失效）。
 async fn run_pre_sampling_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -737,6 +807,17 @@ async fn run_pre_sampling_compact(
 /// Returns `Ok(true)` when compaction ran successfully, `Ok(false)` when compaction was skipped
 /// because the model/context-window preconditions were not met, and `Err(_)` only when compaction
 /// was attempted and failed.
+/// 切换到更小窗口模型时，用「上一轮模型」预先做一次 inline 压缩。
+///
+/// 触发条件需同时满足：
+///   - 上一轮和当前 turn 用不同 model；
+///   - 当前模型的窗口比上一轮的小；
+///   - 当前用量在新模型上已超限。
+/// 用「旧模型」做压缩是因为旧模型的窗口能容下未压缩内容；若直接用新模型，
+/// 压缩请求本身就会超限。
+///
+/// 返回：`Ok(true)` 实际压缩了，`Ok(false)` 跳过（前置条件不满足），
+/// `Err(_)` 仅在压缩尝试失败时返回。
 async fn maybe_run_previous_model_inline_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -790,6 +871,14 @@ async fn maybe_run_previous_model_inline_compact(
     Ok(false)
 }
 
+/// 真正执行一次自动压缩。
+///
+/// 三条路径：
+///   1. provider 支持远端压缩 + Feature::RemoteCompactionV2 → v2 远端；
+///   2. provider 支持远端压缩 → v1 远端；
+///   3. 否则在本地 inline 跑。
+/// v2 远端返回 `Ok(false)`（不需要 reset client session），其余路径返回
+/// `Ok(true)` 表示压缩流程改写了 prefix，需要外层重置 WebSocket。
 async fn run_auto_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -902,6 +991,17 @@ pub(crate) fn build_prompt(
     }
 }
 
+/// 单次 sampling 请求的「外层」：负责构造 ToolRouter、组装 Prompt、调用
+/// `try_run_sampling_request`，并实现自动重试 / WebSocket→HTTPS 降级。
+///
+/// 重试策略：
+///   - 不可重试错误（`ContextWindowExceeded`、`UsageLimitReached`、其他非 retryable）
+///     直接返回；
+///   - 超出 `stream_max_retries` 时尝试切换到 HTTPS 回退传输（若可切），切了
+///     重置 retries=0 重新计数；
+///   - 退避时间优先用错误自带的 `requested_delay`，否则用 `backoff(retries)`；
+///   - debug 构建或首次以外的重试会通过 `notify_stream_error` 通知前端，避免
+///     UI 看起来卡死。
 #[allow(clippy::too_many_arguments)]
 #[allow(deprecated)]
 #[instrument(level = "trace",
@@ -1045,6 +1145,16 @@ async fn run_sampling_request(
     }
 }
 
+/// 为本次 sampling 组装 `ToolRouter`：把 MCP 工具、connector、可发现工具、
+/// extension 工具、dynamic 工具汇总成模型可见的工具列表。
+///
+/// 关键步骤：
+///   1. 读 MCP 工具清单（带 cancel 感知，guard drop 后再继续）；
+///   2. 拉本 Turn 应用的 plugins；
+///   3. 计算 apps 是否启用 → 决定要不要带 connector；
+///   4. 若 tool_suggest 启用，按 connector + client 名过滤出可发现工具；
+///   5. 构 MCP 工具暴露（决定哪些是直连、哪些走 deferred 暴露层）；
+///   6. 用 turn_context + 上述参数构造 `ToolRouter::from_turn_context`。
 #[expect(
     clippy::await_holding_invalid_type,
     reason = "tool router construction reads through the session-owned manager guard"
@@ -1149,6 +1259,9 @@ struct SamplingRequestResult {
 /// only exists while a response is actively streaming. The final plan text
 /// is extracted from the completed assistant message.
 /// Tracks a single proposed plan item across a streaming response.
+/// 单次响应内、单个 proposed plan item 的瞬时状态。
+/// 故意不持久化也不进 session/state —— 它只在「响应正在流式接收」期间存在。
+/// 最终 plan 文本由结束后的 assistant 消息提取，本 state 只追踪生命周期。
 struct ProposedPlanItemState {
     item_id: String,
     started: bool,
@@ -1157,6 +1270,11 @@ struct ProposedPlanItemState {
 
 /// Aggregated state used only while streaming a plan-mode response.
 /// Includes per-item parsers, deferred agent message bookkeeping, and the plan item lifecycle.
+/// Plan 模式下流式响应期间的聚合状态：每个 item 的 parser、延迟开始的
+/// agent message 记账、plan item 生命周期跟踪。
+///
+/// 「延迟开始」机制：plan 模式下，agent message 在能确认出现非 plan 文本前
+/// 不发 ItemStarted 事件，避免「全是 plan 的输出」被前端误显示为空 assistant。
 struct PlanModeStreamState {
     /// Agent message items started by the model but deferred until we see non-plan text.
     pending_agent_message_items: HashMap<String, TurnItem>,
@@ -1701,6 +1819,23 @@ async fn drain_in_flight(
     Ok(())
 }
 
+/// sampling 内核：拉起到模型的流，循环消费 `ResponseEvent`，期间并发派发
+/// 工具调用、按 item 类型发各种 turn item 事件、累计 token / rate-limit /
+/// turn-diff 信息，最后在 `Completed` 上 break 返回。
+///
+/// 关键事件类型：
+///   - `Created`            ：流建立，无副作用；
+///   - `OutputItemAdded`    ：模型开始输出一个 item，必要时发 ItemStarted；
+///   - `OutputItemDone`     ：item 完整收到，路由到 `handle_output_item_done`
+///                            做内容落库 + 派发工具调用 future；
+///   - `OutputTextDelta` / `Reasoning*Delta`：流式文本片段；
+///   - `Completed`          ：流结束，触发 turn diff / token count 事件并 break；
+///   - `RateLimits`         ：记录但延后发 TokenCount 直到 Completed；
+///   - `ServerModel` / `ModelVerifications`：一次性警告（用 AtomicBool 幂等）。
+///
+/// 取消语义：外层 cancellation_token 触发时，会在下一次 `stream.next()` 等
+/// 待点立刻退出并返回 `CodexErr::TurnAborted`，已经派发但未完成的工具
+/// future 会在 `drain_in_flight` 中等结果。
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace",
     skip_all,
@@ -2189,6 +2324,8 @@ async fn try_run_sampling_request(
     outcome
 }
 
+/// 从一组 ResponseItem 倒序找出最后一条 assistant 消息文本（非 plan 模式）。
+/// 用于 Turn 结束时把 last_agent_message 返回给上层。
 pub(crate) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -> Option<String> {
     for item in responses.iter().rev() {
         if let Some(message) = last_assistant_message_from_item(item, /*plan_mode*/ false) {

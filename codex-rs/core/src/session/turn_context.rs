@@ -1,3 +1,19 @@
+//! 单次 Turn 的上下文构造逻辑（属于 `session` 模块的子文件，使用 `super::*`）。
+//!
+//! 【文件职责】
+//! 1. 定义 `TurnContext` — 一次 Turn 需要的所有「静态配置」+「运行期句柄」的集合体；
+//! 2. 提供 Session 上的构造方法：`make_turn_context` / `new_turn_with_sub_id`
+//!    / `new_turn_from_configuration` / `new_default_turn`；
+//! 3. 配套两个轻量内嵌类型：`TurnSkillsContext`（Skill 装载结果）、
+//!    `TurnEnvironment`（执行环境选择）。
+//!
+//! 【架构位置】Session（session/mod.rs）创建 → TurnContext → 交给 Turn（turn.rs）消费。
+//! 一个 Session 可串行产生多个 TurnContext；每个 TurnContext 在创建后是不可变的。
+//!
+//! 【阅读建议】先看 `TurnContext` 字段定义，再看 `make_turn_context`（一次性
+//! 初始化所有字段），最后看 `new_turn_with_sub_id`（响应 SettingsUpdate 后
+//! 派生新的 TurnContext）。
+
 use super::*;
 use crate::SkillLoadOutcome;
 use crate::config::GhostSnapshotConfig;
@@ -14,6 +30,12 @@ use codex_sandboxing::policy_transforms::effective_network_sandbox_policy;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+// ═══════════════════════════════════════════════════════════════
+// TurnSkillsContext  ·  本轮的 Skill 装载结果
+// ═══════════════════════════════════════════════════════════════
+
+/// 当前 Turn 可用的 Skill 集合 + 「已隐式调用过的 skill 集合」去重表。
+/// 后者用于「同一 Turn 内同名 skill 只隐式触发一次」的策略。
 #[derive(Clone, Debug)]
 pub(crate) struct TurnSkillsContext {
     pub(crate) outcome: Arc<SkillLoadOutcome>,
@@ -29,6 +51,13 @@ impl TurnSkillsContext {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// TurnEnvironment  ·  本轮选中的执行环境
+// ═══════════════════════════════════════════════════════════════
+
+/// 一次 Turn 选中的「执行环境」描述（cwd + 可选 shell + 关联 Environment 实例）。
+/// `environment_id` 通常对应 config 中定义的环境名，相同 id 在 fork / resume
+/// 时用来定位同一个 Environment。
 #[derive(Clone, Debug)]
 pub(crate) struct TurnEnvironment {
     pub(crate) environment_id: String,
@@ -38,6 +67,7 @@ pub(crate) struct TurnEnvironment {
 }
 
 impl TurnEnvironment {
+    /// 投影为协议层的 `TurnEnvironmentSelection`（只含外部需要的字段：id + cwd）。
     pub(crate) fn selection(&self) -> TurnEnvironmentSelection {
         TurnEnvironmentSelection {
             environment_id: self.environment_id.clone(),
@@ -46,7 +76,20 @@ impl TurnEnvironment {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// TurnContext  ·  单次 Turn 的「执行上下文」
+// ═══════════════════════════════════════════════════════════════
+
 /// The context needed for a single turn of the thread.
+/// 单次 Turn 所需的「执行上下文」。
+///
+/// 创建后字段基本不可变（除 `realtime_active` 和两个 `AtomicBool` 标志）。
+/// 装在 `Arc<TurnContext>` 里在 Session / Turn / 工具调用之间共享。
+///
+/// 关键设计：
+/// - `cwd` 字段已 `#[deprecated]`：新代码应通过选中的 `TurnEnvironment` 拿
+///   cwd（一个 Turn 可能涉及多个环境）。保留是为了过渡期的兼容性。
+/// - `*_emitted` 是 `AtomicBool`：用于幂等地发送一次性警告（不锁、并发安全）。
 #[derive(Debug)]
 pub struct TurnContext {
     pub(crate) sub_id: String,
@@ -65,6 +108,10 @@ pub struct TurnContext {
     /// The session's absolute working directory. All relative paths provided
     /// by the model as well as sandbox policies are resolved against this path
     /// instead of `std::env::current_dir()`.
+    /// 会话的绝对工作目录。模型给出的相对路径和沙箱策略都以此为基准而非
+    /// `std::env::current_dir()`。
+    ///
+    /// 已废弃：新代码应通过 `environments` 中选中的 turn environment 拿 cwd。
     #[deprecated(note = "use the selected turn environment cwd instead")]
     pub(crate) cwd: AbsolutePathBuf,
     pub(crate) current_date: Option<String>,
@@ -94,10 +141,16 @@ pub struct TurnContext {
     pub(crate) extension_data: Arc<codex_extension_api::ExtensionData>,
     pub(crate) turn_skills: TurnSkillsContext,
     pub(crate) turn_timing_state: Arc<TurnTimingState>,
+    /// 「服务器返回未知 model」警告是否已发出。原子布尔保证仅发一次。
     pub(crate) server_model_warning_emitted: AtomicBool,
+    /// 「model verification」警告是否已发出。原子布尔保证仅发一次。
     pub(crate) model_verification_emitted: AtomicBool,
 }
 impl TurnContext {
+    // ───────────────────────────────────────────────────────────────
+    // 权限 / 沙箱策略派生
+    // ───────────────────────────────────────────────────────────────
+
     pub(crate) fn permission_profile(&self) -> PermissionProfile {
         self.permission_profile.clone()
     }
@@ -110,6 +163,8 @@ impl TurnContext {
         self.permission_profile.network_sandbox_policy()
     }
 
+    /// 合并文件系统 + 网络策略 + cwd 推导出兼容旧版的统一 `SandboxPolicy`。
+    /// 上层有的代码路径只认旧版统一类型，这里做桥接。
     pub(crate) fn sandbox_policy(&self) -> SandboxPolicy {
         let file_system_sandbox_policy = self.file_system_sandbox_policy();
         let network_sandbox_policy = self.network_sandbox_policy();
@@ -122,6 +177,14 @@ impl TurnContext {
         )
     }
 
+    // ───────────────────────────────────────────────────────────────
+    // Reasoning / Context window 派生
+    // ───────────────────────────────────────────────────────────────
+
+    /// 计算「实际生效」的 reasoning effort：
+    /// 1. 当前模型不支持 reasoning summaries → 一律返回 None；
+    /// 2. 显式配置存在 → 用配置值；
+    /// 3. 否则回退到 model_info.default_reasoning_level。
     pub(crate) fn effective_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
         if self.model_info.supports_reasoning_summaries {
             self.reasoning_effort
@@ -131,12 +194,17 @@ impl TurnContext {
         }
     }
 
+    /// trace 友好字符串：None 时显示为 "default"，方便链路追踪日志阅读。
     pub(crate) fn effective_reasoning_effort_for_tracing(&self) -> String {
         self.effective_reasoning_effort()
             .map(|effort| effort.to_string())
             .unwrap_or_else(|| "default".to_string())
     }
 
+    /// 计算「实际可用」的 context window 大小（token 数）。
+    /// 模型实际窗口 × `effective_context_window_percent` / 100 —— 后者用于
+    /// 给响应留余量（如配 80 即模型 128K 窗口实际只用 102K，留 26K 给输出）。
+    /// `saturating_mul` 防止超大模型上乘法溢出。
     pub(crate) fn model_context_window(&self) -> Option<i64> {
         let effective_context_window_percent = self.model_info.effective_context_window_percent;
         self.model_info
@@ -146,6 +214,7 @@ impl TurnContext {
             })
     }
 
+    /// Apps 功能是否启用：依赖「认证后端是否使用 codex backend」+ feature flag。
     pub(crate) fn apps_enabled(&self) -> bool {
         let uses_codex_backend = self
             .auth_manager
@@ -158,10 +227,22 @@ impl TurnContext {
         ToolEnvironmentMode::from_count(self.environments.turn_environments.len())
     }
 
+    /// Goal 工具是否启用：需同时满足「模型支持」+「Feature::Goals 启用」。
     pub(crate) fn goal_tools_enabled(&self) -> bool {
         self.goal_tools_supported && self.features.get().enabled(Feature::Goals)
     }
 
+    // ───────────────────────────────────────────────────────────────
+    // TurnContext 派生构造
+    // ───────────────────────────────────────────────────────────────
+
+    /// 从当前 TurnContext 派生出一个新版本，model 字段切换为 `model`。
+    ///
+    /// 关键逻辑：
+    /// - 若旧 reasoning_effort 仍在新模型的支持列表里，保留它；
+    /// - 否则取新模型支持列表的「中间档」（`len / 2` 索引），再退化到默认值；
+    /// - collaboration_mode 会同步用 `with_updates` 合并新的 model / effort，
+    ///   避免单独换模型却忘了同步 collaboration_mode 内部对模型名的引用。
     pub(crate) async fn with_model(
         &self,
         model: String,
@@ -178,6 +259,7 @@ impl TurnContext {
             .iter()
             .map(|preset| preset.effort)
             .collect::<Vec<_>>();
+        // 优先保留旧 effort；否则选中间档（既不冒进也不保守），最后回退到默认。
         let reasoning_effort = if let Some(current_reasoning_effort) = self.reasoning_effort {
             if supported_reasoning_levels.contains(&current_reasoning_effort) {
                 Some(current_reasoning_effort)
@@ -251,6 +333,8 @@ impl TurnContext {
             extension_data: Arc::clone(&self.extension_data),
             turn_skills: self.turn_skills.clone(),
             turn_timing_state: Arc::clone(&self.turn_timing_state),
+            // 警告 emitted 标志要重新读，AtomicBool 不能 Clone：用 Ordering::Relaxed
+            // 在派生场景已足够（无跨线程同步要求，只追求"曾经发过就别再发"）。
             server_model_warning_emitted: AtomicBool::new(
                 self.server_model_warning_emitted.load(Ordering::Relaxed),
             ),
@@ -267,6 +351,12 @@ impl TurnContext {
             .map_or_else(|| self.cwd.clone(), |path| self.cwd.join(path))
     }
 
+    // ───────────────────────────────────────────────────────────────
+    // 文件系统沙箱上下文构造
+    // ───────────────────────────────────────────────────────────────
+
+    /// 构造一次工具调用要用的 `FileSystemSandboxContext`，可叠加
+    /// `additional_permissions`（如用户在审批时临时授予的额外权限）。
     pub(crate) fn file_system_sandbox_context(
         &self,
         additional_permissions: Option<AdditionalPermissionProfile>,
@@ -299,6 +389,10 @@ impl TurnContext {
         }
     }
 
+    /// 仅当「派生策略」与「legacy 策略」不同时才返回 Some。
+    /// 设计意图：兼容期同时存在两个字段（split policy + legacy）的 payload 中，
+    /// 当二者等价时省略 split 字段，让 payload 保持稳定；一旦调用方全切到
+    /// split policy，此函数和 legacy 投影都可删除。
     fn non_legacy_file_system_sandbox_policy(&self) -> Option<FileSystemSandboxPolicy> {
         // Omit the derived split filesystem policy when it is equivalent to
         // the legacy sandbox policy. This keeps turn-context payloads stable
@@ -315,12 +409,16 @@ impl TurnContext {
             .then_some(file_system_sandbox_policy)
     }
 
+    /// 返回 compact（上下文压缩）使用的 prompt：用户自定义优先，否则回退到
+    /// 内置 `compact::SUMMARIZATION_PROMPT`。
     pub(crate) fn compact_prompt(&self) -> &str {
         self.compact_prompt
             .as_deref()
             .unwrap_or(compact::SUMMARIZATION_PROMPT)
     }
 
+    /// 投影为 rollout 持久化用的 `TurnContextItem`。
+    /// 注意：含 `#[allow(deprecated)]` 是因为 rollout schema 还在使用旧 cwd 字段。
     pub(crate) fn to_turn_context_item(&self) -> TurnContextItem {
         TurnContextItem {
             turn_id: Some(self.sub_id.clone()),
@@ -364,6 +462,7 @@ impl TurnContext {
     }
 }
 
+/// 读本机时区；读不到则降级到 UTC，确保日志/上下文里始终有非空时区字段。
 fn local_time_context() -> (String, String) {
     match iana_time_zone::get_timezone() {
         Ok(timezone) => (Local::now().format("%Y-%m-%d").to_string(), timezone),
@@ -374,8 +473,17 @@ fn local_time_context() -> (String, String) {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// impl Session ·  TurnContext 构造与切换
+// ═══════════════════════════════════════════════════════════════
+
 impl Session {
     /// Don't expand the number of mutated arguments on config. We are in the process of getting rid of it.
+    /// 不要再增加传给 Config 的「就地修改」参数 —— 团队正在逐步淘汰这种用法。
+    ///
+    /// 基于 `session_configuration` 构造「单 Turn 配置」：把 session 级配置
+    /// 投影成本次 Turn 真正会用的 Config（cwd / 权限 / reasoning / personality
+    /// / web search mode 等都按 session 配置覆盖）。
     pub(crate) fn build_per_turn_config(
         session_configuration: &SessionConfiguration,
         cwd: AbsolutePathBuf,
@@ -399,6 +507,8 @@ impl Session {
         let permission_profile = session_configuration.permission_profile();
         let resolved_web_search_mode =
             resolve_web_search_mode_for_turn(&per_turn_config.web_search_mode, &permission_profile);
+        // 若 requirements 拒绝当前 web_search_mode，保留 constrained 值而非
+        // 覆盖；只记 warn，不阻断 Turn 启动（避免单一权限策略拖垮整次会话）。
         if let Err(err) = per_turn_config
             .web_search_mode
             .set(resolved_web_search_mode)
@@ -415,6 +525,8 @@ impl Session {
         per_turn_config
     }
 
+    /// 全量构造「有效 session config」：在 per_turn_config 基础上再叠加 model、
+    /// approval_policy、workspace_roots。供「config_changed」通知和初始化使用。
     pub(crate) fn build_effective_session_config(
         session_configuration: &SessionConfiguration,
     ) -> Config {
@@ -429,6 +541,9 @@ impl Session {
         config
     }
 
+    /// TurnContext 的「主构造器」：聚合 thread / session / provider / model /
+    /// environment / shell / skills 等所有依赖，组装出完整的 TurnContext。
+    /// 参数多（21 个）所以加了 `#[allow(clippy::too_many_arguments)]`。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn make_turn_context(
         thread_id: ThreadId,
@@ -462,6 +577,8 @@ impl Session {
         let auth_manager_for_context = auth_manager.clone();
         let provider_for_context = create_model_provider(provider, auth_manager);
         let session_telemetry_for_context = session_telemetry;
+        // try_list_models 只读缓存、不发请求；构造期间不能 await 网络，否则
+        // 启动延迟不可接受 —— 缓存为空时返回空列表是可接受的降级。
         let available_models = models_manager.try_list_models().unwrap_or_default();
         let shell_command_backend =
             shell_command_backend_for_features(per_turn_config.features.get());
@@ -473,6 +590,7 @@ impl Session {
         );
 
         let mut per_turn_config = per_turn_config;
+        // 若模型不支持给定 service_tier，则丢弃该字段（避免发到 API 后被拒）。
         per_turn_config.service_tier = per_turn_config
             .service_tier
             .filter(|service_tier| model_info.supports_service_tier(service_tier));
@@ -537,6 +655,18 @@ impl Session {
         }
     }
 
+    /// 应用一组 `SessionSettingsUpdate`（如用户改了 model / cwd / 权限）后
+    /// 构造下一轮的 TurnContext。
+    ///
+    /// 关键步骤：
+    ///   1. 在 state 锁内 `apply(&updates)` 校验并落地新 SessionConfiguration；
+    ///   2. 计算 effective_environments，必要时把运行期 cwd 覆盖到主环境；
+    ///   3. 资源 resolve（environments / 配置 contributors / 权限 profile 变化）；
+    ///   4. 释放锁；
+    ///   5. 在锁外做副作用：发 ConfigChanged 事件、刷新 shell 快照、刷新代理；
+    ///   6. 调用 `new_turn_from_configuration` 构造 TurnContext。
+    ///
+    /// 校验失败时会发一个 Error 事件给上层（带 BadRequest 标签），再返回 Err。
     pub(crate) async fn new_turn_with_sub_id(
         &self,
         sub_id: String,
@@ -551,6 +681,8 @@ impl Session {
                         .environments
                         .clone()
                         .unwrap_or_else(|| next.environments.clone());
+                    // 调用方未显式提供 environments 时，把运行期 cwd 覆盖到
+                    // 主环境，避免外层 cwd 切换后 environment 还指向旧目录。
                     if updates.environments.is_none() {
                         Self::overlay_runtime_cwd_on_primary_environment(
                             &mut effective_environments,
@@ -567,6 +699,8 @@ impl Session {
                         previous_permission_profile != next_permission_profile;
                     let codex_home = next.codex_home.clone();
                     let session_source = next.session_source.clone();
+                    // 仅当有 config_contributors 注册时才构造 prev/next 快照
+                    // （构造本身有非零开销）。
                     let previous_config = notify_config_contributors.then(|| {
                         Self::build_effective_session_config(&state.session_configuration)
                     });
@@ -600,6 +734,7 @@ impl Session {
         ) = match update_result {
             Ok(update) => update,
             Err(err) => {
+                // 校验失败也要给上层一个事件，确保前端不会卡在 loading 状态。
                 let message = err.to_string();
                 self.send_event_raw(Event {
                     id: sub_id.clone(),
@@ -613,6 +748,7 @@ impl Session {
             }
         };
 
+        // 锁外副作用：通知 contributors、刷新 shell 快照、按需刷新网络代理。
         self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
         self.maybe_refresh_shell_snapshot_for_cwd(
             &previous_cwd,
@@ -646,6 +782,9 @@ impl Session {
         )
     }
 
+    /// 给定一个 `SessionConfiguration`，组装出对应的 TurnContext。
+    /// 步骤：选 primary environment → 构 per_turn_config → 同步 MCP 审批策略
+    /// → 解析模型 / 插件 / 技能 → 调用 `make_turn_context` → spawn git enrichment。
     async fn new_turn_from_configuration(
         &self,
         sub_id: String,
@@ -658,6 +797,7 @@ impl Session {
             .map(|turn_environment| turn_environment.cwd.clone())
             .unwrap_or_else(|| session_configuration.cwd.clone());
         let per_turn_config = Self::build_per_turn_config(&session_configuration, cwd.clone());
+        // 同步 MCP 审批策略给所有已连接的 MCP server（小作用域写锁）。
         {
             let mcp_connection_manager = self.services.mcp_connection_manager.read().await;
             mcp_connection_manager.set_approval_policy(&session_configuration.approval_policy);
@@ -688,6 +828,7 @@ impl Session {
                 .skills_for_config(&skills_input, fs)
                 .await,
         );
+        // Goal 工具仅在「非临时线程」且「有 state_db」时支持（Goal 状态要持久化）。
         let goal_tools_supported = !per_turn_config.ephemeral && self.state_db().is_some();
         let mut turn_context: TurnContext = Self::make_turn_context(
             self.thread_id(),
@@ -702,6 +843,8 @@ impl Session {
             per_turn_config,
             model_info,
             &self.services.models_manager,
+            // 网络代理仅在「权限 profile 允许托管代理」时启用；
+            // 否则即便 proxy 已启动也不挂到本 Turn。
             self.services
                 .network_proxy
                 .as_ref()
@@ -723,10 +866,13 @@ impl Session {
             turn_context.final_output_json_schema = final_schema;
         }
         let turn_context = Arc::new(turn_context);
+        // 异步任务，不阻塞构造：把 cwd 对应的 git 信息（branch、HEAD 等）填到
+        // turn metadata，构造期间 metadata 先以"待补"状态返回。
         turn_context.turn_metadata_state.spawn_git_enrichment_task();
         turn_context
     }
 
+    /// 在 fallback 模式下用了未知 model 时发一次警告事件，提示用户性能可能下降。
     pub(crate) async fn maybe_emit_unknown_model_warning_for_turn(&self, tc: &TurnContext) {
         if tc.model_info.used_fallback_model_metadata {
             self.send_event(
@@ -742,11 +888,15 @@ impl Session {
         }
     }
 
+    /// 使用 session 当前默认配置构造一次新的 TurnContext（不应用任何 update）。
+    /// 内部生成新的 sub_id。
     pub(crate) async fn new_default_turn(&self) -> Arc<TurnContext> {
         self.new_default_turn_with_sub_id(self.next_internal_sub_id())
             .await
     }
 
+    /// `new_default_turn` 的可指定 sub_id 版本，主要用于「不发 settings update
+    /// 但又需要新 TurnContext」的内部代码路径（如消息注入后构造默认 turn）。
     pub(crate) async fn new_default_turn_with_sub_id(&self, sub_id: String) -> Arc<TurnContext> {
         let session_configuration = {
             let state = self.state.lock().await;
@@ -760,6 +910,8 @@ impl Session {
         let turn_environments = match self.resolve_turn_environments(&effective_environments) {
             Ok(turn_environments) => turn_environments,
             Err(err) => {
+                // 解析失败不致命，退化为空 ResolvedTurnEnvironments：
+                // 后续逻辑会用 session_configuration.cwd 兜底。
                 warn!("failed to resolve stored session environments: {err}");
                 ResolvedTurnEnvironments::default()
             }
@@ -774,6 +926,9 @@ impl Session {
         .await
     }
 
+    /// 把运行期 cwd「覆盖」到 environments 列表的主环境上：
+    /// 仅当主环境 cwd 与运行期 cwd 不一致时改写。保证 Turn 启动用的 cwd
+    /// 与 environment 描述一致。
     fn overlay_runtime_cwd_on_primary_environment(
         environments: &mut [TurnEnvironmentSelection],
         runtime_cwd: &AbsolutePathBuf,

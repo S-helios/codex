@@ -1,3 +1,30 @@
+//! Codex Session 模块的顶层文件，承载会话级核心实现与子模块装配。
+//!
+//! 【文件职责】
+//!   1. 定义对外的 `Codex` 句柄 + `CodexSpawn{Args, Ok}`：上层（thread_manager）
+//!      通过 `Codex::spawn` 启动一次会话；
+//!   2. 暴露 `Session` 的全部 impl（大量方法实现于本文件中 870 行起的 `impl Session`
+//!      代码块，约 2400 行）；
+//!   3. 装配子模块：`session`（Session struct + 配置）、`turn`（Turn 主循环）、
+//!      `turn_context`（TurnContext 构造）、`handlers`（submission 派发）、
+//!      `mcp` / `multi_agents` / `review` / `rollout_reconstruction` / `input_queue`。
+//!
+//! 【架构位置】
+//! ```text
+//! ThreadManager
+//!   └─ Codex::spawn (本文件)        ← 启动 Session 主循环
+//!         └─ Session                ← 会话核心状态机
+//!               └─ TurnContext      ← 单次 Turn 上下文
+//!                     └─ run_turn   ← Turn 主循环（session/turn.rs）
+//! ```
+//!
+//! 【阅读建议】
+//!   - 先看 `Codex` / `CodexSpawnArgs` 字段定义，理解会话的外部依赖；
+//!   - 跳到 `Codex::spawn` / `spawn_internal` 看启动流程；
+//!   - `impl Codex` 块（427-826 行）是对外 API：`submit` / `next_event`
+//!     / `shutdown_and_wait`；
+//!   - `impl Session` 块（870 行起）是真正的核心，按 grep 找你关心的方法。
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -224,6 +251,14 @@ use self::turn_context::TurnSkillsContext;
 #[cfg(test)]
 mod rollout_reconstruction_tests;
 
+/// `steer_input` 接口的错误类型。
+///
+/// - `NoActiveTurn`：没有正在运行的 Turn，无法 steer；附带丢失的输入便于
+///   调用方自行排队或重发；
+/// - `ExpectedTurnMismatch`：乐观并发控制失败（指定的 turn_id 已不再活跃）；
+/// - `ActiveTurnNotSteerable`：当前活跃的是 review / compact 这类不可 steer
+///   的特殊 Turn；
+/// - `EmptyInput`：输入为空。
 #[derive(Debug, PartialEq)]
 pub enum SteerInputError {
     NoActiveTurn(Vec<UserInput>),
@@ -269,6 +304,11 @@ impl SteerInputError {
 /// it can carry other prior-turn settings that matter when constructing
 /// sensible state-change diffs or full-context reinjection, such as model
 /// switches or detecting a prior `realtime_active -> false` transition.
+/// 上一次「真正用户 Turn」的设置快照。
+///
+/// 作用相当于旧的 `previous_model` 字段，但能携带更多 prior-turn 设置——
+/// 用于构造合理的状态变更 diff，或检测「上一轮 realtime_active 由 true 变
+/// false」这类需要在新 Turn 启动时做收尾处理的场景。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreviousTurnSettings {
     pub(crate) model: String,
@@ -367,14 +407,19 @@ use codex_utils_stream_parser::ProposedPlanSegment;
 
 /// The high-level interface to the Codex system.
 /// It operates as a queue pair where you send submissions and receive events.
+/// Codex 系统的高层句柄：本质是一对队列——`tx_sub` 投递操作，`rx_event` 收事件。
+///
+/// 它对外是「单条会话」的抽象，被 `CodexThread` 进一步包装后暴露给 app-server。
+/// 持有 `Arc<Session>` 让 thread 句柄、submission loop、各 handler 三方共享
+/// 同一份 Session 状态。
 pub struct Codex {
     pub(crate) tx_sub: Sender<Submission>,
     pub(crate) rx_event: Receiver<Event>,
-    // Last known status of the agent.
+    /// Agent 当前状态的多消费者订阅端（每次状态变化即推送新值）。
     pub(crate) agent_status: watch::Receiver<AgentStatus>,
     pub(crate) session: Arc<Session>,
-    // Shared future for the background submission loop completion so multiple
-    // callers can wait for shutdown.
+    /// 背景 submission loop 完成的共享 Future——多个调用方可同时 await，
+    /// 实现「等会话彻底退出」的语义（用于 shutdown_and_wait）。
     pub(crate) session_loop_termination: SessionLoopTermination,
 }
 
@@ -382,11 +427,24 @@ pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, ()>>;
 
 /// Wrapper returned by [`Codex::spawn`] containing the spawned [`Codex`] and
 /// the unique session id.
+/// `Codex::spawn` 的返回包：Codex 句柄 + 该会话的 ThreadId。
 pub struct CodexSpawnOk {
     pub codex: Codex,
     pub thread_id: ThreadId,
 }
 
+/// `Codex::spawn` 的入参聚合体——避免函数签名爆炸（曾经有 25+ 散参数）。
+///
+/// 字段分四类：
+///   - 配置：`config` / `installation_id` / `dynamic_tools` / `persist_extended_history`
+///   - 依赖管理器：`auth_manager` / `models_manager` / `environment_manager` /
+///     `skills_manager` / `plugins_manager` / `mcp_manager` / `thread_store`
+///   - 会话身份与历史：`conversation_history` / `session_source` / `thread_source`
+///     / `agent_control` / `attestation_provider`
+///   - 跨进程 / 跨会话继承：`inherited_shell_snapshot` / `inherited_exec_policy`
+///     / `parent_rollout_thread_trace` / `parent_trace` / `user_shell_override`
+///     / `environment_selections` / `extensions` / `analytics_events_client` /
+///     `metrics_service_name`。
 pub(crate) struct CodexSpawnArgs {
     pub(crate) config: Config,
     pub(crate) installation_id: String,
@@ -419,13 +477,34 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) attestation_provider: Option<Arc<dyn AttestationProvider>>,
 }
 
+/// 首事件（`SessionConfigured`）使用的特殊 submit id —— 空字符串。
+/// [引用范围] `Codex::spawn` 阶段写入；`thread_manager::finalize_thread_spawn`
+/// 在等首事件时用它做匹配；其他代码不应直接发起带此 id 的提交。
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
+
+/// Session 主循环的 submission 通道容量。
+/// [引用范围] 仅在 `Codex::spawn` 创建 channel 时使用。
+/// 设为 512：经验值——单会话的提交速率远低于消费速率，512 足够吸收瞬时尖峰
+/// 而不会让发送方阻塞；改小可能在快速重复 submit 场景下导致背压。
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
+
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 
+// ═══════════════════════════════════════════════════════════════
+// impl Codex  ·  对外句柄实现（spawn / submit / next_event / shutdown）
+// ═══════════════════════════════════════════════════════════════
+
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
+    /// 启动一个新的 Codex 会话。这是整个会话级生命周期的入口。
+    ///
+    /// 流程：
+    ///   1. 校验 parent_trace 是否合法（非法则警告并丢弃）；
+    ///   2. 起一个 `thread_spawn` tracing span，若有有效父 trace 则关联上下文；
+    ///   3. 委托给 `spawn_internal` 做真正的初始化（创建通道、构造 Session、
+    ///      启动 submission loop、写首个 `SessionConfigured` 事件等）；
+    ///   4. 整个 spawn 过程都包在 span 里，便于排查启动期问题。
     pub(crate) async fn spawn(args: CodexSpawnArgs) -> CodexResult<CodexSpawnOk> {
         let parent_trace = match args.parent_trace {
             Some(trace) => {
@@ -681,10 +760,13 @@ impl Codex {
     }
 
     /// Submit the `op` wrapped in a `Submission` with a unique ID.
+    /// 投递一个 Op：内部包装成 `Submission`（UUIDv7 + 当前 trace），通过
+    /// `tx_sub` 发到 submission loop。返回生成的 submission id 给上层做关联。
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
         self.submit_with_trace(op, /*trace*/ None).await
     }
 
+    /// `submit` 的可指定 trace 版本：用于跨进程/跨服务的分布式链路追踪场景。
     pub async fn submit_with_trace(
         &self,
         op: Op,
@@ -702,6 +784,9 @@ impl Codex {
 
     /// Use sparingly: prefer `submit()` so Codex is responsible for generating
     /// unique IDs for each submission.
+    /// 慎用：优先用 `submit()` 让 Codex 自己生成 UUID。
+    /// 仅当调用方有「自带 submission id」的特殊需求时才用这个版本（如复用
+    /// 外部已生成的 trace 关联 id）。会自动补齐 trace（若调用方没传）。
     pub async fn submit_with_id(&self, mut sub: Submission) -> CodexResult<()> {
         if sub.trace.is_none() {
             sub.trace = current_span_w3c_trace_context();
@@ -724,6 +809,10 @@ impl Codex {
         handlers::persist_thread_memory_mode_update(&self.session, mode).await
     }
 
+    /// 发 Shutdown Op 并等待 submission loop 完全终止。
+    /// 流程：submit(Shutdown) → 等 session_loop_termination future 完成。
+    /// 即便 submit 失败（如 tx_sub 已关闭），也会继续等待终止 future——
+    /// 因为 loop 可能由于其他原因已经退出，仍需等清理动作完成。
     pub async fn shutdown_and_wait(&self) -> CodexResult<()> {
         let session_loop_termination = self.session_loop_termination.clone();
         match self.submit(Op::Shutdown).await {
@@ -735,6 +824,9 @@ impl Codex {
         Ok(())
     }
 
+    /// 从事件队列 `rx_event` 取下一个事件，无事件时异步等待。
+    /// 通道关闭 ⇒ 返回 `CodexErr::InternalAgentDied`（说明 submission loop
+    /// 已退出，会话不可用）。
     pub async fn next_event(&self) -> CodexResult<Event> {
         let event = self
             .rx_event
@@ -866,6 +958,29 @@ async fn thread_title_from_thread_store(
     let title = thread.name.as_deref()?.trim();
     (!title.is_empty() && thread.preview.trim() != title).then(|| title.to_string())
 }
+
+// ═══════════════════════════════════════════════════════════════
+// impl Session  ·  会话核心实现（~2400 行，是本文件的主体）
+// ═══════════════════════════════════════════════════════════════
+//
+// 本 impl 块定义了 Session 上的大量方法，覆盖：
+//   - 会话构造（`new` 及其辅助）
+//   - 配置管理与持久化（settings update / preview / refresh_runtime_config）
+//   - rollout 读写（ensure_rollout_materialized / flush_rollout / live_thread_*）
+//   - 消息历史 / context 操作（record_conversation_items / inject_response_items
+//     / clone_history / record_context_updates_and_set_reference_context_item）
+//   - 事件发送（send_event / send_event_raw / send_token_count_event 等）
+//   - token / rate-limit 记账（record_token_usage_info / update_rate_limits）
+//   - Goal 状态机驱动（goal_runtime_apply）
+//   - 工具与权限相关（MCP / approval / network proxy）
+//   - 子 agent 协作（subagent spawn / inter-agent communication）
+//
+// 因体量庞大，本文件未对每个方法逐一加中文注释；
+// 按名字 grep 查找你关心的方法、依据其英文 doc + 调用上下文理解即可。
+//
+// TurnContext 相关方法（`make_turn_context` / `new_turn_with_sub_id`
+// / `new_turn_from_configuration` / `new_default_turn`）实现在
+// `session/turn_context.rs`（同一 impl Session 块的延伸）。
 
 impl Session {
     pub(crate) async fn app_server_client_metadata(&self) -> AppServerClientMetadata {
