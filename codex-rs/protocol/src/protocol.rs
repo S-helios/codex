@@ -2,7 +2,16 @@
 //!
 //! Uses a SQ (Submission Queue) / EQ (Event Queue) pattern to asynchronously communicate
 //! between user and agent.
-
+//!
+//! 本文件是「客户端 ↔ agent」之间的协议契约——所有跨进程/跨语言的消息类型都在此
+//! 定义。核心是「双队列」(SQ/EQ) 异步模型：
+//!   · 提交队列 SQ：客户端发 `Submission{ id, op }`，`op: Op` 是动作；
+//!   · 事件队列 EQ：agent 回 `Event{ id, msg }`，`msg: EventMsg` 是结果/进度。
+//! 二者靠 `id` 关联，形成「一次提交 ↔ 多个事件」的多路复用流。
+//!
+//! 这些类型同时被 TUI、app-server、扩展层乃至 TypeScript 端共享，故大量使用
+//! `#[serde(tag="type")]`（自描述 JSON）、`JsonSchema`/`TS` 派生（生成跨语言 schema）。
+//! 改动这里要顾及全链路兼容，尤其注意 `EventMsg` 字段「不可用 Option」的约束。
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
@@ -123,6 +132,11 @@ impl GitSha {
 }
 
 /// Submission Queue Entry - requests from user
+///
+/// 「提交队列条目」(SQ entry)——codex 双队列模型里「输入」那一半。外部把请求
+/// 包成 `Submission` 投进提交队列，内部 `submission_loop` 逐个消费。`id` 是关联键：
+/// 后续所有相关 `Event`（EQ 条目）都带同一个 id 回指这次提交，从而把异步的
+/// 「一次输入 → 多次输出事件」串成一条可追踪的逻辑流。
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct Submission {
     /// Unique id for this Submission to correlate with Events
@@ -488,6 +502,19 @@ pub struct AdditionalContextEntry {
 }
 
 /// Submission operation
+///
+/// 提交的「动作载荷」——codex 对外暴露的全部操作类型。`submission_loop` 按变体
+/// 分派到对应 handler。大致可分几族：
+/// ① 启动/驱动回合：`UserInput`（最常用，可顺带改线程设置）、`Review`、
+///    `RunUserShellCommand`、`Compact`（请求压缩上下文）。
+/// ② 审批/交互回程：`ExecApproval`/`PatchApproval`/`ResolveElicitation`/
+///    `UserInputAnswer`——它们是「事件发出去 → 用户决策 → oneshot 送回」模式的回程。
+/// ③ 线程设置与生命周期：`ThreadSettings`、`SetThreadMemoryMode`、
+///    `ThreadRollback`（按轮回滚，不动磁盘）、`ReloadUserConfig`、`Shutdown`。
+/// ④ 实时(realtime)语音流：`RealtimeConversation*` 一组。
+/// ⑤ 控制：`Interrupt`（中断当前任务但不杀后台进程）、`CleanBackgroundTerminals`。
+/// `#[serde(tag = "type")]` 让它在 JSON 里以 `{"type":"user_input",...}` 形式自描述；
+/// `#[non_exhaustive]` 保留未来加变体的余地，强制外部 match 写 `_` 兜底。
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
@@ -1140,6 +1167,10 @@ impl SandboxPolicy {
 }
 
 /// Event Queue Entry - events from agent
+///
+/// 「事件队列条目」(EQ entry)——双队列模型「输出」那一半，与 `Submission` 对偶。
+/// 一次提交在执行过程中会持续吐出多个 `Event`（开始→流式增量→工具调用→完成），
+/// 全都带回当初那个提交的 `id`，前端据此把它们归并到同一逻辑请求下渲染。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Event {
     /// Submission `id` that this event is correlated with.
@@ -1150,6 +1181,18 @@ pub struct Event {
 
 /// Response event from the agent
 /// NOTE: Make sure none of these values have optional types, as it will mess up the extension code-gen.
+///
+/// agent 对外的全部事件类型。变体极多，但按用途分几大类就清晰了：
+/// ① 回合生命周期：`TurnStarted`/`TurnComplete`/`TurnAborted`、`SessionConfigured`。
+/// ② 模型产出（多为流式，常有 `*Delta` 增量版）：`AgentMessage`、`AgentReasoning*`
+///    （推理/思维链）、`UserMessage`（回显发给模型的输入）。
+/// ③ 工具执行进度：`ExecCommand*`、`McpToolCall*`、`WebSearch*`、`ImageGeneration*`、
+///    `PatchApply*`——多成对出现（Begin/End）以便前端画进度。
+/// ④ 审批/交互请求（需要用户回话，对应 `Op` 里的回程变体）：见后续 `ExecApprovalRequest`
+///    等。⑤ 上下文与计量：`ContextCompacted`、`ThreadRolledBack`、`TokenCount`。
+/// ⑥ 诊断：`Error`/`Warning`/`GuardianWarning`/`ModelReroute`/`ModelVerification`。
+///
+/// 注意顶部那句英文警告：所有内嵌字段都不可用 `Option`——否则会打乱扩展层的代码生成。
 #[derive(Debug, Clone, Deserialize, Serialize, Display, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(tag = "type")]

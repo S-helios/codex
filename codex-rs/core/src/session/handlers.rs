@@ -1,3 +1,10 @@
+//! 【文件职责】会话的「提交分发层」。spawn 出的后台任务跑 submission_loop，从 rx_sub
+//! 串行取出每条 Submission，按其 Op 种类分派到本文件里对应的 handler 函数：用户输入 →
+//! 起 / 转向回合、各类审批应答 → 回填 oneshot、压缩 / 回滚 / 复审 / 关停等控制操作。
+//! 【为何集中在这里】所有改会话状态的入口都收敛到这一处单线程循环，天然串行化，避免并发
+//! 改状态的竞态；要新增一种 Op，就在 submission_loop 的 match 里加一支 + 一个 handler。
+//! 【与上下游】上游是 Codex::submit 投递的 Submission；handler 多数最终落到 Session 的方法
+//! （mod.rs）或 spawn_task（起一个 turn.rs 回合）。返回 true 仅 Op::Shutdown，用于跳出循环。
 use crate::realtime_conversation::handle_audio as handle_realtime_conversation_audio;
 use crate::realtime_conversation::handle_close as handle_realtime_conversation_close;
 use crate::realtime_conversation::handle_start as handle_realtime_conversation_start;
@@ -185,6 +192,11 @@ async fn thread_settings_applied_event(sess: &Session) -> EventMsg {
     })
 }
 
+/// 处理 Op::UserInput —— 函数名里的「or」点出核心二选一：
+///   · 若已有活跃回合 → steer_input 把输入转向进去（追加 / 打断当前回合）；
+///   · 若无活跃回合（NoActiveTurn）→ spawn_task 起一个全新的 RegularTask 回合。
+/// 之前还会按 thread_settings 更新会话设置、刷新 MCP server、合并 additional_context。
+/// 这是「用户说话 → agent 干活」最常走的路径，是 Codex 交互的主入口之一。
 pub(super) async fn user_input_or_turn_inner(
     sess: &Arc<Session>,
     sub_id: String,
@@ -392,6 +404,10 @@ pub async fn resolve_elicitation(
 
 /// Propagate a user's exec approval decision to the session.
 /// Also optionally applies an execpolicy amendment.
+/// 把用户对「命令审批」的裁决回传给会话：Abort → 直接中断当前任务；其余裁决 →
+/// notify_approval 按 approval_id 找到挂起的 oneshot 发送端 fire 回去（唤醒正在
+/// request_command_approval 里 await 的那个回合）。若裁决携带 execpolicy 修正案，先持久化
+/// 并记一条消息，让本次批准的规则在后续生效。这是 mod.rs 那套「事件出 + oneshot 回」的回程。
 pub async fn exec_approval(
     sess: &Arc<Session>,
     approval_id: String,
@@ -434,6 +450,8 @@ pub async fn exec_approval(
     }
 }
 
+/// 补丁审批裁决的回程，与 exec_approval 同构但更简单（无 execpolicy 修正）：Abort 中断，
+/// 其余 notify_approval 唤醒等在 request_patch_approval 返回的接收端上的 apply_patch 运行时。
 pub async fn patch_approval(sess: &Arc<Session>, id: String, decision: ReviewDecision) {
     match decision {
         ReviewDecision::Abort => {
@@ -480,6 +498,10 @@ pub async fn compact(sess: &Arc<Session>, sub_id: String) {
         .await;
 }
 
+/// 处理 Op::ThreadRollback：把会话「回退」若干个用户回合。要求 num_turns ≥ 1 且当前无活跃
+/// 回合。做法不是删历史，而是从持久化加载完整历史、追加一条 ThreadRolledBack 标记后整体
+/// 重放（apply_rollout_reconstruction）重建内存态，再重算 token、落盘标记。本质是「以重放
+/// 重建到目标状态」而非原地删除，保证内存与持久化一致。
 pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32) {
     if num_turns == 0 {
         sess.send_event_raw(Event {
@@ -638,6 +660,10 @@ async fn emit_thread_stop_lifecycle(sess: &Session) {
     }
 }
 
+/// 处理 Op::Shutdown：是唯一返回 true 让 submission_loop 跳出的 handler。流程：先停运行时
+/// （中断任务、关 MCP / 子进程）→ 统计本会话回合数打点 → 跑线程停止生命周期钩子 → 优雅
+/// flush 并关闭线程持久化（避免测试读到半截状态）→ 发 ShutdownComplete 事件并记 rollout
+/// trace 结束。返回 true。
 pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
     shutdown_session_runtime(sess).await;
     info!("Shutting down Codex instance");
@@ -721,6 +747,11 @@ pub async fn review(
     }
 }
 
+/// 会话主循环：从 rx_sub 串行收提交，按 Op 分派，直到收到 Op::Shutdown（handler 返回
+/// true）才跳出。每条提交都包在 dispatch_span 里（携带 op 名 + trace），便于链路追踪。
+/// 注意循环是**单消费者顺序处理**——这正是会话状态无需额外加锁就线程安全的根因；耗时的
+/// 回合执行由各 handler 内部 spawn_task 异步起任务，不会卡住本循环对后续控制类 Op 的响应。
+/// 末尾兜底：若通道在没有显式 Shutdown 的情况下关闭（句柄被 drop），仍跑一遍会话拆除逻辑。
 pub(super) async fn submission_loop(
     sess: Arc<Session>,
     config: Arc<Config>,
@@ -732,6 +763,7 @@ pub(super) async fn submission_loop(
         debug!(?sub, "Submission");
         let dispatch_span = submission_dispatch_span(&sub);
         let should_exit = async {
+            // 按 Op 种类分派；绝大多数 handler 返回 false（继续循环），仅 Shutdown 返回 true。
             match sub.op.clone() {
                 Op::Interrupt => {
                     interrupt(&sess).await;

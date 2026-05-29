@@ -1,3 +1,10 @@
+//! 【文件职责】工具调用的「路由层」。ToolRouter 持有本回合的工具注册表
+//! （ToolRegistry）与对模型可见的工具规格（model_visible_specs），负责两件事：
+//!   1. build_tool_call：把模型返回的 ResponseItem（FunctionCall / ToolSearchCall /
+//!      CustomToolCall）翻译成内部统一的 ToolCall。
+//!   2. dispatch_*：把 ToolCall 包成 ToolInvocation，交给 registry 真正执行。
+//! 【架构位置】上游是 turn.rs 采样循环，下游是 registry.rs（按名分发到具体 handler）。
+
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -31,6 +38,8 @@ pub struct ToolCall {
     pub payload: ToolPayload,
 }
 
+/// 回合级工具路由器：registry 管「怎么执行」，model_visible_specs 管「告诉模型有
+/// 哪些工具可用」（这份规格会被序列化进发给模型的请求里）。
 pub struct ToolRouter {
     registry: ToolRegistry,
     model_visible_specs: Vec<ToolSpec>,
@@ -92,6 +101,10 @@ impl ToolRouter {
             .unwrap_or(false)
     }
 
+    /// 把模型输出条目翻译成内部 ToolCall。三类可执行调用各走一支：普通 FunctionCall
+    /// （带 namespace+name）、execution=="client" 的 ToolSearchCall（解析成搜索参数）、
+    /// CustomToolCall（自由文本 input）。其余条目返回 Ok(None)，表示「这不是一次需要
+    /// 本地执行的工具调用」（如纯文本消息、服务端自行执行的 tool_search）。
     #[instrument(level = "trace", skip_all, err)]
     pub fn build_tool_call(item: ResponseItem) -> Result<Option<ToolCall>, FunctionCallError> {
         match item {
@@ -189,6 +202,10 @@ impl ToolRouter {
         .await
     }
 
+    /// 真正的分发：拆出 (tool_name, call_id, payload) 组装成 ToolInvocation，再转交
+    /// registry 按工具名找到对应 handler 执行。terminal_outcome_reached 供「终态类」
+    /// 工具（如交还控制权 / 结束）做协作式取消。上面两个 pub 包装方法只是这层「带 /
+    /// 不带终态标志」的两个入口。
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_tool_call_with_code_mode_result_inner(
         &self,

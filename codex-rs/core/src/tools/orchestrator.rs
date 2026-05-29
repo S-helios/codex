@@ -6,6 +6,11 @@ simple sequence for any ToolRuntime: approval → select sandbox → attempt →
 retry with an escalated sandbox strategy on denial (no re‑approval thanks to
 caching).
 */
+//! 【文件职责】工具执行的「审批 + 沙箱选择 + 重试」编排器。对任意 ToolRuntime 驱动
+//! 一条固定流程：请求审批 → 选定初始沙箱 → 首次尝试 → 若因沙箱拒绝失败，则升级沙箱
+//! 策略重试（靠审批缓存，重试时不再二次打扰用户）。
+//! 【为何独立一层】把「要不要批准、在多严的沙箱里跑、失败如何降级重试」这些横切策略
+//!   从具体工具（shell / apply_patch 等）里抽出集中处理，工具自身只管「怎么执行」。
 use crate::guardian::guardian_rejection_message;
 use crate::guardian::guardian_timeout_message;
 use crate::guardian::new_guardian_review_id;
@@ -39,6 +44,7 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxType;
 
+/// 工具编排器，持有一个 SandboxManager，用于按平台挑选并施加沙箱。
 pub(crate) struct ToolOrchestrator {
     sandbox: SandboxManager,
 }
@@ -55,6 +61,9 @@ impl ToolOrchestrator {
         }
     }
 
+    /// 在「一个具体沙箱配置」下跑一次工具，并处理网络审批的两种模式：Immediate
+    /// （当场结算）/ Deferred（成功才延迟结算，失败则立即收尾）。把网络拒绝用的取消
+    /// 令牌注入本次 SandboxAttempt，使网络违规能即时中断执行。
     async fn run_attempt<Rq, Out, T>(
         tool: &mut T,
         req: &Rq,
@@ -125,6 +134,10 @@ impl ToolOrchestrator {
         }
     }
 
+    /// 编排单个工具调用的完整执行：① 按审批要求决定是否征求用户 / guardian 批准
+    /// （Forbidden 直接拒、Skip 多数免批、NeedsApproval 走 request_approval）；② 在
+    /// 选定的初始沙箱下首次尝试；③ 若失败且属沙箱拒绝，升级沙箱策略重试。返回里带
+    /// deferred_network_approval：延迟型网络审批留待上层最终结算。
     pub async fn run<Rq, Out, T>(
         &mut self,
         tool: &mut T,

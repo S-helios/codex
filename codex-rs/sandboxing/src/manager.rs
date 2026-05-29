@@ -1,3 +1,13 @@
+//! 【文件职责】SandboxManager —— 跨平台沙箱的「选择 + 改写」中枢。它回答两个问题：
+//!   1. select_initial：这条命令到底要不要进沙箱、进哪种？返回 SandboxType（None / macOS
+//!      Seatbelt / Linux Seccomp+Landlock / Windows 受限令牌），依据是调用方偏好
+//!      （Auto/Require/Forbid）+ 文件/网络策略是否要求平台沙箱。
+//!   2. transform：把一条「可移植命令」按选定沙箱类型**包裹**成真正可执行的 argv ——
+//!      macOS 前面拼 sandbox-exec + 策略 profile、Linux 前面拼 codex-linux-sandbox 包装器，
+//!      并把 PermissionProfile 叠加额外权限后落成 SandboxExecRequest（含最终 argv、env、
+//!      生效的文件/网络策略、arg0 覆盖等）交给 exec 层 spawn。
+//! 【设计取舍】「选择」与「改写」分两步：select_initial 可先定类型，失败时上层（orchestrator）
+//!   还能据偏好降级重试；transform 才真正绑定平台细节，平台差异都收敛在这一个 match 里。
 #[cfg(target_os = "linux")]
 use crate::bwrap::WSL1_BWRAP_WARNING;
 #[cfg(target_os = "linux")]
@@ -19,6 +29,9 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
 
+/// 四种沙箱后端：None（不隔离，直接跑）、macOS 的 Seatbelt（sandbox-exec）、Linux 的
+/// Seccomp + Landlock（经 codex-linux-sandbox 包装器）、Windows 受限令牌。as_metric_tag
+/// 给埋点用。具体平台只会用到其中之一，跨平台代码靠这个枚举统一表达「用哪种隔离」。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SandboxType {
     None,
@@ -38,6 +51,10 @@ impl SandboxType {
     }
 }
 
+/// 调用方对「是否进沙箱」的偏好（由具体工具的 Sandboxable trait 给出）：
+/// - Auto：交给策略判断（should_require_platform_sandbox），默认行为。
+/// - Require：强制进平台沙箱（拿不到平台沙箱则退化为 None）。
+/// - Forbid：明确不进沙箱（如某些必须裸跑的命令）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SandboxablePreference {
     Auto,
@@ -70,6 +87,9 @@ pub struct SandboxCommand {
     pub additional_permissions: Option<AdditionalPermissionProfile>,
 }
 
+/// transform 的产物：一条「已包裹好、可直接 spawn」的命令。command 是最终 argv（可能已被
+/// 套上 sandbox-exec / codex-linux-sandbox 前缀），并附带生效后的文件/网络策略与 arg0 覆盖，
+/// 供 exec 层落地执行。它与下面的 SandboxCommand（改写前的可移植输入）相对。
 #[derive(Debug)]
 pub struct SandboxExecRequest {
     pub command: Vec<String>,
@@ -136,6 +156,9 @@ impl SandboxManager {
         Self
     }
 
+    /// 第一步「选型」：按调用方偏好定沙箱类型。Forbid→None；Require→平台沙箱（无则 None）；
+    /// Auto→看文件/网络策略与是否有受管网络需求是否「要求」平台沙箱，要则取平台沙箱否则 None。
+    /// 注意：选到 None 不代表无限制——上层可能因此先尝试无沙箱、失败再升级（escalate）。
     pub fn select_initial(
         &self,
         file_system_policy: &FileSystemSandboxPolicy,
@@ -165,6 +188,11 @@ impl SandboxManager {
         }
     }
 
+    /// 第二步「改写」：把可移植命令按选定沙箱类型包裹成最终 argv。先合并 PermissionProfile +
+    /// 额外权限算出生效的文件/网络策略；再按 sandbox 分派：None 原样；MacosSeatbelt 在前面拼
+    /// sandbox-exec + 由策略生成的 .sb profile 参数；LinuxSeccomp 在前面拼 codex-linux-sandbox
+    /// 包装器（并校验 WSL1/bubblewrap 兼容性）+ 设定 arg0；Windows 暂原样（隔离在 spawn 时另做）。
+    /// 平台不匹配的分支返回 SandboxTransformError（如非 macOS 选了 Seatbelt）。
     pub fn transform(
         &self,
         request: SandboxTransformRequest<'_>,

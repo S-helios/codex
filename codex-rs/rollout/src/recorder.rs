@@ -1,5 +1,19 @@
 //! Persist Codex session rollouts (.jsonl) so sessions can be replayed or inspected later.
-
+//!
+//! 「rollout」= 一次会话的逐行 JSONL 流水账，落在 `~/.codex/sessions/YYYY/MM/DD/`
+//! 下，用于事后回放、resume（续聊）和审计。本模块是这套持久化的核心，三层设计：
+//!
+//! ① 句柄层 `RolloutRecorder`：可 `Clone` 的轻量句柄，只持一个 mpsc 发送端 `tx`。
+//!    调用方把「写条目/persist/flush/shutdown」当成命令发出去，自己绝不做阻塞 I/O。
+//! ② 写手层（后台 task）`rollout_writer` + `RolloutWriterState`：独占文件句柄，
+//!    串行消费命令。关键韧性设计——条目先进 `pending_items` 缓冲，**写成功才出队**；
+//!    I/O 失败就丢掉文件句柄但保留未写后缀，下一个 barrier（persist/flush）重开文件重试。
+//!    这样磁盘瞬时故障不丢数据。
+//! ③ 列举/检索层：`list_threads_*` 系列以「文件系统扫描」为准、用 SQLite state-db
+//!    做加速与回填（read-repair / reconcile），DB 不可用时优雅退回纯文件扫描。
+//!
+//! 另一关键点是「延迟物化」：新建会话只预计算路径与 meta，真正建文件推迟到首次
+//! `persist()`，避免「开了会话却没产生任何内容」时留下空文件。
 use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
@@ -69,6 +83,9 @@ use codex_utils_path as path_utils;
 /// $ jq -C . ~/.codex/sessions/rollout-2025-05-07T17-24-21-5973b6c0-94b8-487b-a530-2aeb6098ae0e.jsonl
 /// $ fx ~/.codex/sessions/rollout-2025-05-07T17-24-21-5973b6c0-94b8-487b-a530-2aeb6098ae0e.jsonl
 /// ```
+///
+/// 对外的录制句柄。本身极轻——只是 mpsc 发送端 + 后台 task 的观测句柄 + 路径。
+/// `#[derive(Clone)]` 意味着可以到处 clone 分发，所有克隆体共享同一个后台写手。
 #[derive(Clone)]
 pub struct RolloutRecorder {
     tx: Sender<RolloutCmd>,
@@ -91,6 +108,8 @@ pub enum RolloutRecorderParams {
     },
 }
 
+/// 发给后台写手的命令协议。`AddItems` 是「单向投递」（不等回执，只入缓冲）；
+/// 其余三个都带 `ack` oneshot，是「barrier」——调用方据此知道何时真正落盘完成。
 enum RolloutCmd {
     AddItems(Vec<RolloutItem>),
     Persist {
@@ -319,6 +338,13 @@ impl RolloutRecorder {
         .await
     }
 
+    /// 列举会话的「总调度」，把文件系统真相与 SQLite 索引加速调和到一起。三档策略：
+    /// ① `StateDbOnly`：纯查 DB（最快，DB 失败则返回空页）。
+    /// ② 有元数据过滤（来源/provider/cwd/搜索）：以「文件系统扫描页」为准，
+    ///    顺手 read-repair / reconcile 命中的 DB 行，再用 DB 回填缺失元数据。
+    /// ③ 无过滤：DB 页就是结果，但仍先用 FS 命中预热/修复 DB。
+    /// 贯穿始终的原则：**文件系统是事实来源，SQLite 是可重建的缓存**；DB 出任何
+    /// 岔子都 `record_fallback` 记一笔并优雅退回 FS 扫描，绝不让列举整体失败。
     #[allow(clippy::too_many_arguments)]
     async fn list_threads_with_db_fallback(
         state_db_ctx: Option<StateDbHandle>,
@@ -644,6 +670,11 @@ impl RolloutRecorder {
     /// file creation/open until an explicit `persist()` call.
     ///
     /// For resumed sessions, this immediately opens the existing rollout file.
+    ///
+    /// 两种入参对应两种生命周期：`Create` 走「延迟物化」（只算好路径和
+    /// SessionMeta，文件等首次 persist 才建）；`Resume` 立刻以追加模式打开旧文件。
+    /// 不论哪种，最后都 spawn 一个后台写手 task 独占文件，并用 256 容量的有界
+    /// mpsc 连接——缓冲满了发送方会 await 让步，从而保证调用线程永不做阻塞 I/O。
     pub async fn new(
         config: &impl RolloutConfigView,
         params: RolloutRecorderParams,
@@ -811,6 +842,10 @@ impl RolloutRecorder {
         })?
     }
 
+    /// 从 JSONL 文件逐行读回 rollout 条目（resume 的底层）。容错优先：
+    /// 单行解析失败只计数 `parse_errors` 并跳过，绝不中断整体加载——宁可丢一行
+    /// 也要让历史尽量恢复。第一条遇到的 `SessionMeta` 定为 thread 的权威 id。
+    /// 还会顺手剥掉历史遗留的 ghost_snapshot 行（旧格式兼容）。
     pub async fn load_rollout_items(
         path: &Path,
     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
@@ -1375,6 +1410,11 @@ fn open_log_file(path: &Path) -> std::io::Result<File> {
 /// Items are first appended to `pending_items`; persist/flush/shutdown remove each item from that
 /// queue only after it is written successfully. I/O failures drop the file handle but keep the
 /// unwritten suffix so the next barrier can reopen the file and retry.
+///
+/// 后台写手独占的可变状态，也是「不丢数据」韧性的载体。核心不变量：条目只有
+/// 「写盘成功」才从 `pending_items` 出队；任何 I/O 失败都把 `writer` 置 None（丢句柄）
+/// 但保留未写部分，等下一次 barrier 重开文件续写。`last_logged_error` 用于去重日志，
+/// 避免反复失败时刷屏。
 struct RolloutWriterState {
     writer: Option<JsonlWriter>,
     deferred_log_file_info: Option<LogFileInfo>,
@@ -1435,6 +1475,9 @@ impl RolloutWriterState {
         self.write_pending_with_recovery("shutdown").await
     }
 
+    /// 「写一次失败就重开文件再试一次」的两段式重试。第一次失败 → 进入恢复模式
+    /// （丢句柄）→ 第二次再写（会先 reopen）。两次都败才返回错误，且未写条目仍
+    /// 留在缓冲里等下个 barrier。这是单点磁盘抖动下保证最终落盘的关键。
     async fn write_pending_with_recovery(&mut self, operation: &str) -> std::io::Result<()> {
         match self.write_pending_once().await {
             Ok(()) => {
@@ -1724,6 +1767,10 @@ async fn select_resume_path(
     }
 }
 
+/// 判断某条 rollout 是否属于目标 cwd（`codex resume` 按目录续聊时用）。三级
+/// 由快到慢：① 先信缓存里的 cwd；② 不中就读文件、取「最后一条 TurnContext 的
+/// cwd」（因为用户中途可能 cd 过，末轮才是当前目录）；③ 再不中才回退到 head
+/// 元数据里的初始 cwd。
 async fn resume_candidate_matches_cwd(
     rollout_path: &Path,
     cached_cwd: Option<&Path>,

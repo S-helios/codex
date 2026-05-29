@@ -1,3 +1,13 @@
+//! 「线程级」对外门面 `CodexThread`——把底层 `Codex`（提交/事件队列对）包成一个
+//! 面向 app-server / 嵌入方的高层 API。
+//!
+//! 这里几乎所有方法都是「薄转发」：`submit`/`next_event`/`steer_input` 直接委托
+//! 给内部 `codex`。它存在的价值在于「收口与语义化」：
+//! ① 把零散的 `Op` 提交封装成有名字的操作（设置变更、注入历史、读 MCP 资源……）；
+//! ② 持有 thread 级的小状态（rollout 路径、带外 elicitation 计数）；
+//! ③ 暴露持久化读写（load_history/read_thread/update_thread_metadata），把
+//!    「活线程」转交给 thread-store 层落盘。
+//! 一句话：`Codex` 是机制，`CodexThread` 是面向使用者的策略门面。
 use crate::agent::AgentStatus;
 use crate::config::ConstraintResult;
 use crate::goals::ExternalGoalSet;
@@ -114,6 +124,9 @@ pub struct CodexThread {
 
 /// Conduit for the bidirectional stream of messages that compose a thread
 /// (formerly called a conversation) in Codex.
+///
+/// 「thread」是 codex 里一次完整对话的单位（旧称 conversation）。这个 impl 块
+/// 就是它的双向消息管道：一头收 `Op`（submit），一头出 `Event`（next_event）。
 impl CodexThread {
     pub(crate) fn new(
         codex: Codex,
@@ -384,6 +397,11 @@ impl CodexThread {
     }
 
     /// Append raw Responses API items to the thread's model-visible history.
+    ///
+    /// 把外部准备好的 Responses API 条目「塞进」thread 历史（不开新轮）。三步：
+    /// 造一个默认 turn context → 若还没有参照上下文项就先补记一条（保证后续设置
+    /// diff 有基准）→ 注入条目并立即 flush rollout 落盘。供 fork/resume 等场景
+    /// 重建历史时使用。
     pub async fn inject_response_items(&self, items: Vec<ResponseItem>) -> CodexResult<()> {
         if items.is_empty() {
             return Err(CodexErr::InvalidRequest(
@@ -526,6 +544,10 @@ impl CodexThread {
         self.codex.enabled(feature)
     }
 
+    /// 「带外 elicitation」计数 +1，并在「0→1」的那一刻把会话置为暂停态。
+    /// 带外 elicitation 指 turn 之外发起的交互式询问（如 MCP 工具弹出的确认）；
+    /// 只要还有未结清的此类询问，会话就该暂停，避免与正常 turn 抢执行。用「计数器
+    /// + 仅边沿触发暂停/恢复」而非布尔，是为了支持多个询问并发嵌套。
     pub async fn increment_out_of_band_elicitation_count(&self) -> CodexResult<u64> {
         let mut guard = self.out_of_band_elicitation_count.lock().await;
         let was_zero = *guard == 0;

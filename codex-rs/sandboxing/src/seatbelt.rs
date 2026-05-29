@@ -1,3 +1,11 @@
+//! 【文件职责】macOS Seatbelt 沙箱的「策略生成器」。把 Codex 的文件/网络沙箱策略翻译成
+//! Seatbelt Policy Language（SBPL，.sb 脚本）文本，并拼出最终交给 `/usr/bin/sandbox-exec`
+//! 的参数：`-p <策略文本> -D<参数名>=<路径> … -- <真实命令>`。
+//! 【为何用 -D 参数而非把路径直接写进策略】路径以 `(param "KEY")` 占位、用 -D 注入，既避免
+//!   把含特殊字符的路径塞进 SBPL 文本引发注入/转义问题，也让策略文本本身可缓存/可读。
+//! 【三大块策略】文件读（file-read*）、文件写（file-write*，含受保护元数据如 .git 的排除）、
+//!   网络（按代理/受管网络情况收紧或放行，无可用端点时「fail closed」彻底禁网）。最终再拼上
+//!   基础策略 MACOS_SEATBELT_BASE_POLICY 等。glob 不被 Seatbelt 原生支持，故转成锚定正则。
 use codex_network_proxy::NetworkProxy;
 use codex_network_proxy::PROXY_URL_ENV_KEYS;
 use codex_network_proxy::has_proxy_url_env_vars;
@@ -254,6 +262,12 @@ fn dynamic_network_policy(
     )
 }
 
+/// 生成网络相关的 SBPL 段，是安全上最敏感的一块。三种走向：
+/// ① 受限网络（有代理端口 / 配了代理 / 强制受管网络 / 禁网但要放行 unix socket）→ 只放行
+///    loopback、必要的 DNS、指定代理端口与 unix socket，再拼基础网络策略。
+/// ② 「fail closed」：声明了代理配置或强制受管网络，却推断不出可用 loopback 端点 → 返回空串
+///    （= 完全禁网），宁可禁死也不静默放宽——这是刻意的安全默认。
+/// ③ 普通放行：无代理且策略允许联网 → 放行全部出入站。否则（禁网）返回空串。
 fn dynamic_network_policy_for_network(
     network_policy: NetworkSandboxPolicy,
     enforce_managed_network: bool,
@@ -332,6 +346,11 @@ struct SeatbeltAccessRoot {
     protected_metadata_names: Vec<String>,
 }
 
+/// 为某类文件操作（action 如 "file-read*"/"file-write*"）生成 `(allow …)` 策略段。每个根都
+/// 落成一个 -D 参数（param_prefix_N）。若根带「排除子路径」或「受保护元数据名」，则用
+/// `(require-all (subpath 根) (require-not …))` 收紧：既禁掉精确路径又禁其子树（光 subpath
+/// 会给「首次创建该受保护目录本身」留口子，如 mkdir .codex，故同时排 literal + subpath）。
+/// 返回 (策略文本, 需注入的 -D 参数列表)。
 fn build_seatbelt_access_policy(
     action: &str,
     param_prefix: &str,
@@ -481,6 +500,10 @@ fn canonicalize_glob_static_prefix_for_sandbox(pattern: &str) -> Option<String> 
     (normalized_pattern != pattern).then_some(normalized_pattern)
 }
 
+/// 把 git 风格的 glob 子集翻译成 Seatbelt 能用的锚定正则（`^…$`）：`*`/`?` 只在单层路径段内
+/// 匹配（`[^/]*`/`[^/]`），`**/` 可跨零或多层（`(.*/)?`），方括号字符类保留，未闭合的 `[`
+/// 当字面量。完全没有 glob 元字符时按「精确路径 + 其子树」处理（补 `(/.*)?`）。
+/// 用途：file-system 策略的「不可读 glob」需转成 deny 规则，而 Seatbelt 不认 glob 语法。
 fn seatbelt_regex_for_unreadable_glob(pattern: &str) -> Option<String> {
     if pattern.is_empty() {
         return None;
@@ -599,6 +622,11 @@ pub struct CreateSeatbeltCommandArgsParams<'a> {
     pub extra_allow_unix_sockets: &'a [AbsolutePathBuf],
 }
 
+/// 本文件的主入口：根据文件/网络策略生成完整 SBPL 文本并组装 sandbox-exec 参数。
+/// 流程：①按「是否全盘读/写」分别生成 file-read* / file-write* 段（受限时列出可读/可写根 +
+/// 排除只读子路径 + 保护 .git 等元数据）；②生成 deny 段把不可读 glob 转正则禁掉；③生成网络段；
+/// ④把各段 + 基础策略拼成 full_policy；⑤所有路径作为 -D 参数注入，最后 `-- command` 收尾。
+/// 返回值即 sandbox-exec 之后的全部 argv（不含 sandbox-exec 本身，由 manager.transform 补上）。
 pub fn create_seatbelt_command_args(args: CreateSeatbeltCommandArgsParams<'_>) -> Vec<String> {
     let CreateSeatbeltCommandArgsParams {
         command,

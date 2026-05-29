@@ -4,6 +4,12 @@ Runtime: shell
 Executes shell requests under the orchestrator: asks for approval when needed,
 builds sandbox transform inputs, and runs them under the current SandboxAttempt.
 */
+//! 【文件职责】shell 工具的运行时（ShellRuntime），实现 orchestrator 驱动的 ToolRuntime
+//! 契约。三块职责经三个 trait 体现：Sandboxable（沙箱偏好 / 失败可升级）、Approvable
+//! （审批键、发起审批）、ToolRuntime（网络审批声明 + run 真正执行）。
+//! 【run 做了什么】按用户 shell 包裹命令（注入环境快照、PowerShell 关 profile / 强制
+//!   UTF-8），可选走 zsh-fork 升级后端，最终经 build_sandbox_command + execute_env 落到
+//!   exec.rs 执行。
 #[cfg(unix)]
 pub(crate) mod unix_escalation;
 pub(crate) mod zsh_fork_backend;
@@ -46,6 +52,8 @@ use futures::future::BoxFuture;
 use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
 
+/// 一次 shell 调用的请求参数：命令、shell 类型、cwd、超时、取消令牌、环境变量、网络
+/// 代理、沙箱权限与审批要求等。由工具 handler 填好后交给 ShellRuntime 执行。
 #[derive(Clone, Debug)]
 pub struct ShellRequest {
     pub command: Vec<String>,
@@ -128,6 +136,9 @@ impl Approvable<ShellRequest> for ShellRuntime {
         }]
     }
 
+    /// 发起审批：若本次走 guardian（审查代理），交给 review_approval_request；否则用
+    /// with_cached_approval 包一层——同一条命令 + 同样权限在本会话内已批准过就直接复用，
+    /// 不再二次打扰用户（这正是 orchestrator「重试时不重新审批」的底层支撑）。
     fn start_approval_async<'a>(
         &'a mut self,
         req: &'a ShellRequest,
@@ -224,6 +235,10 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         })
     }
 
+    /// 在给定 SandboxAttempt 下执行 shell 命令。先按用户 shell 把命令包装好（环境快照、
+    /// PowerShell 关闭 profile、强制 UTF-8）；ZshFork 后端满足条件时优先走其升级路径，
+    /// 否则 build_sandbox_command 组装沙箱命令、挂上超时与（网络拒绝）取消令牌，最终
+    /// execute_env 真正运行并返回输出。
     async fn run(
         &mut self,
         req: &ShellRequest,

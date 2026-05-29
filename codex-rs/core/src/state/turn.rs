@@ -1,4 +1,12 @@
 //! Turn-scoped state and active turn metadata scaffolding.
+//!
+//! 【文件职责】单个「回合」运行期的可变状态。两个主角：
+//!   · [`ActiveTurn`]：当前正在跑的回合的元数据（运行任务句柄 + 共享的 TurnState）；
+//!   · [`TurnState`]：回合内的可变数据，核心是若干 `pending_*` 表——它们正是
+//!     「事件出 + oneshot 回」审批模式的回程登记处：发起审批 / 权限 / 用户输入 /
+//!     elicitation / 动态工具请求时，把对应的 `oneshot::Sender` 按 key 存进来，
+//!     收到客户端答复时取出并 send；打断时 `clear_pending_waiters` 一次性丢弃所有
+//!     sender，令各等待方因通道关闭而 fail-closed。
 
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use std::collections::HashMap;
@@ -26,6 +34,9 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TokenUsage;
 
 /// Metadata about the currently running turn.
+///
+/// 「当前回合」的把手：task 是正在跑的任务（None 表示当前空闲），turn_state 用
+/// `Arc<Mutex<>>` 包裹，因为它要在 agent 主循环与各审批 / 工具回调之间并发共享。
 pub(crate) struct ActiveTurn {
     pub(crate) task: Option<RunningTask>,
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
@@ -61,6 +72,9 @@ impl Default for ActiveTurn {
     }
 }
 
+/// 回合任务的三种类型：Regular 常规对话回合、Review 代码审查回合、
+/// Compact 上下文压缩回合（见 compact.rs）。不同类型在历史记录、事件与
+/// 计量上有细微差别。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TaskKind {
     Regular,
@@ -68,6 +82,9 @@ pub(crate) enum TaskKind {
     Compact,
 }
 
+/// 「正在运行的回合任务」句柄集合：done 用于等待任务结束的通知，cancellation_token
+/// 做协作式取消，handle 是 `AbortOnDropHandle`——本结构一旦被 drop 就强制 abort 底层
+/// tokio task（防止回合泄漏成幽灵任务），turn_context 是该回合冻结的配置快照。
 pub(crate) struct RunningTask {
     pub(crate) done: Arc<Notify>,
     pub(crate) kind: TaskKind,
@@ -81,6 +98,12 @@ pub(crate) struct RunningTask {
 }
 
 /// Mutable state for a single turn.
+///
+/// 「单回合可变状态」。前五个 `pending_*` 表是「事件出 + oneshot 回」模式的回程
+/// 登记处（按 approval_id / 请求 key 索引未决的 `oneshot::Sender`）；`pending_input`
+/// 是回合中途追加的用户输入队列；`mailbox_delivery_phase` 决定子 Agent 邮件并入
+/// 本回合还是留给下回合；其余是本回合的计量（tool_calls 调用数、起始 token 用量、
+/// 是否引用了记忆等）与开关（已授予的额外权限、严格自动审查）。
 #[derive(Default)]
 pub(crate) struct TurnState {
     pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>,
@@ -119,6 +142,9 @@ impl TurnState {
         self.pending_approvals.remove(key)
     }
 
+    /// 打断 / 回合收尾时调用：清空全部未决等待者。被 drop 的 `oneshot::Sender` 会让
+    /// 对应等待方的 recv 立即返回 Err，从而走 fail-closed 默认（如审批默认 Abort），
+    /// 不会有人永久挂起。
     pub(crate) fn clear_pending_waiters(&mut self) {
         self.pending_approvals.clear();
         self.pending_request_permissions.clear();

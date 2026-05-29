@@ -1,3 +1,17 @@
+//! 「会话历史」的内存模型与 token 估算中枢。
+//!
+//! `ContextManager` 持有一次 thread 的全部历史条目（`Vec<ResponseItem>`，
+//! 最旧在前、最新在后），并围绕它提供四类能力：
+//! ① 记录：`record_items` 把新条目按截断策略写入，过滤掉不该进历史的项；
+//! ② 取用：`for_prompt` 产出「发给模型」的规范化视图（补全 call/output 配对、
+//!    在模型不支持图片时剥离图片）；
+//! ③ 改写：`remove_first_item`（压缩时丢最旧）/`drop_last_n_user_turns`（回滚）
+//!    /`replace`（压缩后整体替换），每次改写都会 bump `history_version`；
+//! ④ 估算：用「字节数 ÷ 4」的粗略启发式反推 token 数，给压缩/上下文窗口判断
+//!    提供下界（注意是 lower bound，不是 tokenizer 级精确值）。
+//!
+//! 设计取舍：历史只在「发给模型那一刻」才规范化（`for_prompt` 消费 self），
+//! 平时增删尽量做局部修补（如删条目时顺带删配对项），避免每次都全量扫描。
 use crate::context_manager::normalize;
 use crate::event_mapping::has_non_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_dev_message_content;
@@ -30,11 +44,17 @@ use std::ops::Deref;
 use std::sync::LazyLock;
 
 /// Transcript of thread history
+///
+/// 一条 thread 的完整历史「底稿」。它是 codex 的「记忆」实体——所有发给模型的
+/// 上下文、token 计费、压缩/回滚都以这里的 `items` 为单一事实来源。
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContextManager {
     /// The oldest items are at the beginning of the vector.
+    /// 最旧的条目在 vec 头部（index 0），最新的在尾部——顺序即时间序。
     items: Vec<ResponseItem>,
     /// Bumped whenever history is rewritten, such as compaction or rollback.
+    /// 历史每被「整体改写」一次就 +1（压缩、回滚等）。外部据此判断缓存是否失效、
+    /// 是否需要重新规范化，相当于一个乐观锁版本号。
     history_version: u64,
     token_info: Option<TokenUsageInfo>,
     /// Reference context snapshot used for diffing and producing model-visible
@@ -96,6 +116,10 @@ impl ContextManager {
     }
 
     /// `items` is ordered from oldest to newest.
+    ///
+    /// 把一批新条目追加进历史（入参须按「旧→新」排好序）。两步把关：
+    /// ① `is_api_message` 过滤——system 消息、纯本地触发项（如 CompactionTrigger）
+    ///    不进历史；② `process_item` 按截断策略压缩超长的工具输出，避免单条撑爆。
     pub(crate) fn record_items<I>(&mut self, items: I, policy: TruncationPolicy)
     where
         I: IntoIterator,
@@ -116,6 +140,10 @@ impl ContextManager {
     /// normalization and drops un-suited items. When `input_modalities` does not
     /// include `InputModality::Image`, images are stripped from messages and tool
     /// outputs.
+    ///
+    /// 产出「可直接发给模型」的历史视图。注意签名是 `mut self`（按值消费）：
+    /// 规范化会原地改写 items，所以这里拿走快照的所有权，避免污染长期存的历史。
+    /// 规范化做三件事：补全 call↔output 配对、删孤儿 output、模型不支持图片时剥图。
     pub(crate) fn for_prompt(mut self, input_modalities: &[InputModality]) -> Vec<ResponseItem> {
         self.normalize_history(input_modalities);
         self.items
@@ -162,6 +190,10 @@ impl ContextManager {
         Some(base_tokens.saturating_add(items_tokens))
     }
 
+    /// 丢弃最旧的一条历史（压缩遇到「上下文窗口超限」时反复调用它来腾空间）。
+    /// 关键点：删掉的条目若是 call/output 配对的一半，会顺带删掉另一半，
+    /// 以维持「每个 call 都有 output、每个 output 都有 call」的不变量。
+    /// 注意此处不 bump `history_version`——这是压缩内部的微调，非整体改写。
     pub(crate) fn remove_first_item(&mut self) {
         if !self.items.is_empty() {
             // Remove the oldest item (front of the list). Items are ordered from
@@ -239,6 +271,11 @@ impl ContextManager {
     /// `reference_context_item`. The surviving history no longer contains the full bundle that
     /// established the prior baseline, so future turns must fall back to full reinjection instead
     /// of diffing against stale state.
+    ///
+    /// 一句话：从尾部砍掉最近 `num_turns` 个「指令轮」（用户消息或结构化的
+    /// inter-agent 指令，这俩才算轮边界）。语义对齐 thread-rollback：
+    /// 0 轮 = 空操作；没有用户轮 = 空操作；要砍的超过现有轮数 = 砍光所有用户轮，
+    /// 但「第一个用户消息之前」的会话前缀（session prefix）一律保留。
     pub(crate) fn drop_last_n_user_turns(&mut self, num_turns: u32) {
         if num_turns == 0 {
             return;
@@ -311,6 +348,12 @@ impl ContextManager {
 
     /// When true, the server already accounted for past reasoning tokens and
     /// the client should not re-estimate them.
+    ///
+    /// 估算「当前历史一共占多少 token」。难点在于服务端返回的 `total_tokens` 只覆盖
+    /// 到「最后一次 API 响应」那一刻，之后本地又追加的条目（工具输出等）没被计入。
+    /// 所以这里 = 服务端报的值 + 本地新增条目的估算；当 `server_reasoning_included`
+    /// 为 false 时，还要额外补回「非末轮的 reasoning 条目」——因为这些推理 token
+    /// 服务端没替我们算，得自己估。
     pub(crate) fn get_total_token_usage(&self, server_reasoning_included: bool) -> i64 {
         let last_tokens = self
             .token_info
@@ -363,6 +406,10 @@ impl ContextManager {
     /// 1. every call (function/custom) has a corresponding output entry
     /// 2. every output has a corresponding call entry
     /// 3. when images are unsupported, image content is stripped from messages and tool outputs
+    ///
+    /// 发给模型前的「体检」：保证 ① 每个工具调用都有对应输出；② 每个输出都有对应
+    /// 调用（删孤儿）；③ 模型不支持图片时剥掉所有图片内容。前两条是 Responses API
+    /// 的硬约束——缺一半会被服务端拒；删条目（压缩/回滚）容易留下半截配对，故在此兜底。
     fn normalize_history(&mut self, input_modalities: &[InputModality]) {
         // all function/tool calls must have a corresponding output
         normalize::ensure_call_outputs_present(&mut self.items);
@@ -481,6 +528,10 @@ pub(crate) fn truncate_function_output_payload(
 /// API messages include every non-system item (user/assistant messages, reasoning,
 /// tool calls, tool outputs, shell calls, web-search calls, and image-generation
 /// calls).
+///
+/// 「这条该不该进历史」的守门员。原则：除了 system 消息、纯本地标记
+/// （`CompactionTrigger` 只是触发信号、`Other` 是占位）之外，凡是会出现在
+/// 模型对话里的项都算 API message，放行入历史。
 fn is_api_message(message: &ResponseItem) -> bool {
     match message {
         ResponseItem::Message { role, .. } => role.as_str() != "system",
@@ -743,6 +794,9 @@ pub(crate) fn is_codex_generated_item(item: &ResponseItem) -> bool {
     ) || matches!(item, ResponseItem::Message { role, .. } if role == "developer")
 }
 
+/// 判断一条目是否构成「用户轮边界」。两种算：真正的用户消息（排除掉
+/// contextual 注入的那种），或助手发出的 inter-agent 指令。回滚按轮裁剪、
+/// reasoning token 估算「末轮之前」都靠它定位边界。
 pub(crate) fn is_user_turn_boundary(item: &ResponseItem) -> bool {
     let ResponseItem::Message { role, content, .. } = item else {
         return false;

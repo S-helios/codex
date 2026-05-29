@@ -1,3 +1,20 @@
+//! 【文件职责】apply_patch 工具的核心实现：把 Codex 自定义的「补丁文本」
+//! （`*** Begin Patch … *** End Patch`）解析成 hunk，再落盘到文件系统
+//! （新增 / 删除 / 更新 / 移动）。这是模型修改用户代码的唯一受控通道。
+//!
+//! 【架构位置】
+//!   层级：工具执行层（独立 crate `codex-apply-patch`，刻意不依赖 `codex-core`）
+//!   上游：core 的 apply_patch 工具处理器、standalone 可执行入口（进程自调用）
+//!   下游：`ExecutorFileSystem`（真正读写磁盘，可携带沙箱上下文）
+//!
+//! 【数据流】
+//!   patch 文本 → parse_patch() → Vec<Hunk> → apply_hunks_to_files()
+//!   → ExecutorFileSystem 落盘 → AffectedPaths / AppliedPatchDelta
+//!
+//! 【阅读建议】先看 apply_patch() / apply_hunks_to_files() 主流程，
+//!   再看 compute_replacements() 的上下文匹配算法（本文件最精巧的部分）；
+//!   底部 `#[cfg(test)]` 测试可跳过。
+
 mod invocation;
 mod parser;
 mod seek_sequence;
@@ -41,6 +58,12 @@ pub const APPLY_PATCH_TOOL_INSTRUCTIONS: &str = include_str!("../apply_patch_too
 /// `codex-arg0` to depend on `codex-core`), it remains part of the "codex core"
 /// process-invocation contract for the standalone `apply_patch` command
 /// surface.
+///
+/// Codex 可执行文件「自调用」时用的特殊 argv[1] 标志：当 Codex 进程以
+/// `codex --codex-run-as-apply-patch <patch>` 的形式重新拉起自己时，
+/// 走的就是内置 apply_patch 路径（而非 shell）。这样既复用同一个二进制，
+/// 又能让补丁应用受沙箱约束。常量放在本 crate 是为了让 `codex-arg0`
+/// 不必依赖庞大的 `codex-core`。
 pub const CODEX_CORE_APPLY_PATCH_ARG1: &str = "--codex-run-as-apply-patch";
 
 #[derive(Debug, Error, PartialEq)]
@@ -53,6 +76,10 @@ pub enum ApplyPatchError {
     #[error("{0}")]
     ComputeReplacements(String),
     /// A raw patch body was provided without an explicit `apply_patch` invocation.
+    /// 检测到裸补丁体，但没有显式的 apply_patch 调用。
+    /// 设计取舍：拒绝「隐式」补丁，强制模型必须以 `["apply_patch", "<patch>"]`
+    /// 的形式调用。否则一段看起来像补丁的普通文本可能被误当成文件改写指令执行，
+    /// 这是有意收窄的安全边界。
     #[error(
         "patch detected without explicit call to apply_patch. Rerun as [\"apply_patch\", \"<patch>\"]"
     )]
@@ -134,6 +161,10 @@ pub enum MaybeApplyPatchVerified {
 
 /// ApplyPatchAction is the result of parsing an `apply_patch` command. By
 /// construction, all paths should be absolute paths.
+///
+/// 解析 apply_patch 命令后的结果。关键不变量：`changes` 里的 key 一律是
+/// **绝对路径**（解析阶段就用 `cwd` 把补丁里的相对路径解析成绝对路径）。
+/// 这条不变量让下游落盘逻辑无需再关心相对路径，也便于沙箱按绝对路径鉴权。
 #[derive(Debug, PartialEq)]
 pub struct ApplyPatchAction {
     changes: HashMap<PathBuf, ApplyPatchFileChange>,
@@ -183,6 +214,14 @@ impl ApplyPatchAction {
 }
 
 /// Textual file changes that were actually committed while applying a patch.
+///
+/// 应用补丁过程中「确实已落盘」的文本变更集合。与 `ApplyPatchAction`（意图）
+/// 不同，这里记录的是**实际发生**的写入，用于失败回滚 / 审计。
+///
+/// `exact` 是核心设计点：标记本 delta 是否「精确」反映了磁盘真实状态。
+/// 写入失败可能在报错前就已部分改写文件（如先 truncate 再 ENOSPC），
+/// 或目标是符号链接 / 无法读回旧内容——这些情况下 `exact=false`，
+/// 提醒调用方「我记录的变更可能与磁盘不完全一致，回滚需谨慎」。
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppliedPatchDelta {
     changes: Vec<AppliedPatchChange>,
@@ -276,6 +315,15 @@ impl ApplyPatchFailure {
 }
 
 /// Applies the patch and prints the result to stdout/stderr.
+///
+/// apply_patch 的公开入口：先 parse_patch() 把补丁文本解析为 hunk，
+/// 解析失败就把人类可读的错误写到 stderr 并返回（不写任何文件）；
+/// 解析成功再交给 apply_hunks() 落盘。
+///
+/// @param fs      - 文件系统抽象，本地直写或经沙箱代理由它决定
+/// @param sandbox - Some 时所有读写都带上沙箱上下文做权限校验
+/// 副作用：写 stdout/stderr，并通过 `fs` 改写磁盘
+/// 返回：Ok(delta) 含实际落盘的变更；Err 携带已提交的部分 delta（见 ApplyPatchFailure）
 pub async fn apply_patch(
     patch: &str,
     cwd: &AbsolutePathBuf,
@@ -361,6 +409,14 @@ pub struct AffectedPaths {
 
 /// Apply the hunks to the filesystem, returning which files were added, modified, or deleted.
 /// Returns an error if the patch could not be applied.
+///
+/// 把解析好的 hunk 逐条落盘，是 apply_patch 的核心循环。三种 hunk 分别走
+/// 新增 / 删除 / 更新（含「移动」）三条分支。
+///
+/// @param delta - 出参（就地累积）：每成功提交一项写入就 push 一条记录；
+///                任何一步发现「可能与磁盘不一致」就把 `delta.exact` 置 false。
+/// 副作用：通过 `fs` 改写磁盘；就地修改 `delta`
+/// 异常：任一 hunk 失败立即返回 Err，已提交的变更仍保留在 `delta` 里（不自动回滚）
 async fn apply_hunks_to_files(
     hunks: &[Hunk],
     cwd: &AbsolutePathBuf,
@@ -378,6 +434,8 @@ async fn apply_hunks_to_files(
     // A failed write can still have modified the target before surfacing an
     // error (for example by truncating before ENOSPC), so the accumulated
     // delta is no longer exact when a write fails.
+    // 写失败也可能已经改动了目标文件（例如先截断再遇到 ENOSPC），
+    // 所以一旦写失败就把 delta 标记为非精确（exact=false），再向上抛错。
     macro_rules! try_write {
         ($result:expr) => {
             match $result {
@@ -394,6 +452,8 @@ async fn apply_hunks_to_files(
         let affected_path = hunk.path().to_path_buf();
         let path_abs = hunk.resolve_path(cwd);
         match hunk {
+            // ── 分支一：新增文件 ──────────────────────────────────────
+            // 写前先读旧内容（若已存在则记为被覆盖），便于事后回滚。
             Hunk::AddFile { contents, .. } => {
                 let overwritten_content =
                     read_optional_file_text_for_delta(&path_abs, fs, sandbox, &mut delta.exact)
@@ -416,6 +476,9 @@ async fn apply_hunks_to_files(
                 });
                 added.push(affected_path);
             }
+            // ── 分支二：删除文件 ──────────────────────────────────────
+            // 删前先把旧内容读进 delta（便于回滚）；读不到就置 exact=false。
+            // remove 用非递归 / 非强制选项，且先 ensure_not_directory 防止误删目录。
             Hunk::DeleteFile { .. } => {
                 note_existing_path_delta_support(&path_abs, fs, sandbox, &mut delta.exact).await;
                 let deleted_content = fs.read_file_text(&path_abs, sandbox).await.ok();
@@ -454,6 +517,12 @@ async fn apply_hunks_to_files(
                 }
                 deleted.push(affected_path);
             }
+            // ── 分支三：更新（可含「移动」）文件 ──────────────────────
+            // 先用 chunks 在内存里算出新内容，再分两种情况落盘：
+            //   · move_path = Some：「改名 + 改内容」。关键顺序是**先写新路径、
+            //     后删旧路径**——万一删源失败，新文件已在，不至于「旧的没了、
+            //     新的也没写成」造成数据丢失。
+            //   · move_path = None：原地覆盖写回。
             Hunk::UpdateFile {
                 move_path, chunks, ..
             } => {
@@ -476,6 +545,9 @@ async fn apply_hunks_to_files(
                         )
                         .await
                     );
+                    // 先登记成「在 dest 新增」这一既成事实：若接下来删源失败而
+                    // 提前返回，delta 至少如实保留「dest 已被写入」。记下其下标，
+                    // 待删源成功后原地改写成完整的 Update。
                     let dest_write_change_index = delta.changes.len();
                     delta.changes.push(AppliedPatchChange {
                         path: dest_abs.to_path_buf(),
@@ -512,6 +584,7 @@ async fn apply_hunks_to_files(
                         .await;
                         return Err(error);
                     }
+                    // 删源成功后，把上面那条临时 Add 改写成语义完整的 Update（移动）。
                     delta.changes[dest_write_change_index] = AppliedPatchChange {
                         path: path_abs.into_path_buf(),
                         change: AppliedPatchFileChange::Update {
@@ -552,6 +625,7 @@ async fn apply_hunks_to_files(
     })
 }
 
+/// 落盘前的守卫：目标是目录就报错，避免把目录误当文件去删除 / 覆盖。
 async fn ensure_not_directory(
     path: &AbsolutePathBuf,
     fs: &dyn ExecutorFileSystem,
@@ -567,6 +641,8 @@ async fn ensure_not_directory(
     Ok(())
 }
 
+/// 删除报错后判断这次失败是否「无副作用」：若文件仍在且内容与删前一致，
+/// 说明删除其实没动到磁盘，delta 仍可视为精确（返回 true）；否则返回 false。
 async fn remove_failure_was_side_effect_free(
     path: &AbsolutePathBuf,
     expected_content: Option<&str>,
@@ -582,6 +658,8 @@ async fn remove_failure_was_side_effect_free(
     }
 }
 
+/// 读目标旧文本用于 delta 的「被覆盖内容」记录：文件不存在返回 None（正常，
+/// 表示纯新增）；读失败（非 NotFound）返回 None 并置 exact=false（旧内容没留住）。
 async fn read_optional_file_text_for_delta(
     path: &AbsolutePathBuf,
     fs: &dyn ExecutorFileSystem,
@@ -599,6 +677,10 @@ async fn read_optional_file_text_for_delta(
     }
 }
 
+/// 探测路径当前状态，判断「按文本记录的 delta」是否还能精确反映磁盘：
+/// 仅当目标是「普通文件且非符号链接」时才保持 exact；若是目录 / 符号链接 /
+/// 特殊文件，或 stat 出错（NotFound 除外），就把 exact 置 false——这些情况下
+/// 旧内容无法用一段文本如实捕获，回滚也就不能保证精确。
 async fn note_existing_path_delta_support(
     path: &AbsolutePathBuf,
     fs: &dyn ExecutorFileSystem,
@@ -613,6 +695,8 @@ async fn note_existing_path_delta_support(
     }
 }
 
+/// 写文件；若因父目录不存在（NotFound）而失败，就递归建好父目录再写一次。
+/// 这样补丁新增「深层路径」文件时无需单独的 mkdir 步骤。其它错误原样上抛。
 async fn write_file_with_missing_parent_retry(
     fs: &dyn ExecutorFileSystem,
     path_abs: &AbsolutePathBuf,
@@ -654,6 +738,10 @@ struct AppliedPatch {
 
 /// Return *only* the new file contents (joined into a single `String`) after
 /// applying the chunks to the file at `path`.
+///
+/// 读原文件 → 按 `\n` 切行（丢掉末尾换行产生的空串，使行数与标准 diff 对齐）
+/// → compute_replacements 算替换 → apply_replacements 施工 → 补回末尾换行 →
+/// join 成新文本。同时返回 original_contents 供 delta 记录旧内容。
 async fn derive_new_contents_from_chunks(
     path_abs: &AbsolutePathBuf,
     chunks: &[UpdateFileChunk],
@@ -691,6 +779,14 @@ async fn derive_new_contents_from_chunks(
 /// Compute a list of replacements needed to transform `original_lines` into the
 /// new lines, given the patch `chunks`. Each replacement is returned as
 /// `(start_index, old_len, new_lines)`.
+///
+/// 本文件最精巧的算法：把每个 chunk 的「上下文行 + 待替换旧行」在原文件里
+/// 定位，产出一组 `(起始行号, 删除行数, 新行)` 替换指令。要点：
+///   · chunk 带 change_context 时，先用 seek_sequence 锚定上下文行、再从其后
+///     继续匹配——保证「相同旧行」出现多次时能落到正确那一处。
+///   · old_lines 为空 = 纯插入：插到文件末尾（若有末尾空行则插在它前面）。
+///   · line_index 只增不减，避免回头重复匹配；末尾按起点升序排序，
+///     交给 apply_replacements 倒序施工（见该函数说明）。
 fn compute_replacements(
     original_lines: &[String],
     path: &Path,
@@ -741,7 +837,8 @@ fn compute_replacements(
         // fails and the pattern ends with an empty string, retry without that
         // final element so that modifications touching the end‑of‑file can be
         // located reliably.
-
+        // 中文小结：先原样找 old_lines；若找不到且模式以空串（=文件末换行哨兵）
+        // 结尾，就去掉该空串重试，让贴着 EOF 的替换也能可靠命中。
         let mut pattern: &[String] = &chunk.old_lines;
         let mut found =
             seek_sequence::seek_sequence(original_lines, pattern, line_index, chunk.is_end_of_file);
@@ -783,6 +880,10 @@ fn compute_replacements(
 
 /// Apply the `(start_index, old_len, new_lines)` replacements to `original_lines`,
 /// returning the modified file contents as a vector of lines.
+///
+/// 把替换指令真正作用到行数组上。关键点：**必须倒序施工**（起点从大到小），
+/// 否则前面的增删会移动后面替换点的下标导致错位。每条先删 old_len 行、再插新行；
+/// 删除带 `start_idx < lines.len()` 守卫以容忍末尾插入等越界场景。
 fn apply_replacements(
     mut lines: Vec<String>,
     replacements: &[(usize, usize, Vec<String>)],

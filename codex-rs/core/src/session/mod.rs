@@ -1,3 +1,12 @@
+//! 【文件职责】session 模块的根，承载两个核心抽象：
+//!   1. Codex —— 对外的「会话句柄」。它是一对队列：submit(Op) 投入提交、next_event() 取出
+//!      事件。spawn() 负责建好 Session 并起一个后台 submission_loop 任务消费提交，直到收到
+//!      Op::Shutdown。调用方（CLI / app-server / 子 agent）只与这层打交道。
+//!   2. impl Session（本文件下半部）—— Session 这个「会话级 God-object」的一大批方法实现
+//!      （结构体本身定义在 session.rs）。这些方法是「会话服务面」：发事件、记历史、算 token、
+//!      发审批 / 权限请求、改运行期配置、维护限流信息等，被每个回合（turn.rs）反复调用。
+//! 【架构位置】上游是 lib.rs/ThreadManager 创建 Codex；下游 spawn 出的 submission_loop 把
+//!   每条 Op 交给 handlers.rs 处理，回合执行则进入 turn.rs。Session 作为共享状态贯穿始终。
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -369,14 +378,19 @@ use codex_utils_stream_parser::ProposedPlanSegment;
 
 /// The high-level interface to the Codex system.
 /// It operates as a queue pair where you send submissions and receive events.
+/// Codex 系统的高层接口，本质是「一对队列」：tx_sub 投提交、rx_event 收事件。调用方不直接
+/// 碰 Session，只通过这对通道异步通信——这种 actor 式设计让会话循环单线程串行处理提交，
+/// 避免并发改状态。session 字段是同一个 Session 的 Arc，供句柄侧（如取 token、状态）旁路读取。
 pub struct Codex {
     pub(crate) tx_sub: Sender<Submission>,
     pub(crate) rx_event: Receiver<Event>,
     // Last known status of the agent.
+    // agent 的最近状态快照（watch 通道）：调用方可不消费事件流就轮询「在跑 / 空闲 / 出错」。
     pub(crate) agent_status: watch::Receiver<AgentStatus>,
     pub(crate) session: Arc<Session>,
     // Shared future for the background submission loop completion so multiple
     // callers can wait for shutdown.
+    // 后台 submission_loop 结束的「可共享 future」：多个调用方都能 await 同一个关停信号。
     pub(crate) session_loop_termination: SessionLoopTermination,
 }
 
@@ -429,6 +443,9 @@ const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyb
 
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
+    /// 创建并初始化一个会话。本方法只负责处理父级 trace（分布式追踪载体）并建好
+    /// thread_spawn span，真正的初始化在 spawn_internal 里。这层包裹是为了让整个初始化
+    /// 过程挂在正确的 span 下（otel 链路追踪）。
     pub(crate) async fn spawn(args: CodexSpawnArgs) -> CodexResult<CodexSpawnOk> {
         let parent_trace = match args.parent_trace {
             Some(trace) => {
@@ -636,6 +653,9 @@ impl Codex {
         let thread_id = session.conversation_id;
 
         // This task will run until Op::Shutdown is received.
+        // 关键一步：起后台任务跑 submission_loop，串行消费 rx_sub 里的提交，直到 Op::Shutdown。
+        // 这是会话的「心跳」——所有回合都在这个任务里依次执行；句柄侧通过 tx_sub 投递、
+        // rx_event 收结果，二者经通道解耦。
         let session_for_loop = Arc::clone(&session);
         let session_loop_handle = tokio::spawn(async move {
             submission_loop(session_for_loop, config, rx_sub)
@@ -675,6 +695,9 @@ impl Codex {
 
     /// Use sparingly: prefer `submit()` so Codex is responsible for generating
     /// unique IDs for each submission.
+    /// 把提交压入 tx_sub 队列（submission_loop 在另一端消费）。若通道已关闭，说明后台会话
+    /// 任务已死，统一翻译成 InternalAgentDied。submit()/submit_with_trace() 是它的便捷包装，
+    /// 负责生成唯一 id；直接用本方法需自带 id，故标注 sparingly。
     pub async fn submit_with_id(&self, mut sub: Submission) -> CodexResult<()> {
         if sub.trace.is_none() {
             sub.trace = current_span_w3c_trace_context();
@@ -708,6 +731,8 @@ impl Codex {
         Ok(())
     }
 
+    /// 队列另一端的出口：阻塞等待会话循环产出的下一个事件。通道关闭同样视作后台任务已死。
+    /// 调用方通常在循环里反复 next_event() 直到收到终态事件（如 TaskComplete）。
     pub async fn next_event(&self) -> CodexResult<Event> {
         let event = self
             .rx_event
@@ -839,6 +864,17 @@ async fn thread_title_from_thread_store(
     (!title.is_empty() && thread.preview.trim() != title).then(|| title.to_string())
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// impl Session：会话级「服务面」方法集（结构体定义在 session.rs）
+// 下面这一大批方法都是回合执行期间被反复调用的「能力」，可粗分几类：
+//   · 配置 / 元数据读写：app_server_client_metadata、get_config、refresh_runtime_config…
+//   · 事件与历史：send_event、record_conversation_items、replace_history…
+//   · token / 限流统计：get_total_token_usage、update_rate_limits…
+//   · 审批与权限请求（与 orchestrator 直接对接）：request_command_approval、
+//     request_patch_approval、request_permissions、notify_approval…
+//   · 上下文构建与转向：build_initial_context、steer_input、interrupt_task…
+// 多数方法先 self.state.lock().await 拿到内部可变状态再操作，故几乎都是 async。
+// ════════════════════════════════════════════════════════════════════════════
 impl Session {
     pub(crate) async fn app_server_client_metadata(&self) -> AppServerClientMetadata {
         let state = self.state.lock().await;
@@ -1592,6 +1628,9 @@ impl Session {
     }
 
     /// Persist the event to rollout and send it to clients.
+    /// 会话向外发事件的「总闸」。一条 EventMsg 在这里被：①写进 rollout trace（落盘可回放）；
+    /// ②包成带 turn_id 的 Event 经 send_event_raw 推给 rx_event；③按需镜像给父 agent / 实时
+    /// 通道；④再展开成「legacy 事件」兼容旧客户端协议。几乎所有用户可见输出都从这里流出。
     pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
         let legacy_source = msg.clone();
         self.services
@@ -1944,6 +1983,14 @@ impl Session {
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
     )]
+    /// 向用户发起一次「命令审批」并阻塞等结果。机制是经典的「事件出 + oneshot 回」：
+    ///   ① 建一对 oneshot，把发送端按 approval_id 登记进本回合的 pending_approvals 表；
+    ///   ② 发出 ExecApprovalRequest 事件给前端（带命令、cwd、可选的网络/execpolicy/权限提案
+    ///      以及可选的可选项集合）；
+    ///   ③ await 接收端拿用户裁决。用户在前端点选后，notify_approval 会按 approval_id 找到
+    ///      发送端 fire 回来。通道意外断开（如会话终止）则默认 Abort，绝不放行。
+    /// 这正是 orchestrator「需要审批就调本方法」的落点。approval_id 仅在子命令回调
+    /// （execve 拦截）时出现，普通命令级审批直接用 call_id。
     pub async fn request_command_approval(
         &self,
         turn_context: &TurnContext,
@@ -2020,6 +2067,9 @@ impl Session {
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
     )]
+    /// 与 request_command_approval 同构，但面向「补丁落盘」审批：登记 oneshot、发
+    /// ApplyPatchApprovalRequest 事件。差异在于本方法**直接返回接收端**而不在内部 await
+    /// ——调用方（apply_patch 运行时）可自行决定何时等待裁决，便于与其他异步工作交错。
     pub async fn request_patch_approval(
         &self,
         turn_context: &TurnContext,
@@ -2613,6 +2663,10 @@ impl Session {
         clippy::await_holding_invalid_type,
         reason = "MCP app context rendering reads through the session-owned manager guard"
     )]
+    /// 组装一个回合「开场」要注入对话的上下文条目集（developer / contextual user 段）。
+    /// 它把分散的会话状态拼成模型能读懂的指令块：模型切换提示、权限说明、协作模式、可用
+    /// 技能 / 插件 / 连接器、AGENTS.md 用户指令等，最终渲染成若干 ResponseItem 前插到历史。
+    /// 这是「系统/开发者提示词」在每回合实际成形的地方——与文档里「上下文如何拼装」对应。
     pub(crate) async fn build_initial_context(
         &self,
         turn_context: &TurnContext,
@@ -3090,6 +3144,10 @@ impl Session {
     /// Inject additional user input into the currently active turn.
     ///
     /// Returns the active turn id when accepted.
+    /// 「转向」：把用户的新输入塞进**正在跑**的回合（而非排队等下一个回合）。这是 Codex
+    /// 支持「打断 / 追加指令」体验的关键——输入会被压入待处理队列，由 run_turn 在下一轮
+    /// 采样前「drain pending input」消费（见 turn.rs 步骤①）。前置校验：必须有活跃且可转向
+    /// 的回合（仅 Regular，Review/Compact 不可转向）、turn_id 若指定须匹配、输入非空。
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"

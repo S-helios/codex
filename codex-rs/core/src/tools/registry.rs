@@ -1,3 +1,11 @@
+//! 【文件职责】工具执行的「注册表 + 分发引擎」。ToolRegistry 按 ToolName 持有一张
+//! 「名字 → 处理器（CoreToolRuntime）」表；dispatch_any_with_terminal_outcome 是所有
+//! 本地工具调用的统一执行入口，串起完整生命周期：
+//!   计数 → 查表 → 遥测打点 → notify_tool_start → PreToolUse hook（可拦截 / 改写入参）
+//!   → 执行 handler → PostToolUse hook（可叫停 / 改写输出）→ notify_tool_finish。
+//! 【架构位置】上游是 router.rs（已把调用包成 ToolInvocation），下游是各具体工具
+//!   handler（handlers/ 目录，如 shell、apply_patch、多代理等）。
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -45,6 +53,10 @@ pub use codex_tools::ToolExposure;
 ///
 /// Implementers provide the shared `ToolExecutor` behavior plus optional
 /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
+///
+/// 本地工具的统一运行时契约：在通用 ToolExecutor 之上，附加 core 私有的元数据钩子
+/// ——工具搜索信息、payload 类型匹配、取消时是否等待优雅收尾、遥测标签等。handlers/
+/// 下每个具体工具都实现它（多数经宏 / 适配器生成），registry 只面向这个 trait 对象分发。
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
     fn search_info(&self) -> Option<ToolSearchInfo> {
         None
@@ -327,6 +339,8 @@ impl CoreToolRuntime for ExposureOverride {
     }
 }
 
+/// 工具注册表：一张 ToolName → 处理器 的映射。from_tools 构建时若发现同名重复会
+/// error_or_panic（防止两个工具抢同一个名字导致分发歧义）。
 pub struct ToolRegistry {
     tools: HashMap<ToolName, Arc<dyn CoreToolRuntime>>,
 }
@@ -405,6 +419,12 @@ impl ToolRegistry {
             .await
     }
 
+    /// 工具调用的统一执行入口，承载完整生命周期。terminal_outcome_reached：某些
+    /// 「终态」工具会自行声明已结束，此标志用于避免重复 notify_tool_finish（见
+    /// notify_tool_finish_if_unclaimed）。关键阶段（按代码顺序）：原子自增 tool_calls
+    /// 计数 → 按名查表（查不到即回错给模型）→ payload 类型校验 → PreToolUse hook
+    /// （Blocked 直接拒、可改写入参）→ 执行 handler → PostToolUse hook（可叫停、可用
+    /// 反馈文本替换模型可见输出）→ 通知结束并返回结果。
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "tool dispatch must keep active-turn accounting atomic"
@@ -545,6 +565,8 @@ impl ToolRegistry {
             }
         }
 
+        // response_cell 是个「出参信元」：handler 的真正结果要从下面的遥测闭包里带出来，
+        // 而闭包本身只向日志返回 (预览, 成功与否)，故用 Mutex<Option<_>> 暂存真结果。
         let response_cell = tokio::sync::Mutex::new(None);
         let invocation_for_tool = invocation.clone();
         let log_payload = invocation.payload.log_payload();

@@ -1,3 +1,24 @@
+//! 【文件职责】「线程管理器（ThreadManager）」—— codex-core 对外的顶层门面，
+//! 负责创建 / 恢复 / 派生（fork）/ 关停所有「线程（thread，旧称 conversation）」，
+//! 并把活跃线程以 `ThreadId → Arc<CodexThread>` 的映射常驻内存。
+//!
+//! 【架构定位】对照总览架构图：用户输入 → CLI → 各运行模式 → ThreadManager。
+//!   它之于 Session，相当于「会话池」之于「单次会话」：本身不跑 agent 循环，只把
+//!   每个线程的生命周期调度起来；真正的「采样 → 工具 → 回填」主循环在 Session /
+//!   CodexThread 内部（见 session/turn.rs）。
+//!
+//! 【为何 state 收进 Arc】子 Agent 控制面 AgentControl 需要在不持有整个
+//!   ThreadManager 的前提下回调线程能力，故把共享字段集中到 `ThreadManagerState`，
+//!   再用一个 Arc 持有、可 downgrade 成 Weak 交给 AgentControl —— 既能共享又不形成
+//!   强引用环，也省去每个方法都写 `Arc<&Self>`。
+//!
+//! 【阅读路线】先看 `ThreadManager` / `ThreadManagerState` 两个 struct 的字段，
+//!   再看 `impl ThreadManager` 的几个入口：
+//!     · start_thread*    —— 新建线程
+//!     · resume_thread_*  —— 从 rollout / 历史恢复线程
+//!     · fork_thread*     —— 基于已有线程派生新线程（快照语义见 `ForkSnapshot`）
+//!     · shutdown_all_threads_bounded —— 带超时的优雅批量关停
+
 use crate::SkillsManager;
 use crate::agent::AgentControl;
 use crate::attestation::AttestationProvider;
@@ -105,6 +126,10 @@ impl Drop for TempCodexHomeGuard {
 
 /// Represents a newly created Codex thread (formerly called a conversation), including the first event
 /// (which is [`EventMsg::SessionConfigured`]).
+///
+/// 「新建线程」的返回包：除线程句柄外，还捎上第一条事件
+/// [`EventMsg::SessionConfigured`]，让调用方一拿到线程就知道本次会话已敲定的
+/// 模型 / 沙箱 / 工具等配置（省去再发一次查询往返）。
 pub struct NewThread {
     pub thread_id: ThreadId,
     pub thread: Arc<CodexThread>,
@@ -120,6 +145,12 @@ pub struct NewThread {
 //   the last stable model boundary without synthesizing an interrupt.
 // - `WaitUntilNextSamplingBoundary` (or similar) for callers that prefer to
 //   fork after the next sampling boundary rather than interrupting immediately.
+/// 「派生快照模式」—— fork 一个线程时，决定从源线程历史的哪个点切断。
+/// 两种语义：
+///   ① `TruncateBeforeNthUserMessage(n)`：按「第 n 条用户消息」截断，回到某轮
+///      对话之前（n 越界且源线程正在回合中时，退而切到当前回合开始之前）；
+///   ② `Interrupted`：按「此刻被打断」截断，保留到当前；若快照停在回合中途，
+///      会补一个与真实打断一致的 `<turn_aborted>` 标记。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkSnapshot {
     /// Fork a committed prefix ending strictly before the nth user message.
@@ -150,6 +181,9 @@ impl From<usize> for ForkSnapshot {
     }
 }
 
+/// 「批量关停报告」—— shutdown_all_threads_bounded 的结果汇总：按结局把线程 id
+/// 分到三个桶，便于调用方分别处理。注意区分后两者：submit_failed 是连关停指令
+/// 都没递进去（线程已不可达），timed_out 是指令进去了但超时仍未停。
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ThreadShutdownReport {
     pub completed: Vec<ThreadId>,
@@ -165,6 +199,10 @@ enum ShutdownOutcome {
 
 /// [`ThreadManager`] is responsible for creating threads and maintaining
 /// them in memory.
+///
+/// 「线程管理器」对外句柄：几乎只是 `Arc<ThreadManagerState>` 的薄包装。真正的
+/// 共享状态都在 state 里，这样 AgentControl 能持有它的 Weak 而不延长生命周期；
+/// `_test_codex_home_guard` 仅测试态使用，在 Drop 时清理临时 CODEX_HOME 目录。
 pub struct ThreadManager {
     state: Arc<ThreadManagerState>,
     _test_codex_home_guard: Option<TempCodexHomeGuard>,
@@ -194,6 +232,15 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
 /// Shared, `Arc`-owned state for [`ThreadManager`]. This `Arc` is required to have a single
 /// `Arc` reference that can be downgraded to by `AgentControl` while preventing every single
 /// function to require an `Arc<&Self>`.
+///
+/// 「线程管理器的共享状态」，字段大致分四组：
+///   · 线程表与通知：`threads`（活跃线程映射，单写多读用 RwLock）、
+///     `thread_created_tx`（新线程创建广播，供 UI / 订阅方实时感知）；
+///   · 各类「管理器」：auth / models / environment / skills / plugins / mcp /
+///     extensions —— 创建线程时注入给 Session，共同构成线程的能力集；
+///   · 持久化：`thread_store`（线程元数据存储抽象）、`state_db`（SQLite 句柄）；
+///   · 身份与遥测：session_source / installation_id / analytics_events_client，
+///     以及仅测试态用于截获已提交 Op 的 `ops_log`。
 pub(crate) struct ThreadManagerState {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
     thread_created_tx: broadcast::Sender<ThreadId>,
@@ -753,6 +800,9 @@ impl ThreadManager {
     /// Removes the thread from the manager's internal map, though the thread is stored
     /// as `Arc<CodexThread>`, it is possible that other references to it exist elsewhere.
     /// Returns the thread if the thread was found and removed.
+    ///
+    /// 仅从管理器的内存映射里摘除：由于线程以 `Arc<CodexThread>` 保存，摘除并不等于
+    /// 销毁——别处可能仍持有引用，线程要到最后一个 Arc 释放后才真正析构。
     pub async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
         self.state.threads.write().await.remove(thread_id)
     }
@@ -760,6 +810,11 @@ impl ThreadManager {
     /// Tries to shut down all tracked threads concurrently within the provided timeout.
     /// Threads that complete shutdown are removed from the manager; incomplete shutdowns
     /// remain tracked so callers can retry or inspect them later.
+    ///
+    /// 「带超时的并发批量关停」，三步走：① 先在读锁内把线程表快照成 Vec 再释放锁，
+    /// 避免持锁跨 await；② 用 FuturesUnordered 让所有线程的 shutdown 并发推进，各自
+    /// 套 `tokio::time::timeout`，结局归为 完成 / 提交失败 / 超时；③ 仅把「已完成」
+    /// 的从表中摘除，未完成的留在表里供调用方重试或排查。最后按 id 排序保证结果确定。
     pub async fn shutdown_all_threads_bounded(&self, timeout: Duration) -> ThreadShutdownReport {
         let threads = {
             let threads = self.state.threads.read().await;
@@ -812,6 +867,10 @@ impl ThreadManager {
     /// `snapshot` and starting a new thread with identical configuration
     /// (unless overridden by the caller's `config`). The new thread will have
     /// a fresh id.
+    ///
+    /// 「派生线程」：按 `snapshot`（见 [`ForkSnapshot`]）从源线程的 rollout 历史切出
+    /// 一段前缀，以此为初始历史新建线程（除非 caller 用 config 覆盖，否则沿用源配置），
+    /// 新线程获得全新 id。泛型 `S: Into<ForkSnapshot>` 是为兼容传 usize 的旧调用点。
     pub async fn fork_thread<S>(
         &self,
         snapshot: S,
@@ -1186,6 +1245,15 @@ impl ThreadManagerState {
         .await
     }
 
+    /// 「线程创建的真正工场」—— 所有 start / resume / fork / spawn 路径最终都汇到这里。
+    /// 流程：
+    ///   1. 若是「恢复」且目标线程已在内存且仍在运行 → 幂等返回现有线程（顺带校验
+    ///      rollout 路径一致，不一致即报错）；若已停则先摘掉陈旧条目；
+    ///   2. 解析环境选择、父级 trace；
+    ///   3. `Codex::spawn` 注入全部管理器（auth / models / mcp / skills / ...），
+    ///      真正拉起 Session 与 agent 循环；
+    ///   4. `finalize_thread_spawn` 等待首个 SessionConfigured 事件并登记进线程表；
+    ///   5. 恢复场景额外补发 resume 生命周期事件、应用 goal 模式的恢复副作用。
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn spawn_thread_with_source(
         &self,
@@ -1276,6 +1344,10 @@ impl ThreadManagerState {
         Ok(new_thread)
     }
 
+    /// 「收尾登记」：spawn 出 Codex 后，等它吐出的第一个事件——按约定必须是
+    /// `SessionConfigured` 且 id == INITIAL_SUBMIT_ID，否则判为协议违例报错。随后在
+    /// 写锁内登记进线程表；若该 id 槽位已被并发抢先占用，则关停这个重复线程并报错，
+    /// 以此保证「一个 thread_id 只对应一个活跃线程」。
     async fn finalize_thread_spawn(
         &self,
         codex: Codex,
