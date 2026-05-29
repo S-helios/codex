@@ -1,7 +1,35 @@
+//! 【文件职责】处理「回合（turn）级」的 JSON-RPC 请求：把客户端发来的
+//! `turn/start`、`turn/steer`、`turn/interrupt`、`review/start`、实时对话
+//! （realtime）、`thread/settings/update` 等请求，翻译成内核 `Op` 并投递给
+//! 对应的 `CodexThread`。
+//!
+//! 【架构位置】
+//!   层级：App-Server 请求处理层（位于 JSON-RPC 协议层与 codex-core 内核之间）
+//!   上游：`request_processors.rs` 的分发逻辑（按方法名路由到本处理器）
+//!   下游：`ThreadManager` / `CodexThread`（提交 `Op`、读取配置快照）、
+//!         `thread_lifecycle`（挂载监听器）、`OutgoingMessageSender`（回发响应/通知）
+//!
+//! 【数据流】
+//!   JSON-RPC 请求参数 → `*_inner()` 校验 + 翻译 → `Op::{UserInput,Review,...}`
+//!   → `submit_core_op()` 提交内核 → 返回 turn_id 包装成 `Turn` 响应
+//!
+//! 【与 thread_processor 的分工】本文件只管「在已存在的线程上推进回合」；
+//!   线程的创建/恢复/归档/列举等生命周期操作在 `thread_processor.rs`。
+//!   两者通过 `use super::*` 共享 `request_processors.rs` 顶部的全部导入。
+//!
+//! 【阅读建议】先看 `turn_start_inner()`（最核心的回合启动流程：校验输入 →
+//!   映射 input items → 构建 thread settings 覆盖 → 提交 `Op::UserInput`），
+//!   再看 `build_thread_settings_overrides()`（逐个请求字段翻译成内核覆盖项，
+//!   并做 preview 校验）。`review_start` 的内联/分离两种交付方式可按需阅读。
+
 use super::*;
 use codex_protocol::protocol::AdditionalContextEntry as CoreAdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind;
 
+/// 回合级请求处理器：持有推进回合所需的全部共享句柄（线程管理器、配置、
+/// 出站消息发送器、各类状态管理器等），所有 `turn/*` 与部分 `thread/*`
+/// 方法都挂在它的 `impl` 上。`Clone` 因为内部字段全是 `Arc`/可廉价克隆的句柄，
+/// 分发层会按连接克隆出处理器实例。
 #[derive(Clone)]
 pub(crate) struct TurnRequestProcessor {
     auth_manager: Arc<AuthManager>,
@@ -18,6 +46,8 @@ pub(crate) struct TurnRequestProcessor {
     skills_watcher: Arc<SkillsWatcher>,
 }
 
+// 将客户端给的（可能是相对的）workspace 根路径列表，逐个解析为绝对路径并去重。
+// base_cwd 作为相对路径的解析基准；去重保证同一根目录不会重复进入沙箱可写集合。
 fn resolve_runtime_workspace_roots(
     workspace_roots: Vec<PathBuf>,
     base_cwd: &AbsolutePathBuf,
@@ -32,6 +62,9 @@ fn resolve_runtime_workspace_roots(
     resolved_roots
 }
 
+// 把 API 层的「附加上下文」映射成内核类型。两层各有一套 enum（API 的
+// `AdditionalContextKind` vs 内核的 `CoreAdditionalContextKind`），此处逐项翻译。
+// 用 `BTreeMap` 而非 `HashMap` 是为了让 key 顺序稳定（影响 prompt 拼装的确定性）。
 fn map_additional_context(
     additional_context: Option<HashMap<String, AdditionalContextEntry>>,
 ) -> BTreeMap<String, CoreAdditionalContextEntry> {
@@ -55,6 +88,10 @@ fn map_additional_context(
         .collect()
 }
 
+/// `build_thread_settings_overrides()` 的入参聚合体。`turn/start` 与
+/// `thread/settings/update` 两条路径都会构造它，把「本次请求想覆盖的线程设置」
+/// （工作目录、审批策略、沙箱、权限、模型、推理力度、协作模式、人格等）打包传入。
+/// `method` 仅用于出错时拼可读的错误信息（区分是哪个 RPC 触发的）。
 struct ThreadSettingsBuildParams {
     method: &'static str,
     cwd: Option<PathBuf>,
@@ -250,6 +287,9 @@ impl TurnRequestProcessor {
 
         Ok((thread_id, thread))
     }
+    // 规整协作模式：若客户端没显式给 developer_instructions，则从内置预设里按
+    // mode 匹配出一份默认指令补上（预设里为空的指令不采用）。保证切换协作模式时
+    // 即使客户端省略了指令，也能带上该模式应有的开发者指令。
     fn normalize_collaboration_mode(
         &self,
         mut collaboration_mode: CollaborationMode,
@@ -267,6 +307,9 @@ impl TurnRequestProcessor {
         collaboration_mode
     }
 
+    /// 把 API 层的评审目标 `ApiReviewTarget` 校验并翻译为内核 `ReviewRequest`，
+    /// 同时产出一段「面向用户的提示文案」（hint，用作回合首条用户消息的展示文本）。
+    /// 校验包括：分支名/commit sha/自定义指令去空白后不得为空。
     fn review_request_from_target(
         target: ApiReviewTarget,
     ) -> Result<(ReviewRequest, String), JSONRPCErrorError> {
@@ -346,6 +389,9 @@ impl TurnRequestProcessor {
         self.outgoing.request_trace_context(request_id).await
     }
 
+    /// 向内核线程提交一个 `Op`，并附带从出站请求中取出的 W3C trace 上下文
+    /// （用于跨进程链路追踪）。返回内核分配的提交 id，上层通常把它当作 turn_id。
+    /// 这是本文件几乎所有「动作类」请求的统一出口。
     async fn submit_core_op(
         &self,
         request_id: &ConnectionRequestId,
@@ -357,6 +403,8 @@ impl TurnRequestProcessor {
             .await
     }
 
+    // 构造「输入过长」错误：除人类可读消息外，还在 data 里塞入机器可读的
+    // 错误码与字符数上下限，方便客户端 UI 精确提示（而非只显示一句话）。
     fn input_too_large_error(actual_chars: usize) -> JSONRPCErrorError {
         let mut error = invalid_params(format!(
             "Input exceeds the maximum length of {MAX_USER_INPUT_TEXT_CHARS} characters."
@@ -377,6 +425,19 @@ impl TurnRequestProcessor {
         Ok(())
     }
 
+    /// `turn/start` 的核心实现：在一个已加载的线程上启动新回合。
+    ///
+    /// 主要步骤（与函数体内顺序一致）：
+    ///   1. 校验输入长度，超限则记录埋点并返回错误；
+    ///   2. 按 thread_id 加载线程句柄，并写入 app-server 客户端信息；
+    ///   3. 解析 environment 选择项；
+    ///   4. 把 v2 输入项映射为内核 `CoreInputItem`，构建本回合的 thread settings 覆盖；
+    ///   5. 组装 `Op::UserInput` 提交内核，拿到的提交 id 即为 turn_id；
+    ///   6. 若本回合带输入，则异步触发「记忆（memories）」启动任务；
+    ///   7. 记录 request↔turn_id 映射，返回一个初始状态为 InProgress 的 `Turn`。
+    ///
+    /// 副作用：提交内核 Op（驱动模型开始生成）、写客户端信息、可能拉起记忆任务、
+    ///         向 outgoing 登记 request→turn 映射；失败路径都会调用 `track_error_response` 埋点。
     async fn turn_start_inner(
         &self,
         request_id: ConnectionRequestId,
@@ -411,6 +472,7 @@ impl TurnRequestProcessor {
         let environment_selections = self.parse_environment_selections(params.environments)?;
 
         // Map v2 input items to core input items.
+        // 把协议 v2 的用户输入项逐个转换为内核输入项（文本/图片等）。
         let mapped_items: Vec<CoreInputItem> = params
             .input
             .into_iter()
@@ -440,6 +502,8 @@ impl TurnRequestProcessor {
             .await?;
 
         // Start the turn by submitting the user input. Return its submission id as turn_id.
+        // 通过提交用户输入来「启动回合」：内核把这次提交分配的 id 直接作为 turn_id 回传，
+        // 即「一次 UserInput 提交 == 一个回合」，回合 id 不在 app-server 侧另行生成。
         let turn_op = Op::UserInput {
             items: mapped_items,
             environments: environment_selections,
@@ -486,6 +550,19 @@ impl TurnRequestProcessor {
         Ok(TurnStartResponse { turn })
     }
 
+    /// 把一次请求里携带的「线程设置覆盖」字段翻译为内核 `ThreadSettingsOverrides`。
+    /// 被 `turn/start`（随回合一起覆盖）和 `thread/settings/update`（单独更新）共用。
+    ///
+    /// 关键点：
+    ///   - `permissions` 与 `sandboxPolicy` 互斥（二选一，不能同时给）；
+    ///   - 当涉及 `permissions` 或 `runtime_workspace_roots` 时，需要先拿线程的
+    ///     `config_snapshot()` 作为解析基准（相对路径、回退 workspace 根等）；
+    ///   - `permissions` 指定的权限档会通过 `config_manager` 重新加载求值；与启动期
+    ///     不同，显式的 settings 更新若档位被策略禁用必须直接报错（不做静默回退）；
+    ///   - 若存在任意覆盖项，先调用 `preview_thread_settings_overrides()` 在内核侧
+    ///     做一次「预演校验」，非法组合在此处被拒，避免把坏设置真正提交进回合。
+    ///
+    /// 副作用：可能触发一次配置加载（磁盘/IO）与一次内核 preview 调用；本身不提交 Op。
     async fn build_thread_settings_overrides(
         &self,
         thread: &CodexThread,
@@ -682,6 +759,8 @@ impl TurnRequestProcessor {
             )
             .await?;
 
+        // 仅当确实有非默认的覆盖项时才提交 `Op::ThreadSettings`：空更新没有意义，
+        // 避免给内核投递一个等价于「什么都不改」的回合外操作。
         if thread_settings != codex_protocol::protocol::ThreadSettingsOverrides::default() {
             self.submit_core_op(
                 request_id,
@@ -741,6 +820,13 @@ impl TurnRequestProcessor {
             .map_err(|err| internal_error(format!("failed to set app server client info: {err}")))
     }
 
+    /// `turn/steer` 的核心实现：向「正在进行中的回合」追加输入以「引导/插话」，
+    /// 而非另起新回合。调用方必须给出 `expectedTurnId`，内核会校验它是否与当前
+    /// 活跃回合一致，避免把输入误投到已经结束/被替换的回合上。
+    ///
+    /// 错误处理是本函数的重头戏：`SteerInputError` 的每个变体都被翻译成带
+    /// 机器可读 data 的 JSON-RPC 错误，并配套上报对应的 analytics 错误类型
+    /// （无活跃回合 / 回合不匹配 / review|compact 回合不可引导 / 空输入）。
     async fn turn_steer_inner(
         &self,
         request_id: &ConnectionRequestId,
@@ -847,6 +933,12 @@ impl TurnRequestProcessor {
         Ok(TurnSteerResponse { turn_id })
     }
 
+    /// 实时（realtime）会话各操作的公共前置：加载线程 → 确保已挂载事件监听器
+    /// → 校验该线程开启了 `RealtimeConversation` 特性。
+    ///
+    /// 返回 `Ok(None)` 表示「连接已关闭」这一非错误的提前退出（调用方据此静默返回），
+    /// 与 `Err` 的真正失败区分开。被 start/append_audio/append_text/stop 四个实时
+    /// 入口共用，避免重复样板。
     async fn prepare_realtime_conversation_thread(
         &self,
         request_id: &ConnectionRequestId,
@@ -1046,6 +1138,15 @@ impl TurnRequestProcessor {
         Ok(())
     }
 
+    /// 「分离式」代码评审：不在父线程里就地评审，而是基于父线程的当前历史
+    /// **fork 出一个独立的评审线程**，在其中跑评审回合。
+    ///
+    /// 流程：固化并刷盘父线程 rollout → 加载父历史 → （若配置了 review_model 则切换模型）
+    /// → `fork_thread_from_history` 派生评审线程 → 挂监听器 → 读回 stored thread 发出
+    /// `ThreadStarted` 通知 → 提交 `Op::Review` → 发 review-started 响应。
+    ///
+    /// 与 `start_inline_review` 的区别：内联评审复用父线程、不新建线程；分离式会产生
+    /// 一个新的可被独立订阅/展示的线程，适合「边干活边在旁路跑评审」的场景。
     async fn start_detached_review(
         &self,
         request_id: &ConnectionRequestId,
@@ -1158,6 +1259,9 @@ impl TurnRequestProcessor {
         Ok(())
     }
 
+    /// `review/start` 的入口：解析评审目标（未提交改动 / 基线分支 / 指定 commit /
+    /// 自定义指令），再按 `delivery` 选择交付方式——`Inline`（在父线程内评审）或
+    /// `Detached`（fork 出独立评审线程）。默认走 `Inline`。
     async fn review_start_inner(
         &self,
         request_id: &ConnectionRequestId,
@@ -1196,6 +1300,16 @@ impl TurnRequestProcessor {
         Ok(())
     }
 
+    /// `turn/interrupt` 的核心实现：中断一个正在进行的回合。
+    ///
+    /// 两种语义由 `turn_id` 是否为空区分：
+    ///   - 普通回合中断（turn_id 非空）：校验目标确实是当前活跃回合，把本次请求登记到
+    ///     `pending_interrupts`，**不在此处立即回复**——等内核派发出 `TurnAborted`
+    ///     事件后，由监听器一侧统一回应（返回 `Ok(None)`）；
+    ///   - 启动期中断（turn_id 为空）：此时还没有回合可言（线程仍在启动），提交
+    ///     `Op::Interrupt` 后**立即回复**（返回 `Ok(Some(...))`），因为不会有回合事件。
+    ///
+    /// 副作用：可能向 thread_state 追加 pending_interrupt；提交失败时会回滚该登记。
     async fn turn_interrupt_inner(
         &self,
         request_id: &ConnectionRequestId,
@@ -1208,6 +1322,8 @@ impl TurnRequestProcessor {
 
         // Record turn interrupts so we can reply when TurnAborted arrives. Startup
         // interrupts do not have a turn and are acknowledged after submission.
+        // 登记普通回合中断，以便 TurnAborted 到达时再回复客户端；启动期中断没有回合，
+        // 在提交后就地确认。先校验 turn_id 与活跃回合一致，否则拒绝（防止误中断）。
         if !is_startup_interrupt {
             let thread_state = self.thread_state_manager.thread_state(thread_uuid).await;
             let is_running = matches!(thread.agent_status().await, AgentStatus::Running);
@@ -1235,6 +1351,9 @@ impl TurnRequestProcessor {
 
         // Submit the interrupt. Turn interrupts respond upon TurnAborted; startup
         // interrupts respond here because startup cancellation has no turn event.
+        // 提交中断 Op：回合中断走「TurnAborted 事件 → 异步回复」（这里返回 Ok(None)）；
+        // 启动期中断没有回合事件，只能就地返回 Ok(Some(...)) 完成应答。
+        // 提交失败时，若先前登记过 pending_interrupt，需在错误分支里把它摘除以免泄漏。
         match self
             .submit_core_op(request_id, thread.as_ref(), Op::Interrupt)
             .await

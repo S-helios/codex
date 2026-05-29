@@ -1,3 +1,35 @@
+//! 【文件职责】core 侧配置的「总装配厂」：把磁盘上多层 `config.toml`（系统/用户/
+//! 项目/会话/CLI 覆盖）合并、套上 requirements.toml 强制约束、再叠加代码侧
+//! `ConfigOverrides`，最终产出运行时唯一的 `Config` 实例。
+//!
+//! 【架构位置】
+//!   层级：core 配置层（顶层装配，是权限/特性/网络等子模块的汇聚点）
+//!   上游：各 CLI 入口（exec / tui / app-server）通过 `ConfigBuilder` 或
+//!         `Config::load_with_cli_overrides*` 触发加载
+//!   下游：本 crate 几乎所有模块都读 `Config`；本文件向 permissions.rs（权限编译）、
+//!         managed_features / network_proxy_spec / otel / agent_roles 等子模块下沉细节
+//!
+//! 【数据流】
+//!   磁盘多层 TOML → `load_config_layers_state()` 合并成 ConfigLayerStack
+//!     → 反序列化为 `ConfigToml` → `load_config_with_layer_stack()` 逐字段解析/校验/约束
+//!     → 装配出 `Config`（含 `Permissions`、`ManagedFeatures`、网络 spec 等）
+//!
+//! 【核心类型】
+//!   - `Config`：最终运行时配置（字段极多，本质是「解析结果聚合体」）。
+//!   - `Permissions`：沙箱/审批相关的权限集合，封装权限 profile 的各种投影
+//!     （legacy SandboxPolicy / 文件系统 / 网络）。
+//!   - `ConfigBuilder` / `ConfigOverrides`：分别是加载入口的建造者、与代码侧覆盖项。
+//!
+//! 【阅读建议】这是数千行的超大文件，按以下顺序抓主干即可：
+//!   ① 看 `Config` 结构体字段总览（了解配置全貌）；
+//!   ② 看 `ConfigBuilder::build` → `build_inner`（加载/锁文件分支的入口）；
+//!   ③ 重点读核心装配函数 `Config::load_config_with_layer_stack`（约 400 行，
+//!      整份配置的解析与约束都在这里，内部有清晰的「权限选择 → 网络 → 校验 →
+//!      构造 Config」阶段）；
+//!   ④ 权限选择相关的 `resolve_effective_permission_selection` /
+//!      `resolve_permission_config_syntax` 等辅助函数按需查阅。
+//!   大量 `resolve_*` / `validate_*` 小函数为字段级解析校验，自解释，可略读。
+
 use crate::agents_md::AgentsMdManager;
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
@@ -252,6 +284,13 @@ pub(crate) async fn test_config() -> Config {
 }
 
 /// Application configuration loaded from disk and merged with overrides.
+///
+/// 会话级权限集合。把审批策略、权限 profile（连同其活动身份与 workspace roots）、
+/// 网络、登录 shell、shell 环境策略、Windows 沙箱等聚成一组，并对外提供多种「投影」
+/// 方法（如 `legacy_sandbox_policy()` 把规范化 profile 投影回旧式 `SandboxPolicy`、
+/// `file_system_sandbox_policy()` / `network_sandbox_policy()` 取分项策略）。
+/// 设计要点：`permission_profile` 是规范表示，运行时还需把符号化 `:workspace_roots`
+/// 用 `workspace_roots` 物化后才是「生效权限」（见 `effective_permission_profile`）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Permissions {
     /// Approval policy for executing commands.
@@ -374,6 +413,8 @@ impl Permissions {
         self.permission_profile_state.profile_workspace_roots()
     }
 
+    /// 把规范 profile 中符号化的 `:workspace_roots` 用当前运行时 `workspace_roots`
+    /// 物化为具体路径，得到可直接喂给沙箱的 profile。多个对外投影方法都先经此步。
     fn materialized_permission_profile(&self) -> PermissionProfile {
         self.permission_profile()
             .clone()
@@ -435,6 +476,11 @@ impl Permissions {
 
     /// Set permissions from a legacy sandbox policy and keep every permission
     /// projection in sync.
+    ///
+    /// 从旧式 `SandboxPolicy` 反向设置权限，并同步重建所有投影。除了把 policy 转成
+    /// 规范 `PermissionProfile` 外，还会据 policy 种类重算 `workspace_roots`：
+    /// `WorkspaceWrite` 取 cwd + 各可写根去重；其余种类只放 cwd。先 `can_set` 校验
+    /// 约束再写入，确保不绕过 requirements。
     pub fn set_legacy_sandbox_policy(
         &mut self,
         sandbox_policy: SandboxPolicy,
@@ -488,6 +534,10 @@ impl Permissions {
 // A profile override only inherits the selected profile's proxy/allowlist config
 // when Codex is still responsible for the network policy. `Disabled` means no
 // outer sandbox, so starting the managed proxy would narrow the override.
+//
+// 判定某 profile 是否应继承「配置里的代理/白名单」。仅当 Codex 仍负责网络策略
+// （Managed/External 且网络处于 enabled）时才继承；`Disabled`（无外层沙箱、全开）
+// 若反而去启动托管代理，等于收窄了用户本想要的「全开」，故返回 false。
 fn profile_allows_configured_network_proxy(permission_profile: &PermissionProfile) -> bool {
     match permission_profile {
         PermissionProfile::Managed { network, .. } | PermissionProfile::External { network } => {
@@ -497,6 +547,10 @@ fn profile_allows_configured_network_proxy(permission_profile: &PermissionProfil
     }
 }
 
+/// 综合「配置的代理设置 + requirements 网络约束 + 当前 profile」构造托管网络代理
+/// 的 `NetworkProxySpec`。返回 `Option`：当存在网络 requirements 时总是返回 `Some`
+/// （强制约束必须落地）；否则仅在代理实际启用时返回 `Some`，未启用则 `None`。
+/// 出错时若约束来自某 requirements 源，会把来源信息拼进错误消息便于排查。
 fn build_network_proxy_spec(
     configured_network_proxy_config: NetworkProxyConfig,
     network_requirements: Option<Sourced<codex_config::NetworkConstraints>>,
@@ -541,6 +595,12 @@ pub enum ThreadStoreConfig {
 }
 
 /// Application configuration loaded from disk and merged with overrides.
+///
+/// 运行时唯一的应用配置聚合体，由 `load_config_with_layer_stack` 装配产出。字段极多
+/// （模型、权限、特性、TUI、MCP、网络、agent、遥测……），本质是「各子系统配置解析
+/// 结果的集合」。各字段的英文文档已逐项说明语义，此处不重复翻译；阅读时按需定位即可。
+/// 注意 `config_layer_stack` 保留了「这份配置如何由多层合并 + requirements 强制而来」
+/// 的出处信息，用于会话刷新/锁文件等场景的重建。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// Provenance for how this [`Config`] was derived (merged layers + enforced
@@ -1059,6 +1119,9 @@ impl AuthManagerConfig for Config {
     }
 }
 
+/// `Config` 加载入口的建造者。逐项设置 codex_home、CLI 覆盖、harness 覆盖、加载器
+/// 选项、是否严格模式、云端 requirements 加载器等，最后 `.build()` 触发真正加载。
+/// 是大多数调用方创建 `Config` 的首选入口。
 #[derive(Clone, Default)]
 pub struct ConfigBuilder {
     codex_home: Option<PathBuf>,
@@ -1117,9 +1180,15 @@ impl ConfigBuilder {
 
     pub async fn build(self) -> std::io::Result<Config> {
         // Keep the large config-loading future off small runtime thread stacks.
+        // 用 `Box::pin` 把这个巨大的加载 future 放到堆上，避免在小栈的运行时线程上
+        // 因 future 体积过大而爆栈（加载流程的局部变量极多）。
         Box::pin(self.build_inner()).await
     }
 
+    /// 真正的加载流程：解析 codex_home/cwd → 用 `load_config_layers_state` 合并多层
+    /// TOML → 反序列化为 `ConfigToml`。若 debug 配置指定了 config 锁文件
+    /// （`load_path`），则改走「锁文件回放」分支：以锁文件为唯一配置层重建 `Config`
+    /// 并回填锁相关元数据；否则走常规 `load_config_with_layer_stack` 装配。
     async fn build_inner(self) -> std::io::Result<Config> {
         let Self {
             codex_home,
@@ -2433,6 +2502,28 @@ impl Config {
         .await
     }
 
+    /// 整份配置的核心装配函数（约 400 行）。把已合并的 `ConfigToml` + 代码侧
+    /// `ConfigOverrides` + requirements 约束，解析/校验成最终 `Config`。
+    ///
+    /// @param fs                - 文件系统抽象（读 AGENTS.md、指令文件等）
+    /// @param cfg               - 多层合并后的 `ConfigToml`
+    /// @param overrides         - 代码侧覆盖（cwd、各种 exe 路径、审批策略等）
+    /// @param codex_home        - Codex 主目录（解析 log/sqlite/memory 等子目录的基准）
+    /// @param config_layer_stack - 配置层出处 + requirements，保留在 `Config` 中
+    /// @returns                 - 装配好的 `Config`；任何字段校验失败返回 `Err`
+    ///
+    /// 内部大致阶段（建议据此跳读）：
+    ///   ① 解构 requirements 与 overrides，做互斥校验（如 `sandbox_mode` 与
+    ///      `permission_profile` 不能同时设）；
+    ///   ② 解析特性 `ManagedFeatures`、cwd、活动项目 `active_project`；
+    ///   ③ 权限选择：判定用 legacy 还是 profile 语法、选定档、编译出
+    ///      `permission_profile` + 文件系统/网络策略 + workspace roots（最长的一段）；
+    ///   ④ 解析审批策略、网络代理 spec、模型 provider、各类指令文本等；
+    ///   ⑤ 用 `apply_requirement_constrained_value` 把 requirements 约束逐项落地
+    ///      （冲突时回退到要求值并产出告警）；
+    ///   ⑥ 把所有解析结果填进 `Config { .. }` 返回。
+    ///
+    /// 副作用：向 `startup_warnings` 累积告警；读磁盘文件。
     pub(crate) async fn load_config_with_layer_stack(
         fs: &dyn ExecutorFileSystem,
         cfg: ConfigToml,
@@ -2441,6 +2532,7 @@ impl Config {
         config_layer_stack: ConfigLayerStack,
     ) -> std::io::Result<Self> {
         // Keep the large config-construction future off small test thread stacks.
+        // 同 `build`：装配 future 体积巨大，pin 到堆上防止小栈线程爆栈。
         Box::pin(async move {
         if cfg.experimental_thread_store_endpoint.is_some() {
             return Err(std::io::Error::new(
@@ -2453,6 +2545,9 @@ impl Config {
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
         // Ensure that every field of ConfigRequirements is applied to the final
         // Config.
+        // 完整解构 `ConfigRequirements`（而非按需取字段）：用穷尽解构当「编译期清单」，
+        // 一旦 requirements 新增字段而此处忘记处理，编译器会报「未使用绑定」提醒，避免
+        // 强制约束被静默遗漏。下方的 `ConfigOverrides` 解构同理。
         let ConfigRequirements {
             approval_policy: mut constrained_approval_policy,
             approvals_reviewer: mut constrained_approvals_reviewer,
@@ -2694,6 +2789,13 @@ impl Config {
             }
         };
         dedupe_absolute_paths(&mut workspace_roots);
+        // ── 权限选择核心：三路确定生效的 (网络代理配置, permission_profile,
+        //    文件系统策略, 活动 profile 身份, profile 自带 workspace roots) ──────
+        //   分支 1：overrides 直接给了 `permission_profile` → 用它，按需带配置代理；
+        //   分支 2：profile 语法生效（profiles_are_active）→ 选定档名后用
+        //           permissions.rs 编译出策略与 workspace roots；
+        //   分支 3：兜底 legacy → 由 `sandbox_mode` 派生 profile，并保留可投影回
+        //           `SandboxPolicy` 的安全回退（无法投影时降级为 read-only）。
         let (
             mut configured_network_proxy_config,
             permission_profile,
@@ -3175,6 +3277,10 @@ impl Config {
             .map(AbsolutePathBuf::to_path_buf)
             .or_else(|| resolve_sqlite_home_env(&resolved_cwd))
             .unwrap_or_else(|| codex_home.to_path_buf());
+        // ── 应用 requirements 强制约束：把上面解析出的「用户期望值」逐项 set 进
+        //    受约束容器；若被约束拒绝，`apply_requirement_constrained_value` 会回退到
+        //    要求值并追加告警。`original_permission_profile` 留底用于稍后判断 profile
+        //    是否因约束被改写（被改写则清掉活动身份/roots，见下方）。──────────────
         let original_permission_profile = permission_profile.clone();
         apply_requirement_constrained_value(
             "approval_policy",
@@ -3254,6 +3360,10 @@ impl Config {
             network_requirements,
             &network_permission_profile,
         )?;
+        // ── 合成「生效权限」：在受约束 profile 基础上，并入 Codex 运行所需的强制
+        //    可读 root（zsh / execve wrapper，启用记忆工具时再加 memories 目录），
+        //    并保留 deny-read 限制、叠加 managed filesystem 约束，最终回写为受约束
+        //    profile 的最终值。这一步保证「无论用户配多严，Codex 自身能跑」。───────
         let mut helper_readable_roots = get_readable_roots_required_for_codex_runtime(
             &codex_home,
             zsh_path.as_ref(),

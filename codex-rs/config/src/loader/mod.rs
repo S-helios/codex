@@ -1,3 +1,26 @@
+//! 【文件职责】配置「分层加载器」的主入口与编排逻辑。把分散在多处的 config.toml
+//! （系统 / 用户 / profile / 项目目录树 / CLI 覆盖 / 旧版 managed / 远程 thread
+//! 配置）按固定优先级读出、做相对路径解析、做信任判定、再组装成一个
+//! `ConfigLayerStack`（分层栈，后续由别处合并出「有效配置」）。
+//!
+//! 【架构位置】配置层「加载/编排」核心。下游依赖：`layer_io`（实际读盘）、
+//! `merge`（TOML 合并）、`config_requirements`（admin 约束）、`config_toml`
+//! （目标结构 `ConfigToml`，用于严格校验与路径解析）。上游：core/app-server
+//! 在启动会话或响应 `/config` 时调用 `load_config_layers_state`。
+//!
+//! 【数据流】各来源 config.toml 文件 → 逐层读成 `toml::Value` → 解析相对路径 +
+//! 严格校验 + 项目层去敏感字段 → 按 precedence 入栈 → `ConfigLayerStack`。
+//!
+//! 【阅读建议】
+//!   1. 先读 `load_config_layers_state` 上方那段超长英文 doc——它列出了「两条
+//!      优先级链」（admin 约束链 + 普通配置链）和每一层的来源路径，是全文地图。
+//!   2. 再顺着 `load_config_layers_state` 函数体看各层是怎么依次压入 `layers`。
+//!   3. 信任相关集中在 `ProjectTrustContext` 及 `project_trust_context` /
+//!      `load_project_layers`——决定项目目录的 config/hooks/exec 是否启用。
+//!   4. `resolve_relative_paths_in_config_toml` + `copy_shape_from_original` 是
+//!      「把相对路径就地解析为绝对路径、又不丢未知字段」的关键技巧。
+//!   5. Windows known-folder、tests、各 `*_with_overrides` 取路径的小函数可略读。
+
 mod layer_io;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -58,6 +81,11 @@ const DEFAULT_PROGRAM_DATA_DIR_WINDOWS: &str = r"C:\ProgramData";
 // choose where a user's credentials are sent or which local commands are run.
 // These settings are still supported from user, system, managed, and runtime
 // config layers.
+// 安全黑名单：项目目录里的 `.codex/config.toml` 来自仓库内容（可能是别人提交的），
+// 因此禁止它左右「凭据发往哪里」「执行什么本地命令」这类高危项（base_url、
+// model_provider、notify、profile、otel 等）。这些项仍可由用户/系统/managed/运行时
+// 层设置——只是不接受来自不可信仓库内容的设置。
+// [引用范围] 仅被 `sanitize_project_config()` 用来从项目层剔除这些键。
 const PROJECT_LOCAL_CONFIG_DENYLIST: &[&str] = &[
     "openai_base_url",
     "chatgpt_base_url",
@@ -107,6 +135,23 @@ async fn first_layer_config_error_from_entries(layers: &[ConfigLayerEntry]) -> O
 /// associated with it such that `cwd` should be `Some(...)`. Only for
 /// thread-agnostic config loading (e.g., for the app server's `/config`
 /// endpoint) should `cwd` be `None`.
+///
+/// 【整体职责】配置加载的总入口：把上述英文 doc 列出的所有来源逐层读出、组装成
+/// `ConfigLayerStack` 返回。涉及两条链——(1) admin 强制「约束」链（早层不可被晚层
+/// 覆盖，产出 `ConfigRequirements`）；(2) 普通「配置」链（按 precedence 叠加合并）。
+///
+/// @param fs                   - 文件系统抽象（实际读盘走它，便于沙箱/测试注入）
+/// @param codex_home           - `$CODEX_HOME`，用户级配置与各种默认路径的基准
+/// @param cwd                  - 当前工作目录；`Some` 时才加载项目目录树相关层与信任判定；
+///                               线程无关加载（如 app-server 的 `/config`）传 `None`
+/// @param cli_overrides        - `-c/--config` 等运行时键值覆盖
+/// @param options              - 加载选项（含 `loader_overrides`、是否 strict 校验）
+/// @param cloud_requirements   - 云端 admin 约束加载器
+/// @param thread_config_loader - 远程/线程级配置层加载器
+/// @returns                    - 组装好的 `ConfigLayerStack`（含可能的启动告警）
+///
+/// 副作用：读多处磁盘文件、可能发起云端/远程请求；不写盘。
+/// 错误：任一来源解析失败会尽量带上「首个有问题的层」的精确定位（见 `first_layer_*`）。
 #[allow(clippy::too_many_arguments)]
 pub async fn load_config_layers_state(
     fs: &dyn ExecutorFileSystem,
@@ -128,6 +173,9 @@ pub async fn load_config_layers_state(
         overrides.ignore_user_and_project_exec_policy_rules;
     let mut config_requirements_toml = ConfigRequirementsWithSources::default();
 
+    // ── 阶段 1：构建 admin 约束链（cloud → macOS MDM → 系统 requirements.toml）──
+    // 这条链「早层不可被晚层覆盖」，用 `merge_unset_fields` 实现：只填未表态的字段，
+    // 已被更高优先来源定下的约束保持不变。`ignore_managed_requirements` 时整段跳过。
     if !ignore_managed_requirements {
         if let Some(requirements) = cloud_requirements.get().await.map_err(io::Error::other)? {
             merge_requirements_with_remote_sandbox_config(
@@ -173,6 +221,9 @@ pub async fn load_config_layers_state(
         .await
         .map_err(io::Error::other)?;
 
+    // ── 阶段 2：构建普通配置链 `layers`（按 precedence 由低到高依次压入）──
+    // 下面预先把 CLI 覆盖层准备好（含严格校验 + 相对路径解析），但它优先级最高，
+    // 要等其他层都压完后才 push（见后文阶段 5）。
     let mut layers = Vec::<ConfigLayerEntry>::new();
 
     let cli_overrides_layer = if cli_overrides.is_empty() {
@@ -224,6 +275,9 @@ pub async fn load_config_layers_state(
         strict_config,
     )
     .await?;
+    // 防呆：profile-v2（独立 `<name>.config.toml`）与旧式 `[profiles.<name>]`/
+    // `profile = "<name>"` 不能并用。若用户既选了 v2 profile，base 配置里又残留同名
+    // 旧 profile 选择器或表，直接报错并指引迁移，避免两套机制语义打架。
     if let Some(active_user_profile) = active_user_profile.as_ref()
         && let Some(base_user_config) = base_user_layer.config.as_table()
     {
@@ -261,6 +315,10 @@ pub async fn load_config_layers_state(
         );
     }
 
+    // ── 阶段 3：项目目录树层（仅当带 `cwd`，即面向具体线程时）──
+    // 先把已入栈的各层（外加 CLI 覆盖）合并成 `merged_so_far`，因为「项目根标记」
+    // 和「项目信任配置」本身也来自配置——必须用合并后的视图来判定，才能让用户在
+    // 更高层调整这些行为。随后据此找项目根、做信任判定、加载各级 `.codex` 目录。
     let mut startup_warnings = None;
     if let Some(cwd) = cwd {
         let mut merged_so_far = TomlValue::Table(toml::map::Map::new());
@@ -323,6 +381,8 @@ pub async fn load_config_layers_state(
         startup_warnings = Some(project_layers.startup_warnings);
     }
 
+    // ── 阶段 4：压入运行时（CLI/UI）覆盖层 ──
+    // 之前已准备好，此处才入栈，确保它位于上面所有静态层之上。
     // Add a layer for runtime overrides from the CLI or UI, if any exist.
     if let Some(cli_overrides_layer) = cli_overrides_layer {
         layers.push(ConfigLayerEntry::new(
@@ -331,6 +391,9 @@ pub async fn load_config_layers_state(
         ));
     }
 
+    // ── 阶段 5：按各自声明的 precedence 插入远程/线程级配置层 ──
+    // 这些层优先级各异，故用 `insert_layer_by_precedence` 找到正确位置插入，
+    // 而非简单 push 到末尾。
     for thread_config_layer in thread_config_layers {
         insert_layer_by_precedence(&mut layers, thread_config_layer);
     }
@@ -376,6 +439,9 @@ pub async fn load_config_layers_state(
         ));
     }
 
+    // ── 阶段 6：组装最终的 ConfigLayerStack ──
+    // 把普通配置层 `layers` 与阶段 1 攒出的 admin 约束（既转成结构化
+    // `ConfigRequirements`，又保留其原始 TOML 形态）一并交给栈。
     let config_layer_stack = ConfigLayerStack::new(
         layers,
         config_requirements_toml.clone().try_into()?,
@@ -418,6 +484,8 @@ async fn load_user_config_layer(
     .await
 }
 
+// 按 precedence 把 `layer` 插到第一个「优先级更高的现有层」之前；若没有更高的，
+// 就追加到末尾。保持 `layers` 始终按优先级升序排列（低优先在前、高优先在后）。
 fn insert_layer_by_precedence(layers: &mut Vec<ConfigLayerEntry>, layer: ConfigLayerEntry) {
     match layers
         .iter()
@@ -435,6 +503,10 @@ fn insert_layer_by_precedence(layers: &mut Vec<ConfigLayerEntry>, layer: ConfigL
 ///   returns the resulting layer entry.
 /// - If there is an error reading the file or parsing the TOML, returns an
 ///   error.
+///
+/// 加载某个「必有」配置层（系统层/用户层）：文件存在则解析并交给 `create_entry`
+/// 包成层条目；文件不存在视为「空表」（该层等于不表态，而非报错）；读/解析出错
+/// 才返回 Err。解析成功还会做严格校验（可选）与相对路径解析。
 async fn load_config_toml_for_required_layer(
     fs: &dyn ExecutorFileSystem,
     toml_file: &AbsolutePathBuf,
@@ -699,6 +771,8 @@ fn windows_program_data_dir_from_known_folder() -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// 把旧版 `managed_config.toml`（来自 MDM 或文件）重新解释为 admin 约束并并入
+/// `config_requirements_toml`，做向后兼容。语义见下方 `LegacyManagedConfigToml`。
 async fn load_requirements_from_legacy_scheme(
     config_requirements_toml: &mut ConfigRequirementsWithSources,
     loaded_config_layers: LoadedConfigLayers,
@@ -706,6 +780,8 @@ async fn load_requirements_from_legacy_scheme(
     // In this implementation, earlier layers cannot be overwritten by later
     // layers, so list managed_config_from_mdm first because it has the highest
     // precedence.
+    // 「早层不可被晚层覆盖」语义下，优先级最高者必须最先列：故 MDM 来源排在文件
+    // 来源之前，确保 MDM 的约束不会被文件来源覆盖。
     let LoadedConfigLayers {
         managed_config,
         managed_config_from_mdm,
@@ -744,6 +820,9 @@ async fn load_requirements_from_legacy_scheme(
     Ok(())
 }
 
+// 把一份 requirements 并入约束集合：若它带远程沙箱配置，先按本机 host 名把
+// 「远程沙箱」展开成具体约束，再以「只填未表态字段」的方式合并进 `target`
+// （保持早层约束不被覆盖的语义）。
 pub(super) fn merge_requirements_with_remote_sandbox_config(
     target: &mut ConfigRequirementsWithSources,
     source: RequirementSource,
@@ -756,6 +835,10 @@ pub(super) fn merge_requirements_with_remote_sandbox_config(
     target.merge_unset_fields(source, requirements);
 }
 
+/// 项目信任判定的上下文：携带「当前目录对应的项目根/仓库根」及其各种归一化查找键，
+/// 以及用户配置里 `[projects]` 表给出的「路径 -> 信任级别」映射。核心方法
+/// `decision_for_dir` 用它来决定某个 `.codex` 目录是否可信，从而控制项目层 config /
+/// hooks / exec 策略是否启用。
 struct ProjectTrustContext {
     project_root: AbsolutePathBuf,
     project_root_key: String,
@@ -785,6 +868,10 @@ impl ProjectTrustDecision {
 }
 
 impl ProjectTrustContext {
+    /// 为某个具体目录裁定信任级别，按「就近优先」逐级回退查 `projects_trust`：
+    /// 先精确匹配该目录本身的各归一化键，查不到再用项目根的键，再用仓库根的键。
+    /// 全程未命中则返回「未表态」（trust_level=None），并附带一个用于提示文案的
+    /// trust_key（优先报仓库根，否则项目根）。
     fn decision_for_dir(&self, dir: &AbsolutePathBuf) -> ProjectTrustDecision {
         for dir_key in normalized_project_trust_keys(dir.as_path()) {
             if let Some((trust_key, trust_level)) =
@@ -848,10 +935,15 @@ impl ProjectTrustContext {
         }
     }
 
+    /// 为「链接 worktree」找到其在主检出（repo_root）下对应目录的 `.codex` 路径。
+    /// 用途：worktree 里的钩子声明应取自主仓库对应位置，而非 worktree 自身（见
+    /// `merge_root_checkout_project_hooks`）。普通检出 checkout_root==repo_root，
+    /// 不存在这种映射，返回 `None`。
     fn root_checkout_hooks_folder_for_dir(&self, dir: &AbsolutePathBuf) -> Option<AbsolutePathBuf> {
         let checkout_root = self.checkout_root.as_ref()?;
         let repo_root = self.repo_root.as_ref()?;
         // Regular checkouts resolve both paths to the same root; linked worktrees do not.
+        // 普通检出两者解析为同一根；链接 worktree 才不同，只有后者需要映射。
         if checkout_root == repo_root {
             return None;
         }
@@ -861,6 +953,8 @@ impl ProjectTrustContext {
     }
 }
 
+// 构造一个项目层条目：有 `disabled_reason`（目录不可信）时建成「禁用」条目——
+// 配置仍被记录但不参与生效；否则建成正常条目。再附上 worktree 钩子目录覆盖。
 fn project_layer_entry(
     dot_codex_folder: &AbsolutePathBuf,
     config: TomlValue,
@@ -879,6 +973,9 @@ fn project_layer_entry(
     entry.with_hooks_config_folder_override(hooks_config_folder_override)
 }
 
+// 就地从项目层配置表中删除 `PROJECT_LOCAL_CONFIG_DENYLIST` 里的高危键，返回被
+// 删掉的键名列表（供生成「已忽略不支持的项目级配置」启动告警）。这是「不可信仓库
+// 内容不得左右凭据去向/命令执行」这一安全边界的落地点。
 fn sanitize_project_config(config: &mut TomlValue) -> Vec<String> {
     let Some(table) = config.as_table_mut() else {
         return Vec::new();
@@ -911,6 +1008,9 @@ fn project_ignored_config_keys_warning(
     )
 }
 
+/// 组装 `ProjectTrustContext`：从合并后的配置里取出 `[projects]` 信任表，并解析
+/// 出当前 cwd 对应的项目根、git 检出根、仓库根（worktree 场景三者可能不同），
+/// 连同各自的归一化查找键一起打包，供后续逐目录裁定信任级别。
 async fn project_trust_context(
     fs: &dyn ExecutorFileSystem,
     merged_config: &TomlValue,
@@ -1017,6 +1117,13 @@ fn project_trust_for_lookup_key(
 ///
 /// This ensures that multiple config layers can be merged together correctly
 /// even if they were loaded from different directories.
+///
+/// 把某层 config.toml 里所有 `AbsolutePathBuf` 字段中的相对路径，按其所在目录
+/// `base_dir` 解析成绝对路径，返回「形状不变、路径已解析」的新 `toml::Value`。
+/// 这样不同目录加载的多层才能正确合并（相对路径不会被错误地相对到合并后的位置）。
+/// 实现技巧：借「反序列化成 `ConfigToml` 再序列化回 `toml::Value`」的往返来触发
+/// `AbsolutePathBuf` 的解析（依赖线程局部的 `AbsolutePathBufGuard` 提供 base_dir）；
+/// 若该层不能解析成 `ConfigToml`（如含未知字段），则原样返回不做处理。
 #[doc(hidden)]
 pub fn resolve_relative_paths_in_config_toml(
     value_from_config_toml: TomlValue,
@@ -1047,6 +1154,10 @@ pub fn resolve_relative_paths_in_config_toml(
 /// `toml::Value`, taking the value from `resolved` where possible. This ensures
 /// the fields that we "removed" during the serialize/deserialize round-trip in
 /// `resolve_config_paths` are preserved, out of an abundance of caution.
+///
+/// 以 `original` 的字段结构为准递归合并：优先取 `resolved`（已解析路径）的值，
+/// `resolved` 缺失的字段则保留 `original` 的。目的是把往返过程中可能被丢弃的
+/// 字段（如 `ConfigToml` 不认识的键）补回来，确保「只改路径、不丢内容」。
 fn copy_shape_from_original(original: &TomlValue, resolved: &TomlValue) -> TomlValue {
     match (original, resolved) {
         (TomlValue::Table(original_table), TomlValue::Table(resolved_table)) => {
@@ -1072,6 +1183,8 @@ fn copy_shape_from_original(original: &TomlValue, resolved: &TomlValue) -> TomlV
     }
 }
 
+// 从 cwd 向上逐级祖先目录查找：命中任一「项目根标记」（默认 `.git`）即认定为
+// 项目根。标记列表为空或一路找不到时，退回 cwd 本身作为项目根。
 async fn find_project_root(
     fs: &dyn ExecutorFileSystem,
     cwd: &AbsolutePathBuf,
@@ -1125,6 +1238,12 @@ struct LoadedProjectLayers {
 /// starting from folders closest to `project_root` (which is the lowest
 /// precedence) to those closest to `cwd` (which is the highest precedence).
 /// Any warnings are stack-level startup messages, not additional config layers.
+///
+/// 收集从 `project_root` 到 `cwd`（含两端）路径上每个含 `.codex` 目录的项目层，
+/// 按优先级升序返回（越靠近 `cwd` 优先级越高）。每层都会：做信任判定（不可信则
+/// 标记 `disabled_reason`，配置仍读出但不生效）、剔除黑名单高危键、解析相对路径、
+/// 处理 worktree 钩子来源。注意信任的非对称处理：可信目录里解析失败直接报错，
+/// 不可信目录解析失败则降级为空表继续（反正不会生效）。
 async fn load_project_layers(
     fs: &dyn ExecutorFileSystem,
     cwd: &AbsolutePathBuf,
@@ -1266,6 +1385,11 @@ async fn load_project_layers(
 
 /// For linked worktrees, preserve ordinary worktree-local project config while
 /// replacing only hook declarations with the matching root-checkout layer.
+///
+/// 针对链接 worktree：worktree 自己的普通项目配置照常保留，但「hooks 声明」整段
+/// 替换为主检出对应目录的 hooks。动机：钩子会执行命令，应以主仓库的可信声明为准，
+/// 而不被各 worktree 自带的 hooks 左右。无 worktree 映射（`hooks_config_folder_override`
+/// 为 None）时原样返回。
 async fn merge_root_checkout_project_hooks(
     fs: &dyn ExecutorFileSystem,
     mut config: TomlValue,
@@ -1360,6 +1484,8 @@ impl From<LegacyManagedConfigToml> for ConfigRequirementsToml {
             let required_mode: SandboxModeRequirement = sandbox_mode.into();
             // Allowing read-only is a requirement for Codex to function correctly.
             // So in this backfill path, we append read-only if it's not already specified.
+            // read-only 是 Codex 正常工作的前提，故这条兼容回填路径里总把它加进允许集
+            // （若指定的模式本身不是 read-only，则两者并存）。
             let mut allowed_modes = vec![SandboxModeRequirement::ReadOnly];
             if required_mode != SandboxModeRequirement::ReadOnly {
                 allowed_modes.push(required_mode);

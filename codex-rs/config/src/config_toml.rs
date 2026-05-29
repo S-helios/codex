@@ -1,4 +1,21 @@
 //! Schema-heavy configuration TOML types used by Codex.
+//!
+//! 【文件职责】定义 Codex 配置的「顶层入口结构体」`ConfigToml`——它对应一整份
+//! `~/.codex/config.toml` 反序列化后的形状，几乎每个用户可配置项都是这里的一个
+//! `Option` 字段。此外还放了若干配套子表（`AgentsToml`/`ToolsToml`/`RealtimeToml`
+//! 等）、锁文件结构 `ConfigLockfileToml`，以及围绕它们的少量校验/解析逻辑。
+//!
+//! 【架构位置】配置层「Schema 定义」核心。字段类型多来自 `types.rs` 与各
+//! `*_toml.rs`；`loader/` 把多份 config.toml 解析、合并、再 `try_into::<ConfigToml>`。
+//!
+//! 【阅读建议】
+//!   1. 先通读 `ConfigToml` 的字段——这是配置项的「总目录」，字段上的英文 doc
+//!      就是面向用户的字段说明。
+//!   2. 再看 `impl ConfigToml` 的两个方法：`derive_permission_profile`（由
+//!      sandbox_mode 推导有效权限，含信任/Windows 特例）与 `get_active_project`
+//!      （按 cwd / 仓库根定位项目信任配置）——这是本文件仅有的实质逻辑。
+//!   3. 末尾的 `validate_*` / `deserialize_*` 是 serde 自定义校验钩子。
+//!   4. 大量 `*Toml` 子结构体只是字段容器（字段上已有英文说明），可略读。
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -88,6 +105,9 @@ const fn default_hide_agent_reasoning() -> Option<bool> {
 }
 
 /// Backward-compatible shape for ChatGPT workspace login restrictions in config.toml.
+/// 限制 ChatGPT 登录所属 workspace 的取值形状：兼容「单个字符串」与「字符串数组」
+/// 两种历史写法（`#[serde(untagged)]` 按形状自动匹配）。手写的 `Deserialize` 还
+/// 额外拦截「逗号分隔字符串」这种易错写法，提示用户改用 TOML 数组。
 #[derive(Serialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(untagged)]
 pub enum ForcedChatgptWorkspaceIds {
@@ -130,6 +150,14 @@ of strings; comma-separated strings are not supported. Use \
 }
 
 /// Base config deserialized from ~/.codex/config.toml.
+/// 一整份 config.toml 反序列化后的根结构体，是所有用户可配置项的「总目录」。
+/// 设计要点：
+///   - 几乎所有字段都是 `Option`/带 `#[serde(default)]`，因为同一结构会被用于
+///     系统/用户/项目/CLI 等多个配置层，缺省字段在合并时表示「本层不表态」。
+///   - `#[schemars(deny_unknown_fields)]` 让未知字段在严格模式下报错（见
+///     `loader` 的 strict_config 校验），帮助用户尽早发现拼写错误。
+///   - 部分字段挂了自定义 `deserialize_with` / `schema_with`（如 model_providers、
+///     mcp_servers、features），用于额外校验或注入 JSON Schema。
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ConfigToml {
@@ -492,6 +520,10 @@ pub struct ConfigToml {
     pub oss_provider: Option<String>,
 }
 
+/// 配置锁文件结构：把某次会话「最终合并出来的有效配置」连同 schema 版本号、
+/// 生成时的 Codex 版本一起冻结到磁盘，便于之后原样回放（reproducibility）。
+/// `version` 用于跨版本兼容判断，`codex_version` 由 debug 配置控制是否允许不匹配
+/// 时回放。导出/加载路径见 `DebugConfigLockToml`。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ConfigLockfileToml {
@@ -508,6 +540,9 @@ pub struct DebugToml {
     pub config_lockfile: Option<DebugConfigLockToml>,
 }
 
+/// `[debug.config_lockfile]`：控制有效配置锁文件（见 `ConfigLockfileToml`）的
+/// 导出与回放——往哪导出、从哪加载、是否允许跨 Codex 版本回放等。主要服务于
+/// 调试与可复现性。
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct DebugConfigLockToml {
@@ -540,6 +575,9 @@ pub struct AutoReviewToml {
     pub policy: Option<String>,
 }
 
+/// `[projects.<path>]` 表项：记录某个项目目录的信任级别（trusted / untrusted /
+/// 未表态）。信任与否直接决定该目录下的 project-local 配置、hooks、exec 策略是否
+/// 加载——这是配置安全模型的关键开关。判定逻辑见 `loader` 的 `ProjectTrustContext`。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ProjectConfig {
@@ -626,6 +664,9 @@ enum WebSearchToolConfigInput {
     Config(WebSearchToolConfig),
 }
 
+// `[tools].web_search` 兼容两种写法：`web_search = true/false`（布尔开关）或一个
+// 详细配置表。注意：布尔形式在这里被「读取后丢弃」（返回 `None`）——真正的开关
+// 由别处（`ConfigToml::web_search`）处理，这里只关心「是否提供了详细配置表」。
 fn deserialize_optional_web_search_tool_config<'de, D>(
     deserializer: D,
 ) -> Result<Option<WebSearchToolConfig>, D::Error>
@@ -637,6 +678,7 @@ where
     Ok(match value {
         None => None,
         Some(WebSearchToolConfigInput::Enabled(enabled)) => {
+            // 布尔开关在此被有意忽略，不构造详细配置。
             let _ = enabled;
             None
         }
@@ -709,6 +751,20 @@ impl ConfigToml {
     /// Call this only after ruling out `default_permissions`: named
     /// `[permissions]` profiles must be compiled through the permissions
     /// profile pipeline, not reconstructed from `sandbox_mode`.
+    ///
+    /// 从旧式的 `sandbox_mode` 配置推导出有效的权限 profile（read-only /
+    /// workspace-write / full-access）。这是「老配置 → 新权限模型」的兼容桥。
+    ///
+    /// @param sandbox_mode_override - 运行时/CLI 强制覆盖的 sandbox 模式（最高优先）
+    /// @param profile_sandbox_mode  - 所选 profile 指定的 sandbox 模式
+    /// @param windows_sandbox_level - Windows 实验沙箱档位；`Disabled` 时触发降级特例
+    /// @param active_project        - 当前目录命中的项目信任配置（影响默认模式）
+    /// @param permission_profile_constraint - admin 约束；推导出的默认若被禁止则回落 read-only
+    /// @returns                     - 最终生效的 `PermissionProfile`
+    ///
+    /// 优先级（`or` 链）：显式覆盖 > profile > 顶层 `sandbox_mode` > 「目录已有信任
+    /// 决定时的隐式默认」。注意调用约束：仅当排除了 `default_permissions` 命名 profile
+    /// 后才走这里，命名 profile 必须经权限流水线编译，不能由 sandbox_mode 重建。
     pub async fn derive_permission_profile(
         &self,
         sandbox_mode_override: Option<SandboxMode>,
@@ -717,6 +773,8 @@ impl ConfigToml {
         active_project: Option<&ProjectConfig>,
         permission_profile_constraint: Option<&crate::Constrained<PermissionProfile>>,
     ) -> PermissionProfile {
+        // 是否「任意一层显式写了 sandbox_mode」。决定下面是否启用「基于目录信任的
+        // 隐式默认」——只有所有层都没表态时，才允许用信任决定来兜底。
         let sandbox_mode_was_explicit = sandbox_mode_override.is_some()
             || profile_sandbox_mode.is_some()
             || self.sandbox_mode.is_some();
@@ -729,6 +787,8 @@ impl ConfigToml {
                 // If no sandbox_mode is set but this directory has a trust decision,
                 // default to workspace-write except on unsandboxed Windows where we
                 // default to read-only.
+                // 无人显式设置、但目录已有信任决定（trusted 或 untrusted）时：默认
+                // 给 workspace-write；唯独「未启用沙箱的 Windows」上默认 read-only。
                 active_project.and_then(|p| {
                     if p.is_trusted() || p.is_untrusted() {
                         if cfg!(target_os = "windows")
@@ -744,6 +804,8 @@ impl ConfigToml {
                 })
             })
             .unwrap_or_default();
+        // Windows 安全降级：没有可用沙箱实现时，把 workspace-write 强制降到
+        // read-only，避免在无隔离环境下给模型写权限。实验沙箱启用时不降级。
         let effective_sandbox_mode = if cfg!(target_os = "windows")
             // If the experimental Windows sandbox is enabled, do not force a downgrade.
             && windows_sandbox_level == WindowsSandboxLevel::Disabled
@@ -779,6 +841,9 @@ impl ConfigToml {
             },
             SandboxMode::DangerFullAccess => PermissionProfile::Disabled,
         };
+        // admin 约束兜底：仅当「我们自己推导出的默认值」（用户没显式设置）撞上
+        // admin 约束时，退回到 read-only。用户显式选择则不在此处被悄悄改写
+        // （由约束校验在别处直接报错处理）。
         if !sandbox_mode_was_explicit
             && let Some(constraint) = permission_profile_constraint
             && let Err(err) = constraint.can_set(&permission_profile)
@@ -796,6 +861,10 @@ impl ConfigToml {
     /// Resolves the cwd to an existing project, or returns None if ConfigToml
     /// does not contain a project corresponding to cwd or the resolved git repo
     /// root for cwd.
+    ///
+    /// 在 `[projects]` 表里为当前工作目录找到匹配的信任配置：先按 cwd 的各种
+    /// 归一化形态查（处理大小写、符号链接、UNC 等），查不到再退而用 git 仓库根
+    /// 再查一遍。都查不到返回 `None`（表示该目录未在配置里登记过信任级别）。
     pub fn get_active_project(
         &self,
         resolved_cwd: &Path,
@@ -867,6 +936,9 @@ fn project_config_for_lookup_key(
         .map(|(_, project_config)| (**project_config).clone())
 }
 
+// 拒绝用户用「保留的内置 provider ID」（如 `openai`/`ollama`）作为自定义
+// provider 的键——内置 provider 不可被覆盖，否则可能悄悄改写凭据去向/请求地址。
+// 命中冲突时返回带建议改名的错误信息。
 pub fn validate_reserved_model_provider_ids(
     model_providers: &HashMap<String, ModelProviderInfo>,
 ) -> Result<(), String> {
@@ -915,6 +987,9 @@ pub fn validate_model_providers(
     Ok(())
 }
 
+// serde 自定义反序列化钩子：解析 `model_providers` 后立即跑校验，把
+// 「保留 ID 冲突 / aws 误用 / 名称为空」等问题在反序列化阶段就变成解析错误，
+// 而非留到运行时才暴露。
 fn deserialize_model_providers<'de, D>(
     deserializer: D,
 ) -> Result<HashMap<String, ModelProviderInfo>, D::Error>

@@ -1,7 +1,21 @@
 //! Types used to define loaded and effective Codex configuration values.
+//!
+//! 【文件职责】定义配置系统的公共类型：从 TOML 反序列化出来的「原始配置」
+//! （多带 `Toml` 后缀，字段几乎全为 `Option`）以及套用默认值后的「有效配置」
+//! （`...Config`）。如 `MemoriesToml` -> `MemoriesConfig`、`OtelConfigToml`
+//! -> `OtelConfig`。
+//!
+//! 【架构位置】配置层底座。被 `config_toml.rs`（聚合成总的 `ConfigToml`）、
+//! `loader/`（分层加载）以及 core 各处消费。
+//!
+//! 【阅读建议】本文件以类型定义为主、几乎无业务逻辑（见下方原注）。重点理解
+//! 两种命名约定：`XxxToml` 是磁盘原样、字段可缺省；`XxxConfig` 是补默认值后
+//! 程序内真正使用的形态，二者间的 `From`/`Default` 实现就是「默认值落地」的
+//! 地方（如 `MemoriesConfig::from(MemoriesToml)` 还会做范围 `clamp`）。
 
 // Note this file should generally be restricted to simple struct/enum
 // definitions that do not contain business logic.
+// 注：本文件原则上只放简单的 struct/enum 定义，不放业务逻辑。
 
 pub use crate::mcp_types::AppToolApproval;
 pub use crate::mcp_types::McpServerConfig;
@@ -43,6 +57,8 @@ pub use crate::tui_keymap::TuiVimNormalKeymap;
 pub use crate::tui_keymap::TuiVimOperatorKeymap;
 
 pub const DEFAULT_OTEL_ENVIRONMENT: &str = "dev";
+// 以下 DEFAULT_MEMORIES_* 是 memories 子系统各项的默认值；同名 MIN_/MAX_
+// 常量给出可接受区间，`MemoriesConfig::from` 会用 `clamp` 把用户值夹到区间内。
 pub const DEFAULT_MEMORIES_MAX_ROLLOUTS_PER_STARTUP: usize = 2;
 pub const DEFAULT_MEMORIES_MAX_ROLLOUT_AGE_DAYS: i64 = 10;
 pub const DEFAULT_MEMORIES_MIN_ROLLOUT_IDLE_HOURS: i64 = 6;
@@ -83,6 +99,8 @@ impl fmt::Display for SessionPickerViewMode {
 }
 
 /// Determine where Codex should store CLI auth credentials.
+/// 决定 CLI 登录凭据（auth.json）的存放位置。默认落地为文件，可选系统
+/// keyring，或仅在进程内存中保存（`Ephemeral`，进程退出即丢）。
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthCredentialsStoreMode {
@@ -98,6 +116,8 @@ pub enum AuthCredentialsStoreMode {
 }
 
 /// Determine where Codex should store and read MCP credentials.
+/// 决定 MCP 服务器 OAuth 凭据的存放位置。与上面的 CLI 凭据类似，但默认
+/// `Auto`（优先 keyring，缺失时回退文件），且无 `Ephemeral` 选项。
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum OAuthCredentialsStoreMode {
@@ -256,6 +276,9 @@ pub struct ToolSuggestConfig {
 }
 
 /// Memories settings loaded from config.toml.
+/// 从 config.toml 读到的 memories（长期记忆）子系统设置。字段全为 `Option`：
+/// 缺省时由 `MemoriesConfig::from` 套用 `DEFAULT_MEMORIES_*` 默认值。这是
+/// 「原始 Toml」侧，对应的有效配置见下方 `MemoriesConfig`。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct MemoriesToml {
@@ -290,6 +313,8 @@ pub struct MemoriesToml {
 }
 
 /// Effective memories settings after defaults are applied.
+/// 套用默认值后的有效 memories 设置：所有字段都是确定值（非 `Option`），
+/// 程序运行时直接读这里。由 `From<MemoriesToml>` 构造，构造时同时做范围 `clamp`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MemoriesConfig {
     pub disable_on_external_context: bool,
@@ -325,6 +350,9 @@ impl Default for MemoriesConfig {
     }
 }
 
+// 把磁盘原始 `MemoriesToml` 转成有效 `MemoriesConfig`：每个字段「缺省补默认、
+// 越界夹回合法区间」。`clamp` 的边界（如 `max_unused_days` 夹到 0..=365）是产品
+// 经验值，防止用户写出会拖垮记忆维护任务的极端取值。
 impl From<MemoriesToml> for MemoriesConfig {
     fn from(toml: MemoriesToml) -> Self {
         let defaults = Self::default();
@@ -446,6 +474,9 @@ pub struct AppConfig {
 }
 
 /// App/connector settings loaded from `config.toml`.
+/// `[apps]` 表：`_default` 子表是所有 app 的默认值（`rename = "_default"`，下划线
+/// 前缀避开与某个真实 app 名冲突），其余键被 `flatten` 当作「按 app ID 索引」的
+/// 逐 app 覆盖。`AppConfig` 里的 `Option` 字段缺省时回落到 `_default`。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct AppsConfigToml {
@@ -479,6 +510,9 @@ pub struct OtelTlsConfig {
 }
 
 /// Which OTEL exporter to use.
+/// 选择 OpenTelemetry 数据的导出后端：不导出、走内部 Statsig，或标准的
+/// OTLP/HTTP、OTLP/gRPC（后两者带 endpoint、headers、可选 TLS）。日志、trace、
+/// metrics 三类可分别指定不同 exporter（见 `OtelConfigToml`）。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 #[serde(rename_all = "kebab-case")]
@@ -547,6 +581,8 @@ impl Default for OtelConfig {
             environment: DEFAULT_OTEL_ENVIRONMENT.to_owned(),
             exporter: OtelExporterKind::None,
             trace_exporter: OtelExporterKind::None,
+            // 注意：日志/trace 默认不导出，但 metrics 默认走内部 `Statsig`
+            // ——产品默认开启指标上报，而原始日志/trace 需用户显式配置。
             metrics_exporter: OtelExporterKind::Statsig,
             span_attributes: BTreeMap::new(),
             tracestate: BTreeMap::new(),
@@ -554,6 +590,9 @@ impl Default for OtelConfig {
     }
 }
 
+// `#[serde(untagged)]`：TOML 里既可写 `notifications = true`（开关，落到
+// `Enabled`），也可写成字符串数组（自定义要通知的事件类型，落到 `Custom`）。
+// 无标签枚举按形状自动匹配，这是为了向后兼容两种历史写法。
 #[derive(Serialize, Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum Notifications {
@@ -646,6 +685,10 @@ pub struct ModelAvailabilityNuxConfig {
 pub const DEFAULT_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS: usize = 1_000;
 
 /// Collection of settings that are specific to the TUI.
+/// TUI（终端界面）专属设置的总集合：动画、提示、Vim 模式、备用屏幕、状态行/
+/// 标题栏项、主题、宠物（pet）、键位映射等。`[tui]` 表整体反序列化到这里。
+/// `notification_settings` 用 `flatten`，使桌面通知相关字段直接平铺在 `[tui]`
+/// 顶层（而非嵌套子表），保持配置文件书写习惯。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct Tui {
@@ -874,6 +917,9 @@ pub enum MarketplaceSourceType {
     Local,
 }
 
+/// `sandbox_mode = "workspace-write"` 时生效的细化沙箱配置：额外可写目录、
+/// 是否放开网络、是否排除 `$TMPDIR` / `/tmp`。安全边界相关，决定模型可写哪里、
+/// 能否联网。默认全空/全 false（最严格）。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct SandboxWorkspaceWrite {
@@ -899,6 +945,8 @@ impl From<SandboxWorkspaceWrite> for codex_app_server_protocol::SandboxSettings 
 }
 
 /// Policy for building the `env` when spawning a process via shell-like tools.
+/// 控制 shell 类工具启动子进程时如何构造环境变量：继承策略、默认排除项开关、
+/// 黑/白名单正则、强制 set 的变量等。原始 Toml 侧，转换见下方 `From` 实现。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ShellEnvironmentPolicyToml {
@@ -917,9 +965,13 @@ pub struct ShellEnvironmentPolicyToml {
     pub experimental_use_profile: Option<bool>,
 }
 
+// 把原始 `ShellEnvironmentPolicyToml` 落成有效策略，关键默认值：未指定时
+// 「继承全部环境变量」(`All`)、保留内置默认排除项 (`ignore_default_excludes`
+// 默认 true)、不启用 profile。正则统一编译为大小写不敏感的匹配模式。
 impl From<ShellEnvironmentPolicyToml> for ShellEnvironmentPolicy {
     fn from(toml: ShellEnvironmentPolicyToml) -> Self {
         // Default to inheriting the full environment when not specified.
+        // 未显式设置时默认继承完整环境。
         let inherit = toml.inherit.unwrap_or(ShellEnvironmentPolicyInherit::All);
         let ignore_default_excludes = toml.ignore_default_excludes.unwrap_or(true);
         let exclude = toml

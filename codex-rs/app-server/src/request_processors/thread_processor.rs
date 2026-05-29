@@ -1,8 +1,38 @@
+//! 【文件职责】处理「线程（thread）级」的 JSON-RPC 请求：线程的创建、恢复、
+//! fork、归档/解档、列举/搜索、读取、回滚、压缩、改名、元数据更新、记忆模式
+//! 等全套生命周期操作，并负责把它们翻译成内核 `Op` 或直接读写 `ThreadStore`。
+//!
+//! 【架构位置】
+//!   层级：App-Server 请求处理层（JSON-RPC 协议层与 codex-core 内核之间）
+//!   上游：`request_processors.rs` 的方法分发逻辑
+//!   下游：`ThreadManager`（创建/恢复/fork 线程、查活跃线程）、
+//!         `ThreadStore`（持久化的线程元数据与历史读写）、
+//!         `ThreadWatchManager` / `ThreadStateManager`（线程状态与订阅）、
+//!         `thread_lifecycle`（监听器挂载）、`OutgoingMessageSender`（回发响应/通知）
+//!
+//! 【两条主路径的区别】
+//!   - 「动作类」（start/resume/fork/rollback/compact 等）：翻译为 `Op` 提交内核，
+//!     通常在后台任务里跑，结果通过 outgoing 异步回发；
+//!   - 「查询类」（list/search/read/turns/list 等）：直接查 `ThreadStore` 持久化层，
+//!     再叠加 `ThreadWatchManager` 的实时状态，拼成 API 视图返回。
+//!
+//! 【阅读建议】这是个超大文件（4000+ 行）。建议主线：
+//!   1. 看 `ThreadRequestProcessor` 结构体字段，了解它握有哪些句柄；
+//!   2. 公共方法（`thread_start`/`thread_resume`/`thread_fork`/...）多为薄封装，
+//!      转调同名 `*_inner`；真正逻辑在 `_inner`；
+//!   3. 重点读 `thread_start_task`（新建线程的完整流程，含项目信任处理）、
+//!      `thread_resume_inner` + `resume_running_thread`（冷恢复 vs 复用运行中线程）、
+//!      `read_thread_view`（thread/read 的多分支视图构建）；
+//!   4. 文件后半段大量 `*_error` 函数是 `ThreadStoreError`/`CodexErr` → JSON-RPC
+//!      错误码的样板翻译，自解释，可略读。
+
 use super::*;
 use crate::error_code::method_not_found;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 
+// thread/list 的默认/最大分页大小。请求未给 limit 时用默认值；给了也会被夹到
+// [1, MAX] 区间，防止单次请求拉取过多线程拖垮 store 查询。
 const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 const THREAD_LIST_MAX_LIMIT: usize = 100;
 const PERSIST_EXTENDED_HISTORY_DEPRECATION_SUMMARY: &str =
@@ -19,6 +49,13 @@ struct ThreadListFilters {
     use_state_db_only: bool,
 }
 
+/// 当 `thread/resume` 命中一个「已在运行的线程」时，请求里携带的各种覆盖项
+/// （模型、provider、cwd、审批/沙箱策略、人格、config 等）其实**无法生效**——
+/// 运行中线程的配置已定型。本函数逐字段对比「请求想要的值」与「线程当前生效的值」，
+/// 收集所有不一致项的可读描述。
+///
+/// @returns 不匹配项的描述列表（空列表 = 完全一致）。调用方据此打 warning 日志，
+///          告知调用者这些覆盖被忽略了，而不是静默吞掉。
 fn collect_resume_override_mismatches(
     request: &ThreadResumeParams,
     config_snapshot: &ThreadConfigSnapshot,
@@ -150,6 +187,9 @@ fn collect_resume_override_mismatches(
     mismatch_details
 }
 
+// 恢复线程时，把持久化的线程元数据（上次用的 model / provider / 推理力度）
+// 回填进配置覆盖项里——前提是调用方**没有**显式指定模型相关覆盖。
+// 即「调用方显式给的优先；没给才沿用上次保存的」，保证 resume 默认还原原样。
 fn merge_persisted_resume_metadata(
     request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
     typesafe_overrides: &mut ConfigOverrides,
@@ -205,6 +245,14 @@ fn has_model_resume_override(
             .is_some_and(|overrides| overrides.contains_key("model_reasoning_effort"))
 }
 
+/// 校验客户端通过 `thread/start` 注册的「动态工具」规格是否合法。
+/// 动态工具是运行时由客户端注入的自定义工具，其名字/命名空间会进入 Responses API，
+/// 因此必须满足一系列约束，否则在与模型交互时会冲突或被拒。
+///
+/// 校验项：名字非空且无首尾空白、匹配 `^[a-zA-Z0-9_-]+$`、长度上限、
+/// 不得占用 `mcp`/`mcp__*` 前缀、命名空间不得与 Responses API 的保留命名空间
+/// （python/web/browser 等）冲突、同 (namespace, name) 不得重复、延迟加载工具
+/// 必须带命名空间、input schema 必须能被 `codex_tools` 解析。
 fn validate_dynamic_tools(tools: &[ApiDynamicToolSpec]) -> Result<(), String> {
     const DYNAMIC_TOOL_NAME_MAX_LEN: usize = 128;
     const DYNAMIC_TOOL_NAMESPACE_MAX_LEN: usize = 64;
@@ -322,6 +370,17 @@ fn validate_dynamic_tools(tools: &[ApiDynamicToolSpec]) -> Result<(), String> {
     Ok(())
 }
 
+/// 线程级请求处理器：持有处理 `thread/*` 请求所需的全部共享句柄。
+/// 字段均为 `Arc`/可廉价克隆的句柄，故整体 `Clone`（分发层按连接克隆）。
+///
+/// 关键字段速记：
+///   - `thread_manager`：内核侧线程的创建/恢复/fork/查活，是「动作类」请求的下游；
+///   - `thread_store`：持久化的线程元数据与历史，是「查询类」请求的下游；
+///   - `thread_state_manager` / `thread_watch_manager`：线程的实时状态与订阅关系；
+///   - `pending_thread_unloads`：正在卸载中的线程集合，避免恢复与卸载竞态；
+///   - `thread_list_state_permit`：信号量，串行化对 list/state 的并发访问；
+///   - `state_db`：可选的 SQLite 状态库（部分查询/记忆功能依赖它）；
+///   - `background_tasks`：承载 `thread_start` 等长耗时操作的后台任务追踪器。
 #[derive(Clone)]
 pub(crate) struct ThreadRequestProcessor {
     pub(super) auth_manager: Arc<AuthManager>,
@@ -377,6 +436,15 @@ impl ThreadRequestProcessor {
             skills_watcher,
         }
     }
+
+    // ───────────────────────────────────────────────────────────────
+    // Public RPC entry points  ·  对外 JSON-RPC 方法入口
+    //
+    // 下面这批 pub(crate) 方法是分发层直接调用的入口。它们大多是**薄封装**：
+    // 调用同名的 `*_inner`/`*_response_inner` 拿到强类型响应，再统一包装成
+    // `Option<ClientResponsePayload>`（`Some` = 当场回复，`None` = 由后台任务或
+    // 事件回调异步回复）。真正的业务逻辑都在对应的 `_inner` 函数里，阅读时直接跳过去。
+    // ───────────────────────────────────────────────────────────────
 
     pub(crate) async fn thread_start(
         &self,
@@ -441,6 +509,8 @@ impl ThreadRequestProcessor {
         .map(|()| None)
     }
 
+    // 归档线程：除回发归档响应外，还会对「实际被归档的每个线程 id」逐个广播
+    // `ThreadArchived` 通知（一次归档可能连带归档其派生子线程，见 `_inner`）。
     pub(crate) async fn thread_archive(
         &self,
         request_id: ConnectionRequestId,
@@ -715,6 +785,9 @@ impl ThreadRequestProcessor {
             .map_err(|err| internal_error(format!("failed to set app server client info: {err}")))
     }
 
+    /// 线程拆除的收尾清理：把该线程从各处 app-server 侧簿记中移除——
+    /// pending 卸载集合、出站请求取消、线程状态、watch 监听。
+    /// 这是「线程不再存活」时必须做的统一善后，归档/解除订阅/连接关闭等多处复用。
     async fn finalize_thread_teardown(&self, thread_id: ThreadId) {
         self.pending_thread_unloads.lock().await.remove(&thread_id);
         self.outgoing
@@ -756,6 +829,9 @@ impl ThreadRequestProcessor {
         Ok(ThreadUnsubscribeResponse { status })
     }
 
+    /// 归档前的准备：若线程当前是活跃的，先把它从内核管理器移除并等待优雅关闭
+    /// （提交失败/超时只记日志、不阻断归档），最后做统一拆除清理。
+    /// 即「先停活、再清账」，保证归档后的线程不会留下半活的内核会话。
     async fn prepare_thread_for_archive(&self, thread_id: ThreadId) {
         let removed_conversation = self.thread_manager.remove_thread(&thread_id).await;
         if let Some(conversation) = removed_conversation {
@@ -819,6 +895,12 @@ impl ThreadRequestProcessor {
         .await
     }
 
+    /// `thread/start` 的内层实现：做**同步前置校验**（互斥参数、解析环境选择、
+    /// 构建配置覆盖），随后把真正的建线程工作 `thread_start_task` 丢到后台任务里
+    /// 异步执行——因为建线程涉及配置加载、内核会话创建等较慢的 IO，不宜阻塞分发线程。
+    ///
+    /// 因此本函数返回 `Ok(())` 只代表「已受理」，真正的成功响应或错误都由后台任务
+    /// 通过 outgoing 异步回发（错误走 `send_error`）。
     async fn thread_start_inner(
         &self,
         request_id: ConnectionRequestId,
@@ -851,11 +933,13 @@ impl ThreadRequestProcessor {
             environments,
             persist_extended_history,
         } = params;
+        // `permissions` 与 `sandbox` 是两套互斥的权限表达方式，不允许同时给。
         if sandbox.is_some() && permissions.is_some() {
             return Err(invalid_request(
                 "`permissions` cannot be combined with `sandbox`",
             ));
         }
+        // persistExtendedHistory 已废弃且被忽略；若客户端仍传了，回发一条弃用通知。
         if persist_extended_history {
             self.send_persist_extended_history_deprecation_notice(request_id.connection_id)
                 .await;
@@ -918,6 +1002,8 @@ impl ThreadRequestProcessor {
         Ok(())
     }
 
+    // 关停时排空后台任务：先关闭任务追踪器（不再接受新任务），再带 10s 超时等待
+    // 已派发任务跑完。超时只记 warning 并继续关停，不无限期阻塞进程退出。
     pub(crate) async fn drain_background_tasks(&self) {
         self.background_tasks.close();
         if tokio::time::timeout(Duration::from_secs(10), self.background_tasks.wait())
@@ -975,6 +1061,21 @@ impl ThreadRequestProcessor {
             .await
     }
 
+    /// 在后台任务里真正「建一个新线程」并把结果回发给客户端。是 `thread/start`
+    /// 的重活所在（由 `thread_start_inner` 派发，故为关联函数而非方法）。
+    ///
+    /// 主线（每步均带 OTel span 计时）：
+    ///   1. 用 config_manager 加载配置（合并请求覆盖与类型安全覆盖）；
+    ///   2. 处理「项目信任」：若用户请求了可写沙箱/信任档但项目尚未标记信任，
+    ///      则把根 git 项目持久化为 Trusted 并重载配置（持久化失败时退化为本线程内
+    ///      存活的内存信任）；
+    ///   3. 解析指令来源、环境选择、校验并转换动态工具；
+    ///   4. `start_thread_with_options` 创建内核线程，拿到 thread_id 与会话配置；
+    ///   5. 写客户端信息、取配置快照、构建 API `Thread`、自动挂监听器、upsert 到 watch；
+    ///   6. 组装 `ThreadStartResponse` 回发，并广播 `ThreadStarted` 通知；
+    ///   7. 全程用 session_telemetry 记录各启动阶段耗时。
+    ///
+    /// 错误：内核创建失败按 `InvalidRequest`/其它分别映射为 invalid_request/internal_error。
     #[allow(clippy::too_many_arguments)]
     async fn thread_start_task(
         listener_task_context: ListenerTaskContext,
@@ -1004,6 +1105,9 @@ impl ThreadRequestProcessor {
         // could be downgraded to ReadOnly (perhaps there is no sandbox
         // available on Windows or the enterprise config disallows it). The cwd
         // should still be considered "trusted" in this case.
+        // 用户可能在命令行请求了 WorkspaceWrite/DangerFullAccess，但推导 Config 时
+        // 可能被降级为 ReadOnly（如 Windows 上无可用沙箱、或企业配置禁止）。即便如此，
+        // 该 cwd 仍应被视为「已信任」——故下面同时检查「请求的」和「实际生效的」两种信任。
         let requested_permissions_trust_project =
             requested_permissions_trust_project(&typesafe_overrides, config.cwd.as_path());
         let effective_permissions_trust_project = permission_profile_trusts_project(
@@ -2066,6 +2170,10 @@ impl ThreadRequestProcessor {
     }
 
     /// Builds the API view for `thread/read` from persisted metadata plus optional live state.
+    /// 为 `thread/read` 构建 API 视图：根据「线程是否已加载」与「是否要 turns」
+    /// 在多个分支间组合「持久化元数据」与「实时线程快照」两个数据源——
+    /// 已加载用元数据 + 实时历史；未加载则从 store 一次性读元数据与历史。
+    /// 最后再叠加实时状态、把陈旧的 in-progress 回合标记为已中断。
     async fn read_thread_view(
         &self,
         thread_id: ThreadId,
@@ -2253,6 +2361,9 @@ impl ThreadRequestProcessor {
         // every request. Rollback and compaction events can change earlier turns, so
         // the server has to rebuild the full turn list until turn metadata is indexed
         // separately.
+        // 该 API 让客户端分页增量取回合以省网络传输，但服务端每次请求仍**重放整个
+        // rollout** 重建完整回合列表——因为回滚/压缩事件会改写更早的回合，在回合元数据
+        // 被单独索引之前，无法做真正的增量。这是已知的性能取舍，不是 bug。
         let loaded_thread = self.thread_manager.get_thread(thread_uuid).await.ok();
         let has_live_running_thread = match loaded_thread.as_ref() {
             Some(thread) => matches!(thread.agent_status().await, AgentStatus::Running),
@@ -2262,6 +2373,9 @@ impl ThreadRequestProcessor {
             // Persisted history may not yet include the currently running turn. The
             // app-server listener has already projected live turn events into ThreadState,
             // so merge that in-memory snapshot before paginating.
+            // 持久化历史可能还不包含「当前正在跑的回合」。app-server 监听器已经把实时
+            // 回合事件投影进了 ThreadState，因此分页前先把这份内存快照合并进来，
+            // 否则正在进行的回合会在 thread/turns/list 里短暂「消失」。
             let thread_state = self.thread_state_manager.thread_state(thread_uuid).await;
             let state = thread_state.lock().await;
             state.active_turn_snapshot()
@@ -2406,6 +2520,18 @@ impl ThreadRequestProcessor {
         }
     }
 
+    /// `thread/resume` 的内层实现：恢复一个先前的线程，使其再次可用。
+    ///
+    /// 两条分支由 `resume_running_thread` 先行决定：
+    ///   - 若目标线程**当前仍在运行**（内核里还活着），走「复用并重新订阅」的快路径，
+    ///     由那里直接处理并返回（本函数随即提前返回）；
+    ///   - 否则走「冷恢复」：从 history 参数或 rollout 持久化里重建初始历史，回填
+    ///     持久化的模型元数据，重新加载配置，`resume_thread_with_history` 重建内核线程，
+    ///     挂监听器，构建 API `Thread` 视图与（可选的）首屏 turns 分页，回发响应，
+    ///     并补发一条恢复后的 token 用量更新。
+    ///
+    /// 注意：本函数大量分支在出错时是**直接 `send_error` 然后返回 `Ok(())`**，
+    /// 而非向上抛错——因为 resume 多在后台异步进行，错误以通知形式回发给客户端。
     async fn thread_resume_inner(
         &self,
         request_id: ConnectionRequestId,
@@ -2413,6 +2539,7 @@ impl ThreadRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
     ) -> Result<(), JSONRPCErrorError> {
+        // 若线程正处于「卸载中」，恢复会与卸载竞态；直接让客户端稍后重试。
         if let Ok(thread_id) = ThreadId::from_string(&params.thread_id)
             && self
                 .pending_thread_unloads
@@ -2494,6 +2621,8 @@ impl ThreadRequestProcessor {
         } = params;
         let include_turns = !exclude_turns;
 
+        // 初始历史的两种来源：客户端直接传入 history（fork 式），或按 thread_id/path
+        // 从 rollout 持久化里读出（resume 式，并带回 stored_thread 供后续构建摘要）。
         let (thread_history, resume_source_thread) = match if let Some(history) = history {
             self.resume_thread_from_history(history.as_slice())
                 .await
@@ -2737,6 +2866,17 @@ impl ThreadRequestProcessor {
         Some(persisted_metadata)
     }
 
+    /// 处理「恢复一个仍在运行/已加载的线程」的快路径。
+    ///
+    /// @returns
+    ///   - `Ok(true)`：目标线程仍存活，已通过线程监听器命令通道把恢复响应「排队」，
+    ///     由监听器侧异步回发（调用方据此提前返回，不再走冷恢复）；
+    ///   - `Ok(false)`：目标线程不存活（或刚被关停清理），调用方应继续走冷恢复路径；
+    ///   - `Err(..)`：硬性错误（如带 history 恢复一个仍在跑的线程、路径过期等）。
+    ///
+    /// 细节：传了 history 却命中运行中线程会直接报错（不允许覆盖运行中历史）；
+    /// 覆盖项与运行中配置不一致时只打 warning（保留 rejoin 语义，见
+    /// `collect_resume_override_mismatches`）。
     async fn resume_running_thread(
         &self,
         request_id: &ConnectionRequestId,
@@ -3152,6 +3292,13 @@ impl ThreadRequestProcessor {
         }
     }
 
+    /// `thread/fork` 的内层实现：从某个源线程的历史**派生一个新线程**（带分叉点），
+    /// 新线程拥有独立 id，源线程不受影响。
+    ///
+    /// 与 resume 的区别：fork 总是新建线程（`fork_thread_from_history`），而 resume 是
+    /// 让原线程重新可用。Windows 下还会把当前沙箱级别透传进 CLI 覆盖。
+    /// 持久化 fork 立即固化自己的 rollout；临时（ephemeral）fork 保持无路径，从拷贝的
+    /// 源历史重建可见历史。完成后回发响应、补发 token 用量、广播 `ThreadStarted`。
     async fn thread_fork_inner(
         &self,
         request_id: ConnectionRequestId,
@@ -3443,6 +3590,13 @@ impl ThreadRequestProcessor {
         Ok(GetConversationSummaryResponse { summary })
     }
 
+    /// `thread/list` 的公共分页 + 过滤循环：反复向 store 取页，对每页按来源类型/cwd
+    /// 做二次过滤，直到攒够 `requested_page_size` 条或翻到末尾。
+    ///
+    /// 为什么要循环而非取一页就返回：store 的分页是按原始记录分的，本地过滤（source
+    /// kind / cwd）可能把一整页都筛掉，故需继续翻页补足。循环内带「游标不前进即退出」
+    /// 的保护，避免过滤掉整页时陷入死循环。`model_providers` 为 None 时默认只列当前
+    /// provider 的线程。
     async fn list_threads_common(
         &self,
         requested_page_size: usize,
@@ -3548,6 +3702,16 @@ impl ThreadRequestProcessor {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// Module-level helpers  ·  模块级自由函数（视图构建 / 分页 / 错误翻译）
+//
+// 以下是 impl 块之外的工具函数：回合分页、API 视图构建（StoredThread → Thread）、
+// 权限信任判断，以及一大批把 `ThreadStoreError`/`CodexErr` 翻译成 JSON-RPC 错误码
+// 的样板函数。错误翻译类多为「按变体 match → 套对应错误构造器」，自解释，可略读。
+// ═══════════════════════════════════════════════════════════════
+
+// 兼容性 hack：Xcode 26.4 发布时 app-server 的 MCP elicitation 请求对客户端尚不可见，
+// 对该客户端版本线自动拒绝 elicitation。待 Xcode 26.4 退场后可删（见 TODO）。
 fn xcode_26_4_mcp_elicitations_auto_deny(
     client_name: Option<&str>,
     client_version: Option<&str>,
@@ -3573,6 +3737,8 @@ fn thread_backwards_cursor_for_sort_key(
     };
     // The state DB stores unique millisecond timestamps. Offset the reverse cursor by one
     // millisecond so the opposite-direction query includes the page anchor.
+    // 状态库的时间戳是毫秒级且唯一。反向游标按方向偏移 ±1ms，使「反方向翻页」时
+    // 能把当前这一页的锚点本身也包含进去（否则边界那条会被反向查询漏掉）。
     let timestamp = match sort_direction {
         SortDirection::Asc => timestamp.checked_add_signed(ChronoDuration::milliseconds(1))?,
         SortDirection::Desc => timestamp.checked_sub_signed(ChronoDuration::milliseconds(1))?,
@@ -3593,6 +3759,12 @@ struct ThreadTurnsCursor {
     include_anchor: bool,
 }
 
+/// 对已重建的回合列表做基于游标的分页。游标 `ThreadTurnsCursor` 锚定一个 turn_id
+/// 并带 `include_anchor` 标志（决定是否含锚点本身）。
+///
+/// 按 `sort_direction` 决定遍历方向（Desc 会先反转列表），再依据锚点位置裁剪；
+/// 锚点已不存在（被回滚/压缩移除）则返回 invalid_request。同时产出 `next_cursor`
+/// （还有更多时）与 `backwards_cursor`（用于反向翻页）。
 fn paginate_thread_turns(
     turns: Vec<Turn>,
     cursor: Option<&str>,
@@ -3738,6 +3910,11 @@ pub(super) fn build_thread_resume_initial_turns_page(
     .map(Into::into)
 }
 
+/// 按客户端请求的 `items_view` 裁剪每个回合的 items，控制回传数据量：
+///   - `NotLoaded`：清空 items（只要回合骨架）；
+///   - `Summary`：只保留「首条用户消息」+「末条 agent 消息」（两者同 id 时只留一条），
+///     给列表页一个轻量摘要；
+///   - `Full`：保留全部 items，仅打上 Full 标记。
 fn apply_thread_turns_items_view(turns: &mut [Turn], items_view: TurnItemsView) {
     for turn in turns {
         match items_view {
@@ -3810,6 +3987,9 @@ fn normalize_thread_turns_status(
     }
 }
 
+/// `thread/read` 系列内部使用的错误中间类型：把多处来源（store、内核）的错误先
+/// 归并成这三类，再由 `thread_read_view_error` 统一翻译为 JSON-RPC 错误码。
+/// 这样视图构建函数之间可以用同一种错误类型传递，最后只在边界翻译一次。
 enum ThreadReadViewError {
     InvalidRequest(String),
     Unsupported(&'static str),
@@ -3975,6 +4155,13 @@ fn set_thread_name_from_title(thread: &mut Thread, title: String) {
     thread.name = Some(title);
 }
 
+/// 把持久化的 `StoredThread` 转换为对外 API 的 `Thread`，并分离出历史（若有）。
+/// 这是「查询类」请求把 store 记录变成响应视图的核心转换器，被 list/search/read/
+/// resume/fork 等多处复用。
+///
+/// 要点：provider 为空时回退到 `fallback_provider`；cwd 规整失败时回退到
+/// `fallback_cwd`（只记 warning）；status 先置 `NotLoaded`，由调用方再叠加实时状态；
+/// `ephemeral` 固定为 false（持久化线程必非临时）。
 pub(crate) fn thread_from_stored_thread(
     thread: StoredThread,
     fallback_provider: &str,
@@ -4188,6 +4375,9 @@ fn requested_permissions_trust_project(overrides: &ConfigOverrides, cwd: &Path) 
         .is_some_and(|profile| permission_profile_trusts_project(profile, cwd))
 }
 
+// 判断某个权限档是否「隐含信任当前项目」：Disabled（无沙箱）与 External 视为信任；
+// Managed 档则看其文件系统沙箱策略是否允许写入 cwd。用于 thread_start_task 决定
+// 是否要把项目自动标记为 Trusted（见那里的信任处理段落）。
 fn permission_profile_trusts_project(
     profile: &codex_protocol::models::PermissionProfile,
     cwd: &Path,

@@ -1,3 +1,22 @@
+//! 【文件职责】把「已解析完成的权限 profile」连同它的身份信息（legacy / 内置 /
+//! 命名）打包成一组数据结构，作为 config 与 session 状态之间的可信桥梁。
+//!
+//! 【架构位置】
+//!   层级：core 配置层（权限子系统）
+//!   上游：config/mod.rs（装配 `Config` 时构造）、session 状态恢复路径
+//!   下游：`Permissions`（mod.rs 中持有它并对外暴露权限投影）
+//!
+//! 【设计背景】一个权限 profile 解析后需要同时携带三类信息：具体的
+//! `PermissionProfile`（实际生效的沙箱权限）、可选的「活动 profile id」（用于
+//! 让用户重新选中/round-trip）、以及 profile 自带的 workspace roots。本文件用
+//! 一个三态枚举 `ResolvedPermissionProfile` 把它们统一编码，再由
+//! `PermissionProfileSnapshot`（对外可信快照）和 `PermissionProfileState`
+//! （带约束校验的内部状态）两层包装提供给不同调用方。
+//!
+//! 【阅读建议】先看 `ResolvedPermissionProfile` 的三个变体含义，再看
+//! `from_active_profile()`（id → 变体的分派逻辑），最后看
+//! `PermissionProfileSnapshot` / `PermissionProfileState` 两个外壳的职责差异。
+
 use codex_config::Constrained;
 use codex_config::ConstraintResult;
 use codex_protocol::models::ActivePermissionProfile;
@@ -7,6 +26,8 @@ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
+/// 内置权限 profile 的强类型 id。三个内置档分别对应只读 / 工作区可写 /
+/// 危险全开（无沙箱）。用枚举而非裸字符串，避免在 `match` 中漏分支。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BuiltInPermissionProfileId {
     ReadOnly,
@@ -33,6 +54,12 @@ impl BuiltInPermissionProfileId {
     }
 }
 
+/// 解析后的权限 profile 三态。区分这三态的根本目的是：是否能向客户端「回报」
+/// 一个可重新选中的活动 profile id。
+/// - `Legacy`：来自旧式 `sandbox_mode` 语法或本地覆盖，没有 profile 身份，
+///   对外 `active_permission_profile()` 返回 `None`。
+/// - `BuiltIn`：选中了某个内置档（如 `:workspace`），id 用强类型表示。
+/// - `Named`：选中了用户在 `[permissions]` 里自定义的命名档，id 是任意字符串。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResolvedPermissionProfile {
     Legacy(LegacyPermissionProfile),
@@ -48,6 +75,11 @@ pub(crate) enum ResolvedPermissionProfile {
 /// install them atomically. It is not a resolver: callers that are handling
 /// user-selected profile ids should resolve those ids through config instead
 /// of constructing this type directly.
+///
+/// 「可信快照」：把已解析好的 profile 三元组（具体权限 + 活动 id + workspace
+/// roots）原子地搬运给 `Permissions` 安装。它本身**不做解析**——调用方若拿到的是
+/// 用户选择的 profile id，应当先走 config 解析，而不是直接构造本类型（否则 id
+/// 与权限可能对不上）。这是 `pub` 类型，是跨 crate 的对外契约。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionProfileSnapshot {
     resolved_permission_profile: ResolvedPermissionProfile,
@@ -75,6 +107,10 @@ pub(crate) struct NamedPermissionProfile {
 }
 
 impl ResolvedPermissionProfile {
+    /// 根据「活动 profile 元数据是否存在 + id 是否为内置档」三路分派到对应变体：
+    /// - 无活动元数据 → `Legacy`（无身份）。
+    /// - id 命中内置档 → `BuiltIn`。
+    /// - 其余 → `Named`（用户自定义命名档）。
     pub(crate) fn from_active_profile(
         permission_profile: PermissionProfile,
         active_permission_profile: Option<ActivePermissionProfile>,
@@ -224,6 +260,10 @@ impl PermissionProfileSnapshot {
     }
 }
 
+/// `Permissions` 内部持有的权限 profile 状态：在 `ResolvedPermissionProfile`
+/// 外再套一层 `Constrained`，使「设置新 profile」时会经过 requirements 约束校验
+/// （例如 requirements.toml 禁止某些沙箱模式）。与 `PermissionProfileSnapshot`
+/// 的区别：Snapshot 是可信、无校验的搬运容器；State 是带约束、可拒绝写入的活状态。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PermissionProfileState {
     resolved_permission_profile: Constrained<ResolvedPermissionProfile>,
@@ -251,6 +291,10 @@ impl PermissionProfileState {
         Self::from_constrained_resolved(constrained_permission_profile, resolved)
     }
 
+    /// 把「对 `PermissionProfile` 的约束」转译成「对 `ResolvedPermissionProfile`
+    /// 的约束」：新约束的校验逻辑就是取出候选 resolved 内部的具体
+    /// `PermissionProfile`，再交给原始约束判定。这样 resolved 这层包装在切换时
+    /// 仍受底层 requirements 约束保护。
     pub(crate) fn from_constrained_resolved(
         constrained_permission_profile: Constrained<PermissionProfile>,
         resolved_permission_profile: ResolvedPermissionProfile,

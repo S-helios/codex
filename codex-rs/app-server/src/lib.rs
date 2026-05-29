@@ -1,4 +1,26 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
+//! 【文件职责】app-server 的「进程/服务总入口与编排骨架」。负责加载配置、初始化
+//! 遥测/日志、按 transport（stdio / unix / ws / 远程控制）拉起接入点，并启动两个长驻
+//! tokio 任务——「处理器循环」与「出站路由循环」，把整套服务的生命周期（启动、优雅
+//! 重启 drain、关闭）串起来。
+//!
+//! 【架构位置】
+//!   层级：前端集成层（app-server）· 顶层装配
+//!   上游：CLI（`codex app-server` / daemon）通过 `run_main*` 进入
+//!   下游：`transport`（接入与字节流）、`MessageProcessor`（请求分发）、`OutgoingMessageSender`（出站）
+//!
+//! 【两循环模型 · 本文件的核心设计】见 `OutboundControlEvent` 文档：
+//!   · 处理器循环：消费 `TransportEvent`，做 JSON-RPC 分发、连接初始化握手、关闭信号 drain；
+//!   · 出站循环：消费 `OutgoingEnvelope`，执行「可能很慢」的逐连接写。
+//!   两者经由 `OutboundControlEvent`（连接开/关/全断）协调，不直接共享可变连接状态。
+//!
+//! 【阅读建议】主入口是 `run_main_with_transport_options`（巨型装配函数）。读法：
+//!   ① 前半段——配置加载 / 遥测 / 状态库 / 告警收集；
+//!   ② 中段——按 transport 启动 acceptor、启动远程控制；
+//!   ③ 后半段——`tokio::spawn` 出站循环 + 处理器循环（含 `tokio::select!` 主循环）。
+//!   `ShutdownState`（优雅重启状态机）与 `OutboundControlEvent` 是理解生命周期的两把钥匙；
+//!   顶部一批 `config_*_warning` / `*_location` 是配置告警的格式化 helper，可后看。
+//!   对照 learn_docs/5_前端_集成_协议/20_app_server_layer.md §6、§7。
 
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::ConfigLayerStackOrdering;
@@ -136,8 +158,14 @@ fn configured_thread_config_loader(config: &Config) -> Arc<dyn ThreadConfigLoade
 /// `OutboundControlEvent` keeps those loops coordinated without sharing mutable
 /// connection state directly. In particular, the outbound loop needs to know
 /// when a connection opens/closes so it can route messages correctly.
+/// 【控制面事件】处理器循环 → 出站循环的单向控制消息。出站循环维护 `connection_id → 写端`
+/// 的路由表，但它本身不监听 transport，因此连接的开/关必须由处理器循环「告知」它——
+/// 这就是本枚举存在的原因：用消息传递替代共享可变状态，避免两个任务争抢同一份连接表。
 enum OutboundControlEvent {
     /// Register a new writer for an opened connection.
+    /// 新连接打开：把它的写端 + 一组共享标志（是否已初始化 / 是否启用实验 API /
+    /// 退订的通知方法集）登记进出站路由表。这些 `Arc` 标志在处理器侧更新、出站侧读取，
+    /// 使出站循环能据此过滤/路由而无需回查处理器状态。
     Opened {
         connection_id: ConnectionId,
         writer: mpsc::Sender<QueuedOutgoingMessage>,
@@ -147,11 +175,17 @@ enum OutboundControlEvent {
         opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
     },
     /// Remove state for a closed/disconnected connection.
+    /// 连接关闭：从出站路由表移除其状态。
     Closed { connection_id: ConnectionId },
     /// Disconnect all connection-oriented clients during graceful restart.
+    /// 优雅重启：主动断开所有面向连接的客户端（出站侧触发各连接的 disconnect token）。
     DisconnectAll,
 }
 
+/// 优雅重启的状态机（只在多客户端 transport 且启用信号处理时生效）。
+/// 语义：收到首个关闭信号后进入「drain」——停止接受新连接但允许现有 assistant turn 跑完；
+/// 收到第二个可强制信号则 `forced`，不再等待直接收尾。`last_logged_running_turn_count`
+/// 用于「turn 数变化才打日志」，避免 drain 期间刷屏。
 #[derive(Default)]
 struct ShutdownState {
     requested: bool,
@@ -159,11 +193,14 @@ struct ShutdownState {
     last_logged_running_turn_count: Option<usize>,
 }
 
+/// `update()` 的决策结果：`Noop` 继续 drain；`Finish` 立即收尾（停 acceptor、断全部连接）。
 enum ShutdownAction {
     Noop,
     Finish,
 }
 
+/// 关闭信号的两种性质：`Forceable`（SIGTERM/Ctrl-C，可二次触发强制）；
+/// `GracefulOnly`（SIGHUP，仅触发优雅 drain，二次也不强制）——仅 unix 有此区分。
 #[derive(Clone, Copy)]
 enum ShutdownSignal {
     Forceable,
@@ -203,6 +240,9 @@ impl ShutdownState {
         self.forced
     }
 
+    /// 收到关闭信号时推进状态：首次置 `requested` 进入 drain；若 drain 期间又收到可强制信号
+    /// 则升级为 `forced`（第二次 Ctrl-C 强杀语义）。仅 `Forceable` 能触发 `forced`，
+    /// `GracefulOnly`（SIGHUP）重复到达不会强制。
     fn on_signal(
         &mut self,
         signal: ShutdownSignal,
@@ -224,6 +264,9 @@ impl ShutdownState {
         );
     }
 
+    /// 在处理器主循环每轮开头被调用，根据「是否已请求关闭 / 是否强制 / 还有几个 turn 在跑」
+    /// 决定是否收尾。收尾条件：已强制，或正在运行的 assistant turn 归零。否则返回 `Noop`
+    /// 继续等待（turn 数变化时补一行日志）。
     fn update(&mut self, running_turn_count: usize, connection_count: usize) -> ShutdownAction {
         if !self.requested {
             return ShutdownAction::Noop;
@@ -372,6 +415,9 @@ fn log_format_from_env() -> LogFormat {
     LogFormat::from_env_value(value.as_deref())
 }
 
+/// 默认入口：以「stdio transport + VSCode 来源 + 默认运行时选项」启动 app-server，
+/// 是最常见的 TUI/桌面端子进程接入路径。需要 unix/ws/远程控制等其它形态时，
+/// 直接调用 `run_main_with_transport_options` 自定义参数。
 pub async fn run_main(
     arg0_paths: Arg0DispatchPaths,
     cli_config_overrides: CliConfigOverrides,
@@ -393,12 +439,15 @@ pub async fn run_main(
     .await
 }
 
+/// 是否在启动时跑「插件预热任务」。嵌入式/测试场景可用 `Skip` 跳过，避免无谓的后台预热。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginStartupTasks {
     Start,
     Skip,
 }
 
+/// app-server 运行时开关集合。三者分别控制：插件预热、是否启用远程控制接入、
+/// 是否安装系统关闭信号处理器（进而决定能否走「优雅重启 drain」，见 `ShutdownState`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppServerRuntimeOptions {
     pub plugin_startup_tasks: PluginStartupTasks,
@@ -416,6 +465,15 @@ impl Default for AppServerRuntimeOptions {
     }
 }
 
+/// 【主入口·巨型装配函数】完整拉起一个 app-server 实例并阻塞到其退出。
+///
+/// 职责（按执行顺序）：建三条 mpsc 信道 → 解析配置/初始化遥测与状态库 → 收集配置告警
+/// → 装好 tracing 订阅者 → 按 `transport` 启动 acceptor 与远程控制 → spawn「出站循环」
+/// 与「处理器循环」→ 等两循环结束后做收尾（取消 token、回收 acceptor、关闭遥测）。
+///
+/// 副作用：安装全局 tracing 订阅者、启动多个长驻 tokio 任务、（unix socket 形态）持有
+/// 启动锁与创建控制 socket。返回 `Ok(())` 表示服务正常退出（连接耗尽 / 收到关闭信号 /
+/// 信道关闭）。`strict_config` 为真时配置错误会直接向上抛 `Err`，否则降级用默认配置并告警。
 #[allow(clippy::too_many_arguments)]
 pub async fn run_main_with_transport_options(
     arg0_paths: Arg0DispatchPaths,
@@ -428,6 +486,10 @@ pub async fn run_main_with_transport_options(
     auth: AppServerWebsocketAuthSettings,
     runtime_options: AppServerRuntimeOptions,
 ) -> IoResult<()> {
+    // ── Step 1：建立三条核心 mpsc 信道 ──────────────────────────────────
+    // transport_event：transport → 处理器循环（入站事件）
+    // outgoing       ：发射器 → 出站循环（出站信封）
+    // outbound_control：处理器循环 → 出站循环（连接开/关/全断的控制面）
     let (transport_event_tx, mut transport_event_rx) =
         mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(CHANNEL_CAPACITY);
@@ -656,12 +718,18 @@ pub async fn run_main_with_transport_options(
     let transport_shutdown_token = CancellationToken::new();
     let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
 
+    // ── Step 2：按 transport 形态推导生命周期策略 ───────────────────────
+    // stdio 是「单客户端」模式（一个子进程对端）：最后一个连接关闭即退出整个进程；
+    // 也正因为它生命周期绑定父进程，不启用「信号优雅重启」（那是多客户端守护场景的需求）。
     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
     let shutdown_when_no_connections = single_client_mode;
     let graceful_signal_restart_enabled =
         runtime_options.install_shutdown_signal_handler && !single_client_mode;
     let mut app_server_client_name_rx = None;
 
+    // ── Step 3：按 transport 启动对应 acceptor，归一为统一的 TransportEvent 流 ──
+    // 四种形态各起一种接入：stdio 直连父进程 stdin/stdout；unix/ws 起监听 acceptor；
+    // Off 不监听（仅 in-process 或纯远程控制）。无论哪种，入站都汇成 `transport_event_tx`。
     match &transport {
         AppServerTransport::Stdio => {
             let (stdio_client_name_tx, stdio_client_name_rx) = oneshot::channel::<String>();
@@ -730,6 +798,11 @@ pub async fn run_main_with_transport_options(
     .await?;
     transport_accept_handles.push(remote_control_accept_handle);
 
+    // ── Step 4：spawn「出站路由循环」────────────────────────────────────
+    // 维护本地的 `connection_id → OutboundConnectionState` 表，只做两件事：
+    // ① 消费控制面事件（Opened/Closed/DisconnectAll）维护路由表；
+    // ② 消费 `OutgoingEnvelope` 把消息写到目标连接（可能是慢写，故独立于处理器循环）。
+    // `biased`：优先处理控制面，确保「连接已登记」先于「向其写消息」，避免丢路由。
     let outbound_handle = tokio::spawn(async move {
         let mut outbound_connections = HashMap::<ConnectionId, OutboundConnectionState>::new();
         loop {
@@ -785,6 +858,10 @@ pub async fn run_main_with_transport_options(
         info!("outbound router task exited (channel closed)");
     });
 
+    // ── Step 5：spawn「处理器循环」（服务主循环）─────────────────────────
+    // 先一次性装配 `MessageProcessor`（聚合全部 Processor），再进入 `tokio::select!` 主循环：
+    // 处理 transport 事件（连接开/关、入站 JSON-RPC 请求/响应/通知/错误）、远程控制状态变更、
+    // 线程创建广播、以及关闭信号/turn 计数变化（优雅重启 drain）。循环退出后做线程收尾。
     let processor_handle = tokio::spawn({
         let auth_manager = Arc::clone(&auth_manager);
         let analytics_events_client =
@@ -866,6 +943,10 @@ pub async fn run_main_with_transport_options(
                                 writer,
                                 disconnect_sender,
                             } => {
+                                // 新连接：创建三份「处理器侧 ↔ 出站侧」共享标志（已初始化 /
+                                // 启用实验 API / 退订通知方法），先把写端 + 标志 `Opened` 给出站
+                                // 循环登记，再在处理器侧记一份 ConnectionState 持同样的标志。
+                                // 两侧持同一组 `Arc`，状态更新对出站路由即时可见。
                                 let outbound_initialized = Arc::new(AtomicBool::new(false));
                                 let outbound_experimental_api_enabled =
                                     Arc::new(AtomicBool::new(false));
@@ -955,6 +1036,12 @@ pub async fn run_main_with_transport_options(
                                                 experimental_api_enabled,
                                                 std::sync::atomic::Ordering::Release,
                                             );
+                                        // 这次请求恰好让连接从「未初始化」跃迁到「已初始化」
+                                        // （即刚处理完 Initialize 握手）：此处才把连接级初始化
+                                        // 通知 + 远程控制状态推给这条连接，随后标记 outbound 就绪。
+                                        // 顺序很关键——先送初始通知、后置就绪位，避免下游误判
+                                        // 「已就绪却还没收到初始状态」。对应 process_request 里传
+                                        // `outbound_initialized = None` 的注释：就绪由这里收尾。
                                         if !was_initialized && is_initialized {
                                             processor
                                                 .send_initialize_notifications_to_connection(
@@ -1052,6 +1139,8 @@ pub async fn run_main_with_transport_options(
                 }
             }
 
+            // 收尾：仅在「非强制」退出时做有序清理——等各连接 rpc_gate 排空、跑完后台任务、
+            // 关闭线程。强制退出（第二次信号）则跳过这些等待，尽快让位重启。
             if !shutdown_state.forced() {
                 futures::future::join_all(
                     connections
@@ -1066,6 +1155,9 @@ pub async fn run_main_with_transport_options(
         }
     });
 
+    // ── Step 6：等两循环退出并做进程级收尾 ─────────────────────────────
+    // 先 drop 持有的 `transport_event_tx`：否则只要这一份发送端还在，处理器循环里的
+    // `transport_event_rx.recv()` 永不返回 `None`，循环无法因「信道关闭」而退出。
     drop(transport_event_tx);
 
     let _ = processor_handle.await;

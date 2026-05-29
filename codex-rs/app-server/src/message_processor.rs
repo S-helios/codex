@@ -1,3 +1,27 @@
+//! 【文件职责】app-server 的「请求分发中枢」。`MessageProcessor` 聚合了按领域切分的
+//! 全部 Processor（thread/turn/fs/account/...），把每条入站 JSON-RPC 请求经「反序列化 →
+//! 初始化握手网关 → 序列化范围(scope)排队 → 巨型 match 分发到对应 Processor」一路送达，
+//! 并把结果回写为 response/error。
+//!
+//! 【架构位置】
+//!   层级：前端集成层（app-server）· 入站方向核心
+//!   上游：`lib.rs` 处理器循环（收到 `TransportEvent::IncomingMessage` 后调 `process_request`）
+//!   下游：各 `request_processors::*`（领域处理器）→ 内核 `ThreadManager` / 本地资源；
+//!         出站经 `OutgoingMessageSender`
+//!
+//! 【数据流】
+//!   JSONRPCRequest → process_request（反序列化为 ClientRequest）→ handle_client_request
+//!   → (Initialize 走握手 | 其余) dispatch_initialized_client_request（初始化检查 + 实验网关 +
+//!   scope 排队）→ handle_initialized_client_request（约 400 行 match 委派）→ Processor → 回写
+//!
+//! 【阅读建议】请求生命周期的四段式依次是：`process_request`（§8.1 入口）→
+//! `handle_client_request`（§8.2 Initialize 网关）→ `dispatch_initialized_client_request`
+//! （§8.2 守门 + 入队）→ `handle_initialized_client_request`（§8.3 巨型分发）。
+//! 顶部 `MessageProcessor::new` 是一次性装配（把上百个依赖织进各 Processor），可略读；
+//! `ConnectionSessionState` 是「连接是否已握手」的真相源。`ExternalAuthRefreshBridge` 是
+//! 一个反向调用案例（内核要刷新 token → 反过来向客户端发 server-request）。
+//! 对照 learn_docs/5_前端_集成_协议/20_app_server_layer.md §8、§9、§10。
+
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
@@ -89,8 +113,14 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+// 反向请求「刷新 ChatGPT token」的等待上限。超时即取消该 server-request 并报错，
+// 避免内核侧的 auth 刷新调用被无回复的客户端无限期挂住。
 const EXTERNAL_AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 把内核 `AuthManager` 的「外部 token 刷新」需求桥接成一次「服务端 → 客户端」反向请求。
+/// 这是 app-server 少见的反向调用方向：当内核发现 token 失效时，不直接刷新，而是通过本桥
+/// 向客户端发 `ChatgptAuthTokensRefresh` 请求、等其回传新 token。体现了「凭据归客户端持有」
+/// 的设计——app-server 不掌握刷新逻辑，只做转发与超时兜底。
 #[derive(Clone)]
 struct ExternalAuthRefreshBridge {
     outgoing: Arc<OutgoingMessageSender>,
@@ -159,6 +189,10 @@ impl ExternalAuth for ExternalAuthRefreshBridge {
     }
 }
 
+/// 【核心结构体】请求分发中枢。本质是「一个出站发射器 + 一组按领域切分的 Processor +
+/// 一套请求序列化队列」的聚合器。`handle_initialized_client_request` 的巨型 match 把每个
+/// `ClientRequest` 变体路由到下面对应的 `*_processor`。各 Processor 在 `new()` 中一次性装配，
+/// 之间通过 `Arc` 共享 `ThreadManager`/配置/出站发射器等公共依赖。
 pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     skills_watcher: Arc<SkillsWatcher>,
@@ -186,12 +220,18 @@ pub(crate) struct MessageProcessor {
     request_serialization_queues: RequestSerializationQueues,
 }
 
+/// 单个连接的会话状态。`initialized` 用 `OnceLock`——握手完成后「写一次、此后只读」，
+/// 天然契合「一个连接只初始化一次」的约束，且无需加锁即可被多任务并发读。
+/// 未初始化时 `initialized.get()` 为 `None`，正是 §8.2 守门检查「是否已 Initialize」的依据。
 #[derive(Debug)]
 pub(crate) struct ConnectionSessionState {
     pub(crate) rpc_gate: Arc<ConnectionRpcGate>,
     initialized: OnceLock<InitializedConnectionSessionState>,
 }
 
+/// 握手完成后才确定的连接级能力与身份：是否启用实验 API（实验字段/方法的运行期闸门）、
+/// 退订了哪些通知方法、客户端名称/版本、是否要求 attestation。这些值在 Initialize 时一次性
+/// 写入，后续请求据此做网关判定与通知过滤。
 #[derive(Debug)]
 pub(crate) struct InitializedConnectionSessionState {
     pub(crate) experimental_api_enabled: bool,
@@ -277,6 +317,9 @@ pub(crate) struct MessageProcessorArgs {
 impl MessageProcessor {
     /// Create a new `MessageProcessor`, retaining a handle to the outgoing
     /// `Sender` so handlers can enqueue messages to be written to stdout.
+    /// 一次性装配：构建 `ThreadManager` 等公共依赖，再把它们以 `Arc` 织进各领域 Processor。
+    /// 本函数很长但逻辑线性（几乎全是「new 出一个 Processor 并塞进字段」），无需逐个细读；
+    /// 关注点应放在分发逻辑（`handle_initialized_client_request`）而非这里的接线细节。
     pub(crate) fn new(args: MessageProcessorArgs) -> Self {
         let MessageProcessorArgs {
             outgoing,
@@ -518,6 +561,15 @@ impl MessageProcessor {
         self.skills_watcher.shutdown();
     }
 
+    /// 【入站 JSON-RPC 入口】处理一条来自 transport 的 `JSONRPCRequest`。
+    /// 关键步骤：① 组装 `RequestContext`（id + tracing span + 上游 W3C trace）；
+    /// ② 把 `JSONRPCRequest` 先序列化回 `Value`、再反序列化成强类型 `ClientRequest`
+    /// （协议壳层 → 强类型的交接点，失败即回 invalid_request）；③ 委派 `handle_client_request`。
+    ///
+    /// 注意 `outbound_initialized` 传 `None`：websocket 路径下，「标记连接 outbound 就绪」
+    /// 由 lib.rs 在镜像会话状态 + 发完连接级初始通知之后收尾，此处提前标记会引发竞态
+    /// （见 lib.rs 中「became initialized」一段）。in-process 路径则不同，见
+    /// `process_client_request`。
     pub(crate) async fn process_request(
         self: &Arc<Self>,
         connection_id: ConnectionId,
@@ -581,6 +633,10 @@ impl MessageProcessor {
     ///
     /// This bypasses JSON request deserialization but keeps identical request
     /// semantics by delegating to `handle_client_request`.
+    /// in-process 嵌入方的「类型直通」入口：直接拿到 `ClientRequest`，跳过 JSON 反序列化，
+    /// 但语义与 `process_request` 完全一致（同样委派 `handle_client_request`）。
+    /// 与 websocket 路径的唯一差异：in-process 没有 lib.rs 那套握手后收尾，故这里把
+    /// `outbound_initialized` 以 `Some(...)` 传入，让共享处理器自己完成「标记就绪」。
     pub(crate) async fn process_client_request(
         self: &Arc<Self>,
         connection_id: ConnectionId,
@@ -734,6 +790,8 @@ impl MessageProcessor {
     }
 
     /// Handle a standalone JSON-RPC response originating from the peer.
+    /// 客户端对「服务端反向请求」的回复落点：转交 `OutgoingMessageSender` 按 id 匹配回调，
+    /// 唤醒之前在 `send_request*` 处等待的调用方（如审批/token 刷新）。
     pub(crate) async fn process_response(&self, response: JSONRPCResponse) {
         tracing::info!("<- response: {:?}", response);
         let JSONRPCResponse { id, result, .. } = response;
@@ -746,6 +804,10 @@ impl MessageProcessor {
         self.outgoing.notify_client_error(err.id, err.error).await;
     }
 
+    /// 【初始化握手网关】所有请求的第一道分叉：`Initialize` 在此就地处理（握手并标记连接
+    /// 就绪），其余一律下放给 `dispatch_initialized_client_request`。
+    /// 把握手单独前置，是因为它是「连接尚未初始化时唯一允许的请求」——其它请求若先到，
+    /// 会在下游守门处被拒（见 `dispatch_initialized_client_request` 第一步）。
     async fn handle_client_request(
         self: &Arc<Self>,
         connection_request_id: ConnectionRequestId,
@@ -791,6 +853,15 @@ impl MessageProcessor {
         .await
     }
 
+    /// 【守门 + 序列化排队】对「已初始化连接的非 Initialize 请求」做三道把关后，决定如何执行。
+    ///
+    /// 三道门：① 未握手直接拒（`Not initialized`）；② 请求含实验性字段/方法但连接未启用
+    /// 实验 API → 拒（运行期实验闸门，见 §10）；③ 取请求的「序列化范围 scope」决定调度方式。
+    ///
+    /// 调度：有 scope → 映射成 `(队列键, 访问模式)` 入序列化队列，保证「同一资源」的请求串行
+    /// （如同一 thread 的 settings 更新与 turn 启动按提交顺序执行，杜绝竞态）；无 scope（如
+    /// `thread/start`，尚无 thread_id）→ 直接 `tokio::spawn` 并发执行。这层串行是 app-server
+    /// 自己的、位于「到达内核之前」，与内核 SQ 互补（见 §9）。
     async fn dispatch_initialized_client_request(
         self: &Arc<Self>,
         connection_request_id: ConnectionRequestId,
@@ -798,10 +869,12 @@ impl MessageProcessor {
         session: Arc<ConnectionSessionState>,
         request_context: RequestContext,
     ) -> Result<(), JSONRPCErrorError> {
+        // Step 1：初始化检查——没握手就发其它请求一律拒。
         if !session.initialized() {
             return Err(invalid_request("Not initialized"));
         }
 
+        // Step 2：实验性 API 闸门——含实验字段/方法且连接未开实验，则拒。
         if let Some(reason) = codex_request.experimental_reason()
             && !session.experimental_api_enabled()
         {
@@ -841,6 +914,7 @@ impl MessageProcessor {
             .instrument(span),
         );
 
+        // Step 3：按 scope 调度。有 scope → 入对应队列串行；无 scope → 直接并发 spawn。
         if let Some(scope) = serialization_scope {
             let (key, access) = RequestSerializationQueueKey::from_scope(connection_id, scope);
             self.request_serialization_queues
@@ -854,6 +928,13 @@ impl MessageProcessor {
         Ok(())
     }
 
+    /// 【巨型分发匹配块】请求生命周期的终点：一个约 400 行的 `match codex_request { ... }`，
+    /// 把每个 `ClientRequest` 变体委派给对应领域的 Processor 方法。各分支形态高度一致
+    /// （`变体 { params } => self.某_processor.某方法(params).await`），故下方不逐臂注释——
+    /// 看一两个即明全貌；Processor 返回 `Result<Option<ClientResponsePayload>, _>`，
+    /// 函数末尾统一收口：`Ok(Some)` 发响应、`Ok(None)` 静默（结果由 Processor 自行异步回写）、
+    /// `Err` 发错误。注意 `Initialize` 分支是 `panic!`——它本应在 `handle_client_request`
+    /// 就被截走，走到这里说明分发逻辑被破坏，属编程错误而非运行时输入错误。
     async fn handle_initialized_client_request(
         self: Arc<Self>,
         connection_request_id: ConnectionRequestId,
@@ -1348,6 +1429,9 @@ impl MessageProcessor {
             }
         };
 
+        // 统一收口：Some → 立即回响应；None → 不在此回（Processor 已自行异步回写，
+        // 如长流式/审批类）；Err → 回错误。外层返回 `Ok(())` 仅表示「分发动作完成」，
+        // 不代表业务成功——业务成败已通过上面的 response/error 直接告知客户端。
         match result {
             Ok(Some(response)) => {
                 self.outgoing

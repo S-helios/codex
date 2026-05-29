@@ -1,3 +1,34 @@
+//! 【文件职责】app-server JSON-RPC 协议的「总目录」：用四个声明宏集中定义
+//! 客户端↔服务端之间所有的请求、响应与通知枚举，并为每个方法登记其
+//! 「线缆方法名（wire method）」、参数/响应类型、串行化作用域与实验性标记。
+//!
+//! 【架构位置】
+//!   层级：协议定义层（被 `lib.rs` 以 `pub use protocol::common::*;` 全量导出）
+//!   上游：app-server 收发循环——解析进来的 JSON-RPC 后匹配到这里的枚举变体。
+//!   下游：`protocol::v1` / `protocol::v2` 提供每个变体的具体 params/response 类型。
+//!
+//! 【四大宏定义（本文件核心）】
+//!   - `client_request_definitions!` → 生成 `ClientRequest`（客户端发给服务端的
+//!     请求）+ `ClientResponse` + `ClientResponsePayload`，并附带方法名/作用域/
+//!     实验性常量与 TS/JSON Schema 导出函数。
+//!   - `server_request_definitions!` → 生成 `ServerRequest`（服务端反向请求客户端，
+//!     如审批、用户输入征询）+ `ServerResponse` + `ServerRequestPayload`。
+//!   - `server_notification_definitions!` → 生成 `ServerNotification`（服务端单向推送，
+//!     无需响应，如各类流式 delta、生命周期事件）。
+//!   - `client_notification_definitions!` → 生成 `ClientNotification`（客户端单向通知，
+//!     目前仅 `Initialized`）。
+//!
+//! 【串行化作用域（serialization scope）】每个客户端请求声明一个
+//!   `ClientRequestSerializationScope`，告诉 app-server 该请求应在哪个「键」上
+//!   排队串行执行（如某个 thread_id / 进程 / 文件监视），未声明者可并发。
+//!   这是保证同一线程内请求有序、跨线程/只读请求可并行的关键设计。
+//!
+//! 【阅读建议】
+//!   1. 先读 `client_request_definitions!` 宏体（生成了什么 enum 与方法），
+//!   2. 再看下方对它的 *调用*（`client_request_definitions! { ... }`）——那是
+//!      所有客户端方法的清单，按「线程生命周期 / 文件系统 / 账号 / 进程」等分组。
+//!   3. 通知清单见底部 `server_notification_definitions! { ... }` 调用。
+//!   4. 文件后半段（约 1567 行起）是单元测试，仅作行为参考，可跳过。
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -16,6 +47,13 @@ use strum_macros::Display;
 use ts_rs::TS;
 
 /// Authentication mode for OpenAI-backed providers.
+/// OpenAI 系 provider 的鉴权方式。区分「谁来持有/刷新令牌」：
+///   - `ApiKey`：调用方提供 API key，由 Codex 落盘保存。
+///   - `Chatgpt`：Codex 托管 ChatGPT OAuth（自行持久化并刷新令牌）。
+///   - `ChatgptAuthTokens`：[不稳定，仅 OpenAI 内部] 令牌由外部宿主 app 提供、仅存内存，
+///     刷新也由宿主负责——Codex 不持久化。
+///   - `AgentIdentity`：基于已注册 Agent Identity 的程序化鉴权。
+/// 各变体上的英文注释更详尽，下方保留原样。
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMode {
@@ -74,6 +112,22 @@ macro_rules! experimental_type_entry {
     };
 }
 
+/// 一个客户端请求的「串行化作用域」——决定 app-server 应在哪个键上对该请求排队。
+///
+/// app-server 为每个 scope 维护一条串行队列：落在同一个键上的请求顺序执行，
+/// 互不交叠；`serialization_scope()` 返回 `None` 的请求则可并发。
+/// 这样既能保证「同一 thread 内的操作有序」，又能让只读/跨资源请求并行加速。
+///
+/// 各变体语义：
+///   - `Global(key)`：按全局命名键串行的「写」类请求（如改配置、账号鉴权）。
+///   - `GlobalSharedRead(key)`：同键的「共享读」，彼此可并发、但与同键的 `Global` 写互斥。
+///   - `Thread` / `ThreadPath`：按线程 id 或其 rollout 路径串行。
+///   - `CommandExecProcess` / `Process`：按命令执行/独立进程的句柄串行（写 stdin、终止等）。
+///   - `FuzzyFileSearchSession` / `FsWatch` / `McpOauth`：分别按模糊搜索会话、文件监视、
+///     MCP OAuth 服务名串行。
+///
+/// 注意：键多为 `&'static str` 常量字符串，命名（如 `"config"`、`"account-auth"`）
+/// 即是不同子系统的「串行域名」，新增请求时复用既有键以共享同一队列。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientRequestSerializationScope {
     Global(&'static str),
@@ -158,6 +212,22 @@ macro_rules! serialization_scope_expr {
 /// client can send to the server. Each variant has associated `params` and
 /// `response` types. Also generates a `export_client_responses()` function to
 /// export all response types to TypeScript.
+///
+/// 由「方法清单」一次性生成客户端请求相关的全部样板，避免每个方法手写重复代码。
+/// 展开后产出：
+///   - `enum ClientRequest`：客户端→服务端的请求（按 `method` 标签做 serde 内部标记）。
+///   - `enum ClientResponse` / `ClientResponsePayload`：对应的强类型响应及其载荷封装。
+///   - `id()` / `method()` / `serialization_scope()` 等访问器。
+///   - 实验性常量表与 TS / JSON Schema 导出函数。
+///
+/// 每条变体的迷你 DSL 字段含义（阅读下方调用清单时对照）：
+///   - `=> "wire/method"`：可选，覆盖该方法在 JSON 上的线缆名；省略则用 camelCase 变体名。
+///   - `params:` / `response:`：该方法的参数与响应类型（多来自 `v1` / `v2`）。
+///   - `inspect_params: true`：方法整体稳定，但需根据 params 内字段做实验性门控
+///     （见 `experimental_reason_expr!`）。
+///   - `serialization:`：串行化作用域，取值对应 `serialization_scope_expr!` 的各分支
+///     （`None` / `global(..)` / `thread_id(..)` 等），即上文 `ClientRequestSerializationScope`。
+///   - `#[experimental("reason")]`：整方法实验性，reason 为门控原因标识。
 macro_rules! client_request_definitions {
     (
         $(
@@ -432,6 +502,17 @@ macro_rules! client_response_payload_from_impl {
     ($variant:ident, $response:ty, manual) => {};
 }
 
+// ═══════════════════════════════════════════════════════════════
+// 客户端方法清单（ClientRequest 全集）· Client request catalog
+// ═══════════════════════════════════════════════════════════════
+// 这是所有「客户端可调用方法」的单一事实来源，宏会据此生成枚举/导出/作用域逻辑。
+// 大致分组（按出现顺序）：Initialize → 线程生命周期（thread/*）→ 目标/设置/记忆 →
+// 技能·插件·市场（skills/plugin/marketplace）→ 文件系统（fs/*）→ 轮次（turn/*）→
+// 实时语音（thread/realtime/*）→ 模型/能力/实验特性 → 远程控制 → MCP → 沙箱 →
+// 账号鉴权（account/*）→ 命令与进程执行（command/exec、process/*）→ 配置（config/*）→
+// 末尾「DEPRECATED」区为兼容保留的 v1 旧方法 + 模糊文件搜索。
+// 控噪音起见，下面不逐方法加注释——方法名/线缆名/params 类型已自解释，
+// 仅对个别带英文说明的方法保留其原注释。
 client_request_definitions! {
     Initialize {
         params: v1::InitializeParams,
@@ -1080,6 +1161,12 @@ client_request_definitions! {
 /// server can send to the client along with the corresponding params and
 /// response types. It also generates helper types used by the app/server
 /// infrastructure (payload enum, request constructor, and export helpers).
+///
+/// 与 `client_request_definitions!` 方向相反：这里是「服务端→客户端」的反向请求，
+/// 即服务端在处理某个 turn 时需要客户端配合的场景——典型如向用户征求命令执行/
+/// 文件改动的审批、MCP elicitation、动态工具调用等。展开产出 `ServerRequest` /
+/// `ServerResponse` / `ServerRequestPayload` 及配套构造器、导出函数。
+/// `response_from_result()` 负责把客户端回传的 JSON 结果反序列化为强类型响应。
 macro_rules! server_request_definitions {
     (
         $(
@@ -1227,6 +1314,11 @@ macro_rules! server_request_definitions {
 
 /// Generates `ServerNotification` enum and helpers, including a JSON Schema
 /// exporter for each notification.
+///
+/// 生成 `ServerNotification`——服务端「单向推送、不期待响应」的事件。serde 采用
+/// `tag = "method", content = "params"` 外标记格式（与请求枚举的内部标记不同）。
+/// 这类通知是流式 UI 的主干：增量文本/推理 delta、命令输出 delta、线程/轮次/条目
+/// 的生命周期变化等。每条变体携带一个 payload 类型（多来自 `v2`）。
 macro_rules! server_notification_definitions {
     (
         $(
@@ -1283,6 +1375,10 @@ macro_rules! server_notification_definitions {
     };
 }
 /// Notifications sent from the client to the server.
+///
+/// 生成 `ClientNotification`——客户端「单向通知、不期待响应」的事件，与
+/// `ServerNotification` 对称但方向相反。目前清单极小（仅 `Initialized`，即客户端
+/// 完成初始化握手后的通知，无 params）。
 macro_rules! client_notification_definitions {
     (
         $(
@@ -1384,6 +1480,9 @@ server_request_definitions! {
     },
 }
 
+/// 模糊文件搜索（一次性请求版）的入参。`roots` 为搜索根目录集合。
+/// 该请求被刻意设计为可并发（见上方 `FuzzyFileSearch` 方法注释）：客户端复用同一
+/// `cancellation_token` 即可让新请求取消同 token 的旧在途搜索，实现「边打字边搜」。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase")]
@@ -1466,6 +1565,15 @@ pub struct FuzzyFileSearchSessionCompletedNotification {
     pub session_id: String,
 }
 
+// ═══════════════════════════════════════════════════════════════
+// 服务端通知清单（ServerNotification 全集）· Server notification catalog
+// ═══════════════════════════════════════════════════════════════
+// 所有「服务端单向推送事件」的单一事实来源。语法：`变体 => "wire/method" (Payload)`。
+// 大致分组：错误/线程生命周期（thread/*）→ 轮次与条目（turn/*、item/*，含各类
+// 流式 delta）→ 命令/进程输出流 → MCP → 账号/限额 → 文件系统变更 → 推理摘要 delta →
+// 模型改道/校验、各类 warning → 模糊搜索会话 → 实时语音（thread/realtime/*）→
+// Windows 沙箱相关。标 `#[experimental(..)]` 者为实验性、可能随版本变动。
+// 同样控噪音：line method 名已自解释，仅保留个别变体自带的英文说明。
 server_notification_definitions! {
     /// NEW NOTIFICATIONS
     Error => "error" (v2::ErrorNotification),

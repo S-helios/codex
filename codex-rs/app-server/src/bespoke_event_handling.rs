@@ -1,3 +1,32 @@
+//! 【文件职责】把内核 `codex-core` 抛出的 `Event`/`EventMsg` 翻译成 app-server v2
+//! 协议的 `ServerNotification`/`ServerRequestPayload`，再通过出站通道推给客户端。
+//! 「bespoke（定制）」之名意指：大量事件能被 `item_event_to_server_notification`
+//! 等通用映射器自动转换，唯独这里列举的那些事件需要逐个手写定制逻辑。
+//!
+//! 【架构位置】
+//!   层级：app-server 协议适配层（内核事件 → 客户端通知）
+//!   上游：app-server 的事件分发循环（每收到内核一条 `Event` 就调一次本文件入口）
+//!   下游：`ThreadScopedOutgoingMessageSender`（发通知/发请求）、
+//!         `CodexThread::submit`（把客户端审批结果回灌内核 `Op`）
+//!
+//! 【数据流】
+//!   内核 `Event{id, msg}` → `apply_bespoke_event_handling` 按 `msg` 分派
+//!     ├─ 纯通知类：构造 `XxxNotification` → `send_server_notification`
+//!     ├─ 需审批类：`send_request` 发出 server→client 请求，spawn 任务等回包，
+//!     │            回包再 `submit` 成内核 `Op`（审批/许可/用户输入/MCP elicitation）
+//!     └─ 生命周期类：`TurnStarted/TurnComplete/TurnAborted` 维护 turn 摘要与状态
+//!
+//! 【阅读建议】先通读 `apply_bespoke_event_handling` 这个巨型 `match`（全文主干，
+//!   每个分支即一类内核事件的处理策略）；再看下半部分的 helper：通知构造器
+//!   (`start/complete_command_execution_item`、`emit_turn_completed_with_status`)
+//!   与异步回包处理器 (`on_*_response`)。文件末尾的 `#[cfg(test)]` 测试可跳过。
+//!
+//! 【设计要点】
+//!   - v1/v2 双协议并存：内核仍为 legacy 客户端广播一批 deprecated 事件
+//!     (`McpToolCallBegin`、`PatchApplyBegin`、`ContextCompacted` 等)，本文件对
+//!     v2 客户端「静默吞掉」它们，因为 v2 已有规范的 `TurnItem` 表达同一信息。
+//!   - 审批/许可类事件一律「发请求 + spawn 后台任务等回包」，避免阻塞事件循环。
+
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use crate::outgoing_message::ClientRequestResult;
@@ -119,11 +148,17 @@ use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tracing::error;
 
+/// 命令执行审批在客户端的两种「呈现形态」：要么作为「网络访问审批」展示，
+/// 要么作为「shell 命令审批」展示。二者互斥——内核给出网络审批上下文时走
+/// `Network`，否则把命令拼成字符串走 `Command`。决定了客户端弹窗的内容布局。
 enum CommandExecutionApprovalPresentation {
     Network(V2NetworkApprovalContext),
     Command(CommandExecutionCompletionItem),
 }
 
+/// 一条「命令执行项」的最小快照：审批前用来发起 `ItemStarted`，审批被拒/失败
+/// 后又用来补一条 `ItemCompleted`（状态 `Declined`/`Failed`）。把 `command`/`cwd`/
+/// `command_actions` 三要素打包，便于在 begin 与 end 两处复用同一份数据。
 #[derive(Debug, PartialEq)]
 struct CommandExecutionCompletionItem {
     command: String,
@@ -131,6 +166,22 @@ struct CommandExecutionCompletionItem {
     command_actions: Vec<V2ParsedCommand>,
 }
 
+/// 本文件的总入口：消费内核抛出的单条 `Event`，按 `EventMsg` 变体分派到对应的
+/// 「内核 → 客户端」翻译逻辑。app-server 的事件循环每收到一条内核事件就调一次。
+///
+/// @param event                   - 内核事件；其 `id` 即所属 turn 的 id（下文 `event_turn_id`）
+/// @param conversation_id          - 当前线程（会话）的 `ThreadId`
+/// @param conversation             - 内核线程句柄，用于把客户端回包 `submit` 回内核
+/// @param thread_manager           - 线程管理器，少数分支（如 collab 关闭）需查询其它线程
+/// @param outgoing                 - 线程级出站通道：发通知 / 发 server→client 请求
+/// @param thread_state             - 本线程的可变状态（turn 摘要、待回复的中断/回滚请求等）
+/// @param thread_watch_manager     - 线程活跃度看门狗，记录 turn 起止、审批/输入等待
+/// @param thread_list_state_permit - 串行化「线程列表状态」读写的信号量（仅回滚分支用）
+/// @param fallback_model_provider  - 回滚重建线程时缺省的模型 provider
+///
+/// 副作用：发送出站通知/请求、修改 `thread_state`、spawn 后台任务、回灌内核 `Op`。
+/// 设计：审批/许可/用户输入/elicitation 类事件统一「发请求 + spawn 等回包」，
+///       绝不在此 `await` 客户端响应，否则会卡死整条事件循环。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_bespoke_event_handling(
     event: Event,
@@ -143,17 +194,24 @@ pub(crate) async fn apply_bespoke_event_handling(
     thread_list_state_permit: Arc<tokio::sync::Semaphore>,
     fallback_model_provider: String,
 ) {
+    // 解构事件：`id` 携带的是「事件所属 turn 的 id」，下文统一记作 `event_turn_id`。
     let Event {
         id: event_turn_id,
         msg,
     } = event;
     match msg {
+        // ── 新一轮 turn 开始：清空上一轮残留并广播 TurnStarted ──────────
         EventMsg::TurnStarted(payload) => {
             // While not technically necessary as it was already done on TurnComplete, be extra cautios and abort any pending server requests.
+            // 防御性兜底：上轮 TurnComplete 理论上已 abort 过待回复请求，这里再
+            // abort 一次，确保新 turn 不会被上一轮遗留的审批/输入请求污染。
             outgoing.abort_pending_server_requests().await;
             thread_watch_manager
                 .note_turn_started(&conversation_id.to_string())
                 .await;
+            // 取已有 turn 快照（若内核已先于此推过 item），否则用 payload 现造一个；
+            // 随后清空 items 并标记 NotLoaded —— TurnStarted 只通报「开始」这一事实，
+            // 具体 items 由后续 ItemStarted/ItemCompleted 事件增量补齐。
             let turn = {
                 let state = thread_state.lock().await;
                 let mut turn = state.active_turn_snapshot().unwrap_or_else(|| Turn {
@@ -178,9 +236,13 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .send_server_notification(ServerNotification::TurnStarted(notification))
                 .await;
         }
+        // ── turn 正常结束：回收待回复请求、应答中断、广播 TurnCompleted ──
         EventMsg::TurnComplete(turn_complete_event) => {
             // All per-thread requests are bound to a turn, so abort them.
+            // 所有 server→client 请求的生命周期都绑定在 turn 上，turn 一结束就
+            // 全部 abort，防止悬挂请求泄漏到下一轮。
             outgoing.abort_pending_server_requests().await;
+            // 若客户端先前发过 turn/interrupt 请求且尚未应答，此处给它回成功。
             respond_to_pending_interrupts(&thread_state, &outgoing).await;
             let turn_failed = thread_state.lock().await.turn_summary.last_error.is_some();
             thread_watch_manager
@@ -237,7 +299,14 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .send_server_notification(ServerNotification::GuardianWarning(notification))
                 .await;
         }
+        // ── Guardian 自动审批评估：包裹一次命令执行的「审查生命周期」 ────
+        // Guardian 是内核侧对模型动作（命令/网络）做风险评估、自动放行或拦截的
+        // 机制。此分支要同时维护两套通知：①「审查」本身的 started/completed；
+        // ② 被审查命令项的 InProgress/Declined/Failed 状态。逻辑分三段：先按需
+        // 发命令项的 ItemStarted，再发审查通知，最后按评估结论补命令项 completed。
         EventMsg::GuardianAssessment(assessment) => {
+            // 仅当被审查动作是「命令执行」时，才抽出可复用的命令项快照；网络访问
+            // 等其它动作 → None（不会产生 CommandExecution 项）。
             let pending_command_execution = match build_item_from_guardian_event(
                 &assessment,
                 CommandExecutionStatus::InProgress,
@@ -258,11 +327,14 @@ pub(crate) async fn apply_bespoke_event_handling(
                 )),
                 Some(_) | None => None,
             };
+            // turn_id 兜底：评估事件自带的 turn_id 可能为空，退回用事件本身的 id。
             let assessment_turn_id = if assessment.turn_id.is_empty() {
                 event_turn_id.clone()
             } else {
                 assessment.turn_id.clone()
             };
+            // 第①段：评估刚开始（InProgress）且确有命令项时，先发 ItemStarted，
+            // 让客户端在审查进行中就能看到「命令执行中」。
             if assessment.status == codex_protocol::protocol::GuardianAssessmentStatus::InProgress
                 && let Some((target_item_id, completion_item)) = pending_command_execution.as_ref()
             {
@@ -279,12 +351,17 @@ pub(crate) async fn apply_bespoke_event_handling(
                 )
                 .await;
             }
+            // 第②段：无论评估处于哪个阶段，都发一条审查 started/completed 通知
+            // （由该 helper 根据 status 决定发哪种）。
             let notification = guardian_auto_approval_review_notification(
                 &conversation_id,
                 &event_turn_id,
                 &assessment,
             );
             outgoing.send_server_notification(notification).await;
+            // 第③段：把评估结论映射成命令项的「终态」。Approved/InProgress 不结项
+            // （命令会继续执行，由真正的 ExecCommandEnd 收尾）；被拒/中止 → Declined；
+            // 超时 → Failed。仅在有终态且确有命令项时补一条 ItemCompleted。
             let completion_status = match assessment.status {
                 codex_protocol::protocol::GuardianAssessmentStatus::Denied
                 | codex_protocol::protocol::GuardianAssessmentStatus::Aborted => {
@@ -495,6 +572,10 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .send_server_notification(ServerNotification::ThreadRealtimeClosed(notification))
                 .await;
         }
+        // ── 文件改动审批请求：发 server→client 请求，spawn 任务等回包 ────
+        // 这是「审批类事件」的范式：① 登记 permission_guard 让看门狗知道在等人工；
+        // ② send_request 发出审批请求拿到 (request_id, rx)；③ spawn 后台任务 await
+        // rx，把客户端决定 submit 回内核。事件循环本身不阻塞等待。
         EventMsg::ApplyPatchApprovalRequest(event) => {
             let permission_guard = thread_watch_manager
                 .note_permission_requested(&conversation_id.to_string())
@@ -524,6 +605,10 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
             });
         }
+        // ── 命令执行审批请求：先判定呈现形态，再走审批范式 ─────────────
+        // 与文件审批同构，但多一步：根据有无网络审批上下文，决定客户端把这次审批
+        // 渲染成「网络访问审批」(Network) 还是「shell 命令审批」(Command)，二者携带
+        // 的字段不同（见 CommandExecutionApprovalPresentation）。
         EventMsg::ExecApprovalRequest(ev) => {
             let permission_guard = thread_watch_manager
                 .note_permission_requested(&conversation_id.to_string())
@@ -579,6 +664,9 @@ pub(crate) async fn apply_bespoke_event_handling(
                         Some(completion_item),
                     ),
                 };
+            // approval_id 为空 → 这是常规 shell/unified_exec 审批，对应一个独立的
+            // 命令项，先发 ItemStarted。approval_id 非空（如 zsh-fork 子命令审批）则
+            // 不在此起新项——item_id 指向的是父命令项，避免重复起项。
             if approval_id.is_none()
                 && let Some(completion_item) = completion_item.as_ref()
             {
@@ -825,7 +913,13 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::McpToolCallBegin(_) | EventMsg::McpToolCallEnd(_) => {
             // Deprecated MCP tool-call events are still fanned out for legacy clients.
             // App-server v2 receives the canonical TurnItem::McpToolCall lifecycle instead.
+            // v2 客户端在此「静默吞掉」这两个 deprecated 事件：同一信息已由规范的
+            // TurnItem::McpToolCall 生命周期表达，重复下发会让客户端渲染两遍。
         }
+        // ── 通用转发：这批事件无需定制，交给通用映射器直转直发 ──────────
+        // 这是「bespoke」的反面——能用 `item_event_to_server_notification` 一对一
+        // 映射的事件都归在此（各类 delta 流、协作 collab 生命周期等），本文件不为
+        // 它们写专门逻辑，仅统一转发。
         msg @ (EventMsg::DynamicToolCallResponse(_)
         | EventMsg::CollabAgentSpawnBegin(_)
         | EventMsg::CollabAgentSpawnEnd(_)
@@ -882,6 +976,9 @@ pub(crate) async fn apply_bespoke_event_handling(
             handle_token_count_event(conversation_id, event_turn_id, token_count_event, &outgoing)
                 .await;
         }
+        // ── 终态错误：可能改写 turn 状态为 Failed 并通知客户端 ──────────
+        // 与 StreamError（见下方）不同：Error 是终态错误，会记入 turn 摘要的
+        // last_error，进而让 TurnComplete 把 turn 标成 Failed。
         EventMsg::Error(ev) => {
             thread_watch_manager
                 .note_system_error(&conversation_id.to_string())
@@ -906,6 +1003,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
             };
 
+            // 不影响 turn 状态的错误（如纯信息性告警）直接忽略，不污染 turn 摘要、
+            // 也不向客户端发 Error 通知。
             if !ev.affects_turn_status() {
                 return;
             }
@@ -925,9 +1024,12 @@ pub(crate) async fn apply_bespoke_event_handling(
                 }))
                 .await;
         }
+        // ── 流式中间错误：只通知、不改 turn 状态（will_retry=true）─────────
         EventMsg::StreamError(ev) => {
             // We don't need to update the turn summary store for stream errors as they are intermediate error states for retries,
             // but we notify the client.
+            // 流式错误是「可重试的中间态」，不写入 turn 摘要（否则会被误判为 Failed），
+            // 但仍通知客户端并置 will_retry=true，让前端显示「重试中」而非「失败」。
             let turn_error = TurnError {
                 message: ev.message,
                 codex_error_info: ev.codex_error_info.map(V2CodexErrorInfo::from),
@@ -1049,6 +1151,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             // Core still fans out these deprecated events for legacy clients;
             // v2 clients receive the canonical FileChange item instead.
         }
+        // ── 命令开始：去重（同一 call 只起一次项）并屏蔽 unified-exec 交互 ──
         EventMsg::ExecCommandBegin(exec_command_begin_event) => {
             if matches!(
                 exec_command_begin_event.source,
@@ -1060,6 +1163,9 @@ pub(crate) async fn apply_bespoke_event_handling(
                 return;
             }
             let item_id = exec_command_begin_event.call_id.clone();
+            // 用 turn 摘要里的 command_execution_started 集合去重：HashSet::insert
+            // 返回 true 表示首次见到该 call_id，才发 ItemStarted。审批流程可能已
+            // 提前为同一命令起过项，这里避免重复起项。
             let first_start = {
                 let mut state = thread_state.lock().await;
                 state
@@ -1109,7 +1215,10 @@ pub(crate) async fn apply_bespoke_event_handling(
             );
             outgoing.send_server_notification(notification).await;
         }
+        // ── turn 被中断：与 TurnComplete 对称，但终态记为 Interrupted ─────
         // If this is a TurnAborted, reply to any pending interrupt requests.
+        // 中断通常由客户端的 turn/interrupt 请求触发，因此这里务必回应那些待回复的
+        // 中断请求（respond_to_pending_interrupts），否则客户端会一直挂着等结果。
         EventMsg::TurnAborted(turn_aborted_event) => {
             // All per-thread requests are bound to a turn, so abort them.
             outgoing.abort_pending_server_requests().await;
@@ -1127,6 +1236,10 @@ pub(crate) async fn apply_bespoke_event_handling(
             )
             .await;
         }
+        // ── 线程回滚成功：兑现挂起的 thread/rollback 请求 ──────────────
+        // 回滚是「请求-事件」异步配对：客户端发 thread/rollback 时把 request_id 存进
+        // pending_rollbacks，内核回滚完成后抛此事件，这里取出 request_id、重读回滚后
+        // 的线程并以 ThreadRollbackResponse 应答。无挂起请求则什么都不做。
         EventMsg::ThreadRolledBack(_rollback_event) => {
             let pending = {
                 let mut state = thread_state.lock().await;
@@ -1196,6 +1309,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 turn_id: thread_goal_event.turn_id,
                 goal: thread_goal_event.goal.clone().into(),
             };
+            // 注意用的是 send_global_*（广播给所有连接）而非线程级 send_*：线程目标
+            // 变更属于「跨连接可见」的全局状态，需让监听该线程的所有客户端都收到。
             outgoing
                 .send_global_server_notification(ServerNotification::ThreadGoalUpdated(
                     notification,
@@ -1238,9 +1353,15 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
 
+        // 其余未显式列举的事件：v2 协议无需处理（多为已被上面分支覆盖的同族变体，
+        // 或仅对 legacy 客户端有意义），一律忽略。
         _ => {}
     }
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers · 内部辅助函数（通知构造器 / 异步回包处理器 / 类型映射器）
+// ═══════════════════════════════════════════════════════════════
 
 async fn handle_turn_diff(
     conversation_id: ThreadId,
@@ -1312,6 +1433,12 @@ async fn emit_turn_completed_with_status(
         .await;
 }
 
+/// 起一条「命令执行」项并发 `ItemStarted`，但保证同一 `item_id` 只起一次。
+/// 通过 turn 摘要里的 `command_execution_started` 集合去重：命令可能从多个来源
+/// （审批事件、Guardian 评估、ExecCommandBegin）被尝试起项，靠这个集合避免重复。
+///
+/// @returns - true 表示本次确实是首次起项（已发通知）；false 表示已起过、被跳过。
+/// 副作用：插入去重集合、可能发送 `ItemStarted` 通知。
 #[allow(clippy::too_many_arguments)]
 async fn start_command_execution_item(
     conversation_id: &ThreadId,
@@ -1356,6 +1483,10 @@ async fn start_command_execution_item(
     first_start
 }
 
+/// 结一条「命令执行」项并发 `ItemCompleted`，与 `start_command_execution_item`
+/// 配对。从去重集合 `remove` 该 `item_id`：只有当项确实处于「已起未结」状态时才
+/// 发完成通知，否则跳过——既防重复结项，也防为从未起过的项凭空发完成通知。
+/// 副作用：从去重集合移除、可能发送 `ItemCompleted` 通知。
 #[allow(clippy::too_many_arguments)]
 async fn complete_command_execution_item(
     conversation_id: &ThreadId,
@@ -1370,6 +1501,7 @@ async fn complete_command_execution_item(
     outgoing: &ThreadScopedOutgoingMessageSender,
     thread_state: &Arc<Mutex<ThreadState>>,
 ) {
+    // remove 返回 true 才发：保证「起过项」与「结项」一一对应。
     let should_emit = thread_state
         .lock()
         .await
@@ -1419,6 +1551,10 @@ async fn maybe_emit_raw_response_item_completed(
         .await;
 }
 
+/// 若某个内核 `ResponseItem` 其实是「hook 注入的提示消息」，则额外发一条
+/// `HookPrompt` 的 `ItemCompleted`，让客户端把它和普通用户消息区分开展示。
+/// 三道前置过滤（任一不满足即静默返回，不发通知）：必须是 `Message`、role 为
+/// `user`、且能被 `parse_hook_prompt_message` 解析出 hook 提示结构。
 pub(crate) async fn maybe_emit_hook_prompt_item_completed(
     conversation_id: ThreadId,
     turn_id: &str,
@@ -1458,6 +1594,8 @@ pub(crate) async fn maybe_emit_hook_prompt_item_completed(
         .await;
 }
 
+/// 取走并清空当前 turn 摘要（`mem::take` 留下默认值）。turn 结束/中断时调用，
+/// 既拿到摘要里累积的 last_error/started_at 用于构造完成通知，又顺手为下一轮重置。
 async fn find_and_remove_turn_summary(
     _conversation_id: ThreadId,
     thread_state: &Arc<Mutex<ThreadState>>,
@@ -1466,6 +1604,10 @@ async fn find_and_remove_turn_summary(
     std::mem::take(&mut state.turn_summary)
 }
 
+/// 处理 turn 正常结束：取走并清空本 turn 摘要，依据摘要里是否记录过 last_error
+/// 决定终态——有错 → `Failed` 并携带该错误；无错 → `Completed`。最后发
+/// `TurnCompleted` 通知。`find_and_remove_turn_summary` 的「取走」语义保证下一轮
+/// 从干净状态开始。
 async fn handle_turn_complete(
     conversation_id: ThreadId,
     event_turn_id: String,
@@ -1534,6 +1676,9 @@ async fn handle_thread_rollback_failed(
     }
 }
 
+/// 由回滚后持久化的 `StoredThread` 重建 `ThreadRollbackResponse`。回滚必须带上
+/// 持久化历史（否则报错），据此用 `populate_thread_turns_from_history` 还原 turns。
+/// `fallback_*` 参数用于补齐 StoredThread 里可能缺失的字段（如 provider/cwd）。
 fn thread_rollback_response_from_stored_thread(
     stored_thread: codex_thread_store::StoredThread,
     session_id: String,
@@ -1555,6 +1700,9 @@ fn thread_rollback_response_from_stored_thread(
     Ok(ThreadRollbackResponse { thread })
 }
 
+/// 给所有「待回复的 turn/interrupt 请求」逐个回成功 (`TurnInterruptResponse`)。
+/// turn 结束或被中断时调用：客户端可能在中断生效前发了 interrupt 请求并挂起等待，
+/// 这里统一应答，避免客户端永久阻塞。
 async fn respond_to_pending_interrupts(
     thread_state: &Arc<Mutex<ThreadState>>,
     outgoing: &ThreadScopedOutgoingMessageSender,
@@ -1571,6 +1719,9 @@ async fn respond_to_pending_interrupts(
     }
 }
 
+/// 处理 token 计数事件：可能发两条独立通知——有 token 用量则发
+/// `ThreadTokenUsageUpdated`（线程级），有限流快照则发 `AccountRateLimitsUpdated`
+/// （账号级）。二者各自可有可无，按需发送。
 async fn handle_token_count_event(
     conversation_id: ThreadId,
     turn_id: String,
@@ -1608,6 +1759,13 @@ async fn handle_error(
     state.turn_summary.last_error = Some(error);
 }
 
+/// 后台任务：等待客户端对「请求用户输入」的回包，并把答案 `submit` 回内核。
+/// 这是所有 `on_*_response` 处理器的范式，统一的收尾骨架为：
+///   1. `await` 回包；2. 在线程监听器上注销该 server 请求；3. drop 看门狗 guard；
+///   4. 按结果分流：①turn 切换错误 → 静默返回（该请求已因换轮失效，无需回灌）；
+///      ②其它客户端错误 / 通道断开 → 记日志并回灌一个「安全缺省」(此处=空答案)；
+///      ③成功 → 反序列化后回灌真实答案。
+/// 设计：永远要给内核一个回灌（除非换轮），否则内核会一直等审批/输入而卡死该 turn。
 async fn on_request_user_input_response(
     event_turn_id: String,
     pending_request_id: RequestId,
@@ -1621,6 +1779,7 @@ async fn on_request_user_input_response(
     drop(user_input_guard);
     let value = match response {
         Ok(Ok(value)) => value,
+        // turn 已切换 → 这个请求作废，不再回灌内核（新 turn 不认旧 id）。
         Ok(Err(err)) if is_turn_transition_server_request_error(&err) => return,
         Ok(Err(err)) => {
             error!("request failed with client error: {err:?}");
@@ -1793,6 +1952,9 @@ async fn on_request_permissions_response(
     }
 }
 
+/// `on_request_permissions_response` 的参数包：权限审批回包处理所需的全部上下文。
+/// 单独成结构体是为绕开过多裸参数（其它 on_* 处理器用 `#[allow(too_many_arguments)]`，
+/// 此处因还要携带 `outgoing` 用于回灌「已生效权限」而改用打包传递）。
 struct PendingRequestPermissionsResponse {
     call_id: String,
     requested_permissions: CoreRequestPermissionProfile,
@@ -1803,6 +1965,15 @@ struct PendingRequestPermissionsResponse {
     request_permissions_guard: ThreadWatchActiveGuard,
 }
 
+/// 把客户端对「权限授予请求」的回包转成内核可用的 `RequestPermissionsResponse`。
+/// @returns - `None` 表示该请求因换轮而作废（调用方应直接不回灌）；`Some` 表示要回灌。
+///
+/// 两处关键安全/约束逻辑：
+///   - `strict_auto_review` 仅允许配合 turn 作用域；客户端若对 session 作用域开启它，
+///     视为非法，降级为「空权限 + Turn 作用域」。
+///   - 实际授予权限 = 客户端「已授予」与「原始请求」二者的交集
+///     (`intersect_permission_profiles`)，确保客户端无法授予比模型所请求更宽的权限，
+///     且把授予范围收敛到 `cwd` 之内。空授予则回缺省（不授任何权限）。
 fn request_permissions_response_from_client_result(
     requested_permissions: CoreRequestPermissionProfile,
     response: std::result::Result<ClientRequestResult, oneshot::error::RecvError>,
@@ -1865,8 +2036,13 @@ fn request_permissions_response_from_client_result(
     })
 }
 
+// [引用范围 · 模块私有] 评审无任何可呈现内容时的占位文案。被
+// `render_review_output_text`（评审输出为空时）与 ExitedReviewMode 分支
+// （review_output 缺失时）共用。
 const REVIEW_FALLBACK_MESSAGE: &str = "Reviewer failed to output a response.";
 
+/// 把评审输出渲染成给用户看的纯文本：拼接「总体说明」+「findings 块」，二者都
+/// 去空白后非空才纳入；若两段皆空则退回 `REVIEW_FALLBACK_MESSAGE`。
 fn render_review_output_text(output: &ReviewOutputEvent) -> String {
     let mut sections = Vec::new();
     let explanation = output.overall_explanation.trim();
@@ -1942,6 +2118,12 @@ async fn on_file_change_request_approval_response(
     }
 }
 
+/// 后台任务：等待客户端对「命令执行审批」的回包，把决定映射为内核
+/// `ReviewDecision` 并 `submit` 成 `Op::ExecApproval`。比其它回包处理器多两件事：
+///   - 决定映射含多种带载荷的变体（execpolicy 修订 / 网络策略修订 / 接受 / 拒绝 /
+///     取消），且会顺带算出命令项是否要补一个终态 `completion_status`；
+///   - 子命令审批（approval_id 非空）需「抑制」补完成项——见下方 suppress 注释。
+/// 失败/通道断开时回灌 `Denied` 并把命令项标 `Failed`，保证内核与 UI 都不悬挂。
 #[allow(clippy::too_many_arguments)]
 async fn on_command_execution_request_approval_response(
     event_turn_id: String,
@@ -2024,6 +2206,9 @@ async fn on_command_execution_request_approval_response(
         // For regular shell/unified_exec approvals, approval_id is null.
         // For zsh-fork subcommand approvals, approval_id is present and
         // item_id points to the parent command item.
+        // 子命令审批（approval_id 非空）时 item_id 指向「父命令项」，若父项仍在
+        // 进行中就不能在此把它结掉——否则会过早终结整条父命令。故当父项仍登记在
+        // command_execution_started 集合里时，抑制本次补完成项。
         if approval_id.is_some() {
             let state = thread_state.lock().await;
             state
@@ -2055,6 +2240,8 @@ async fn on_command_execution_request_approval_response(
         .await;
     }
 
+    // 回灌内核：审批 id 优先用 approval_id（子命令场景），否则退回 item_id
+    // （常规命令场景二者本就等价）。
     if let Err(err) = conversation
         .submit(Op::ExecApproval {
             id: approval_id.unwrap_or_else(|| item_id.clone()),

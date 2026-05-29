@@ -1,3 +1,24 @@
+//! 【文件职责】app-server 的「对外消息发射器」。把内核/处理器侧产生的三类出站
+//! 消息——「响应」(response)、「错误」(error)、「通知」(notification) 以及「服务端反向
+//! 请求」(server-request)——封装成 `OutgoingEnvelope`，投递给出站路由任务，再由 transport
+//! 推回对应客户端连接。
+//!
+//! 【架构位置】
+//!   层级：前端集成层（app-server）· 出站方向
+//!   上游：各 Processor（thread/turn/...）与 `bespoke_event_handling.rs`（内核事件 → 通知）
+//!   下游：`lib.rs` 的 outbound 路由任务（消费 `OutgoingEnvelope` 后写各连接 writer）
+//!
+//! 【数据流】
+//!   入站请求 → 注册 `RequestContext`（保留 span/trace）→ 处理完成 → `send_response`/`send_error`
+//!   内核事件 → `send_server_notification*` → `OutgoingEnvelope` → mpsc → 出站任务 → transport
+//!   服务端反向请求 → `send_request*`（登记回调）→ 客户端回复 → `notify_client_response`/`error`
+//!
+//! 【阅读建议】先看 `OutgoingEnvelope`（出站消息载体）与 `OutgoingMessageSender`（核心结构体），
+//! 再看三组方法：① `send_request*`/`notify_client_*`（反向请求与回调匹配）；
+//! ② `send_response*`/`send_error*`（应答入站请求）；③ `send_server_notification*`（广播/定向通知）。
+//! `ThreadScopedOutgoingMessageSender` 是绑定线程 + 连接集合的「窄接口」，供 turn 内部使用。
+//! 详见 learn_docs/5_前端_集成_协议/20_app_server_layer.md §4、§8.4。
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
@@ -39,6 +60,9 @@ use codex_protocol::account::PlanType;
 pub(crate) type ClientRequestResult = std::result::Result<Result, JSONRPCErrorError>;
 
 /// Stable identifier for a client request scoped to a transport connection.
+/// 把「连接 id」与「请求 id」绑成一个稳定标识。同一个 `RequestId`（如整数 7）在不同
+/// 连接上可能重复，必须连带 `connection_id` 才能唯一定位一次入站请求，并把响应/错误
+/// 精确路由回原连接。多客户端（unix/ws）场景下这点尤为关键。
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ConnectionRequestId {
     pub(crate) connection_id: ConnectionId,
@@ -47,6 +71,9 @@ pub(crate) struct ConnectionRequestId {
 
 /// Trace data we keep for an incoming request until we send its final
 /// response or error.
+/// 为「一次进行中的入站请求」保留的链路追踪上下文：tracing `span` + 可选的上游 W3C
+/// trace。从请求进入一直留到发出最终 response/error 为止，期间出站写操作会 instrument
+/// 到这个 span（见 `send_outgoing_message_to_connection`），把出站日志归并到同一条链路。
 #[derive(Clone)]
 pub(crate) struct RequestContext {
     request_id: ConnectionRequestId,
@@ -80,30 +107,48 @@ impl RequestContext {
     }
 }
 
+/// 出站消息的「投递信封」：本发射器与 `lib.rs` 出站路由任务之间的唯一传递单元。
+/// 两个变体决定路由目标——定向单连接 vs 广播全部连接。
 #[derive(Debug)]
 pub(crate) enum OutgoingEnvelope {
+    // 定向：仅写给某一个连接。`write_complete_tx` 用于需要「等写完成」的场景
+    // （如初始化通知必须落到该连接后才继续），路由任务写完后回发 `()`。
     ToConnection {
         connection_id: ConnectionId,
         message: OutgoingMessage,
         write_complete_tx: Option<oneshot::Sender<()>>,
     },
+    // 广播：写给当前所有已注册连接（stdio 单连接时即写给唯一连接）。
     Broadcast {
         message: OutgoingMessage,
     },
 }
 
 /// Sends messages to the client and manages request callbacks.
+/// 【核心结构体】对外消息发射器。除了把消息封成 `OutgoingEnvelope` 投递出去，还承担两份
+/// 「待办账本」：① `request_id_to_callback`——服务端反向请求(server-request)的 id → 回调，
+/// 等客户端回复后唤醒等待者；② `request_contexts`——入站请求的 trace 上下文，发完最终响应
+/// 才移除。这两份账本都用 `Mutex<HashMap>` 保护，因为发射器以 `Arc` 形式被多任务共享。
 pub(crate) struct OutgoingMessageSender {
+    // 服务端反向请求 id 的单调分配器（从 0 递增）。`Relaxed` 足够：仅需唯一性，不依赖跨线程顺序。
     next_server_request_id: AtomicI64,
     sender: mpsc::Sender<OutgoingEnvelope>,
+    // [引用范围] 服务端反向请求的回调表：发出 server-request 时登记，收到客户端
+    // response/error 时由 `notify_client_*` 取出并唤醒；按 thread 取消/全量取消亦走这里。
     request_id_to_callback: Mutex<HashMap<RequestId, PendingCallbackEntry>>,
     /// Incoming requests that are still waiting on a final response or error.
     /// We keep them here because this is where responses, errors, and
     /// disconnect cleanup all get handled.
+    /// 入站请求的「未结账本」：键是 `ConnectionRequestId`。响应/错误发出后取出（`take_request_context`），
+    /// 连接断开时按 connection_id 批量清理（`connection_closed`），避免悬挂上下文泄漏。
     request_contexts: Mutex<HashMap<ConnectionRequestId, RequestContext>>,
     analytics_events_client: AnalyticsEventsClient,
 }
 
+/// 绑定「某条线程 + 该线程订阅连接集合」的窄接口发射器，供单个 turn 的执行链使用。
+/// 它在底层 `OutgoingMessageSender` 之上预置了 `thread_id` 与 `connection_ids`，使调用方
+/// 无需每次都传这两个参数：通知只发给订阅了该线程的连接、反向请求自动归属该线程
+/// （便于按线程取消，见 `abort_pending_server_requests`）。
 #[derive(Clone)]
 pub(crate) struct ThreadScopedOutgoingMessageSender {
     outgoing: Arc<OutgoingMessageSender>,
@@ -111,6 +156,8 @@ pub(crate) struct ThreadScopedOutgoingMessageSender {
     thread_id: ThreadId,
 }
 
+// 一条「在途的服务端反向请求」：保存唤醒等待者的 `callback`、归属线程（用于按线程取消）、
+// 以及请求原文（重发与统计需要）。
 struct PendingCallbackEntry {
     callback: oneshot::Sender<ClientRequestResult>,
     thread_id: Option<ThreadId>,
@@ -283,6 +330,15 @@ impl OutgoingMessageSender {
         RequestId::Integer(self.next_server_request_id.fetch_add(1, Ordering::Relaxed))
     }
 
+    /// 发起一次「服务端 → 客户端」的反向请求（典型场景：审批、token 刷新、用户输入），
+    /// 并返回 `(分配的 request_id, 等待客户端回复的 oneshot 接收端)`。
+    ///
+    /// @param connection_ids - `None` 广播给所有连接；`Some(&[...])` 定向若干连接
+    /// @param thread_id      - 归属线程（便于按线程批量取消在途请求）
+    /// @returns              - 调用方 `.await` 该接收端即可拿到客户端回复（或错误/取消）
+    ///
+    /// 关键时序：必须「先登记回调、再发送」。若发送失败则回滚移除回调，避免回调表里
+    /// 残留永远不会被唤醒的死条目。定向多连接时逐个发送，任一失败即中止并回滚。
     pub(crate) async fn send_request_to_connections(
         &self,
         connection_ids: Option<&[ConnectionId]>,
@@ -370,6 +426,8 @@ impl OutgoingMessageSender {
         }
     }
 
+    /// 客户端对某个反向请求回了「成功响应」：取出对应回调并唤醒等待者。
+    /// 找不到回调只 `warn` 不报错——多为请求已被取消/超时清理过，属预期竞态而非故障。
     pub(crate) async fn notify_client_response(&self, id: RequestId, result: Result) {
         let entry = self.take_request_callback(&id).await;
 
@@ -465,6 +523,9 @@ impl OutgoingMessageSender {
         requests
     }
 
+    /// 取消某条线程上全部在途的反向请求：常用于 turn 状态切换时（见
+    /// `abort_pending_server_requests`），让原本悬而未决的审批/输入请求带错误立即收敛，
+    /// 避免客户端永久卡在等待。`error` 为 `Some` 时把该错误推给每个等待者。
     pub(crate) async fn cancel_requests_for_thread(
         &self,
         thread_id: ThreadId,
@@ -507,6 +568,10 @@ impl OutgoingMessageSender {
         self.send_response_as(request_id, response.into()).await;
     }
 
+    /// 把一次入站请求的成功响应序列化并发回原连接（`send_response` 的实现底座）。
+    /// 序列化为 JSON-RPC parts 时若失败，则转而回发一条 internal_error，保证调用方总能
+    /// 收到「响应或错误」二者之一、不会无声丢失。期间从未结账本取出该请求的 `RequestContext`
+    /// 以便把出站写归并到正确的 trace span。
     pub(crate) async fn send_response_as(
         &self,
         request_id: ConnectionRequestId,
@@ -550,11 +615,21 @@ impl OutgoingMessageSender {
         }
     }
 
+    // ── 通知发送的三种语义（按背压/目标区分）────────────────────────────
+    // 服务端通知是单向广播、不期望回复（与反向请求相对）。三个方法的差异是关键：
+    //   · send_server_notification              → 广播，async 发送（满则等待，保序不丢）
+    //   · try_send_server_notification          → 广播，try_send（满则丢弃并 warn，永不阻塞）
+    //   · send_server_notification_to_connections → 定向若干连接（空切片回退为广播）
+    //   · *_to_connection_and_wait              → 定向单连接且等写完成（初始化通知用）
+
+    /// 广播一条服务端通知给所有连接（传空连接切片即等价广播）。
     pub(crate) async fn send_server_notification(&self, notification: ServerNotification) {
         self.send_server_notification_to_connections(&[], notification)
             .await;
     }
 
+    /// 非阻塞广播：用 `try_send`，队列满时直接丢弃并告警，绝不阻塞调用方。
+    /// 适用于「可丢失的提示型通知」——宁可丢一条也不能让调用路径卡在背压上。
     pub(crate) fn try_send_server_notification(&self, notification: ServerNotification) {
         tracing::trace!("app-server event: {notification}");
         let outgoing_message = OutgoingMessage::AppServerNotification(notification);
@@ -602,6 +677,9 @@ impl OutgoingMessageSender {
         }
     }
 
+    /// 定向单连接发送并「等到该通知真正写完成」才返回（依赖信封里的 `write_complete_tx`）。
+    /// 用于初始化阶段必须保证顺序的通知——例如要先把状态镜像通知落到这条连接，
+    /// 再让 lib.rs 标记其 outbound 就绪，否则会出现「就绪先于初始通知到达」的竞态。
     pub(crate) async fn send_server_notification_to_connection_and_wait(
         &self,
         connection_id: ConnectionId,

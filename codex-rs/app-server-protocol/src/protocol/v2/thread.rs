@@ -1,3 +1,37 @@
+//! 【文件职责】v2 协议中「线程（Thread）」相关的请求参数、响应与通知类型。
+//! 一个 Thread 是一段可持久化、可恢复、可派生的会话，本文件定义围绕其
+//! 生命周期与元数据的全部 wire 类型。
+//!
+//! 【架构位置】
+//!   层级：协议定义层 · v2 子模块（被 `protocol::v2` 以 `pub use thread::*;` 导出）
+//!   上游：`protocol::common` 的 `client_request_definitions!` / `server_notification
+//!         _definitions!` 调用，把这里的类型登记为具体方法的 params/response/payload。
+//!   下游：`codex_protocol`（核心领域类型，如 `ThreadGoal` / `TokenUsage` /
+//!         `ThreadMemoryMode`），本文件多处提供 `From<core 类型>` 的转换桥接。
+//!
+//! 【类型分组（按出现顺序）】
+//!   - 启动/恢复/派生：`ThreadStartParams` / `ThreadResumeParams` / `ThreadForkParams`
+//!     及各自 Response——三者共享大量「配置覆盖」字段（model、sandbox、审批策略等）。
+//!     Resume/Fork 顶部的 `///` 详述了 thread_id / history / path 三种来源的优先级。
+//!   - 设置与归档：`ThreadSettingsUpdate*` / `ThreadArchive*` / `ThreadUnarchive*` /
+//!     `ThreadUnsubscribe*`。
+//!   - 目标模式（Goal）：`ThreadGoal*`，对应 goal-mode 的目标/预算/状态。
+//!   - 元数据/记忆/压缩/回滚：`ThreadMetadataUpdate*` / `ThreadMemoryMode*` /
+//!     `ThreadCompactStart*` / `ThreadRollback*`。
+//!   - 列举与读取：`ThreadList*` / `ThreadSearch*` / `ThreadLoadedList*` /
+//!     `ThreadRead*` / `ThreadTurns(Items)List*`（含分页游标语义）。
+//!   - 通知：`Thread*Notification`（started / statusChanged / archived / tokenUsage 等）。
+//!
+//! 【贯穿设计 · double-option 字段】不少可选字段用 `Option<Option<T>>` 配合
+//!   `serde_helpers::*_double_option`，以在 JSON 上区分「字段缺省＝不改」与
+//!   「显式 null＝清空」两种语义——阅读 `service_tier`、`git_info` 等字段时注意这点。
+//!
+//! 【实验性标记】`#[experimental("...")]` 标注的字段/类型属实验性 API，可能随
+//!   版本变动；schema 导出时会据此做门控过滤。
+//!
+//! 【阅读建议】先看 `ThreadStartParams` / `ThreadStartResponse` 建立「一个线程由
+//!   哪些配置构成」的整体印象，其余 Resume/Fork 基本是其变体；列举类只需关注
+//!   游标（cursor / backwards_cursor）的成对语义。本文件为纯类型定义，无运行逻辑。
 use super::ActivePermissionProfile;
 use super::ApprovalsReviewer;
 use super::AskForApproval;
@@ -36,6 +70,10 @@ pub enum ThreadStartSource {
     Clear,
 }
 
+/// 由客户端在 `thread/start` 时注入的「动态工具」声明：让宿主侧自定义一个可被模型
+/// 调用的工具（名称、描述、入参 JSON Schema）。`defer_loading` 为 true 时表示该工具
+/// 默认不暴露给模型上下文、需要时再加载。注意此结构「只 `Serialize` 派生」，反序列化
+/// 走下方手写 `Deserialize` 以兼容旧字段。
 #[derive(Serialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -49,6 +87,8 @@ pub struct DynamicToolSpec {
     pub defer_loading: bool,
 }
 
+/// 反序列化中转结构：比 `DynamicToolSpec` 多了一个已弃用的 `expose_to_context` 字段，
+/// 用于在手写 `Deserialize` 中做新旧字段的兼容映射（见下方 impl）。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DynamicToolSpecDe {
@@ -79,6 +119,11 @@ impl<'de> Deserialize<'de> for DynamicToolSpec {
             name,
             description,
             input_schema,
+            // `defer_loading` 的取值优先级（兼容新旧客户端）：
+            //   1. 显式给了 `deferLoading` → 直接用。
+            //   2. 否则回退到旧字段 `exposeToContext`：语义相反，「暴露」即「不延迟加载」，
+            //      故取其反值（visible=true → defer=false）。
+            //   3. 两者都没给 → 默认 false（不延迟，即立即暴露给上下文）。
             defer_loading: defer_loading
                 .unwrap_or_else(|| expose_to_context.map(|visible| !visible).unwrap_or(false)),
         })
@@ -87,6 +132,12 @@ impl<'de> Deserialize<'de> for DynamicToolSpec {
 
 // === Threads, Turns, and Items ===
 // Thread APIs
+/// `thread/start` 的入参：创建一个新线程并指定其初始配置。字段几乎全部可选，
+/// 缺省者落回 Codex 全局/默认配置。核心维度包括：模型与 provider、cwd 与运行时
+/// 工作区根、审批策略（`approval_policy` / `approvals_reviewer`）、沙箱或命名权限
+/// profile、基础/开发者指令、人格、是否临时（`ephemeral`，不落盘）等。
+/// 标 `#[experimental(..)]` 的字段为实验性、可能变动。本类型是理解「一个线程由
+/// 哪些配置构成」的入口，Resume / Fork 的参数基本是它的变体。
 #[derive(
     Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS, ExperimentalApi,
 )]
@@ -189,6 +240,10 @@ pub struct MockExperimentalMethodResponse {
     pub echoed: Option<String>,
 }
 
+/// `thread/start` 的响应：回传新建线程的句柄（`thread`）及「实际生效」的配置——
+/// 即把入参里的可选项与默认值合并后的最终结果（解析后的 cwd、运行时工作区根、
+/// 加载到的指令源文件、生效的审批策略与沙箱策略等）。客户端据此知晓线程真实状态，
+/// 而非自己传入的请求值。`ThreadResumeResponse` / `ThreadForkResponse` 结构几乎相同。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -327,6 +382,13 @@ pub struct ThreadSettingsUpdatedNotification {
 /// Empty string path values are treated as absent.
 ///
 /// Prefer using thread_id whenever possible.
+///
+/// 恢复一个线程的三种来源及优先级（针对「非运行中」线程）：
+///   history（内存历史，实验性，仅 Codex Cloud）＞ 非空 path（按磁盘路径加载）
+///   ＞ thread_id（按 id 从磁盘加载）。用 history 或非空 path 时，thread_id 被忽略。
+/// 若 thread_id 命中一个「正在运行」的线程，则 app-server 直接重新接入该线程，
+/// 并把非空 path 当作「与当前 rollout 路径是否一致」的校验项。空字符串 path 视为未提供。
+/// 实践中应尽量用 thread_id。其余字段与 `ThreadStartParams` 同义，为恢复后的配置覆盖。
 pub struct ThreadResumeParams {
     pub thread_id: String,
 
@@ -493,6 +555,10 @@ impl From<ThreadTurnsListResponse> for TurnsPage {
 /// Empty string path values are treated as absent.
 ///
 /// Prefer using thread_id whenever possible.
+///
+/// 派生（fork）一个线程到「新线程」的两种来源：按 thread_id 从磁盘加载后 fork，
+/// 或按非空 path 从磁盘加载后 fork（此时 thread_id 被忽略）。空字符串 path 视为未提供。
+/// 与 resume 的区别：fork 产出的是一条全新线程（新 id），原线程不受影响。
 pub struct ThreadForkParams {
     pub thread_id: String,
 
@@ -692,6 +758,9 @@ pub struct ThreadUnarchiveParams {
 #[ts(export_to = "v2/")]
 pub struct ThreadSetNameResponse {}
 
+// `v2_enum_from_core!` 宏：声明一个 wire 层枚举，并自动生成它与 `codex_protocol`
+// 核心枚举（`CoreThreadGoalStatus`）之间的双向 `From` 转换，避免手写样板。
+// 这里定义「目标状态」：活跃 / 暂停 / 受阻 / 用量受限 / 预算受限 / 已完成。
 v2_enum_from_core! {
     pub enum ThreadGoalStatus from CoreThreadGoalStatus {
         Active,
@@ -703,6 +772,9 @@ v2_enum_from_core! {
     }
 }
 
+/// goal-mode 的「目标」：给线程设定一个客观目标与可选的 token 预算，并跟踪其
+/// 消耗（tokens_used / time_used_seconds）与状态。时间戳/计数用 `i64` 并在 TS 侧
+/// 映射为 `number`。下方 `From<core::ThreadGoal>` 负责从核心类型转换而来。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -916,6 +988,9 @@ pub struct ThreadShellCommandParams {
     /// Unlike `command/exec`, this intentionally preserves shell syntax
     /// such as pipes, redirects, and quoting. This runs unsandboxed with full
     /// access rather than inheriting the thread sandbox policy.
+    /// 由线程配置的 shell 直接求值的命令串。与 `command/exec` 不同，这里刻意保留
+    /// 管道、重定向、引号等 shell 语法。⚠️ 安全注意：此命令「不进沙箱、以完整权限」
+    /// 运行，不继承线程的 sandbox 策略——属于受信任路径，调用方需自行担保安全性。
     pub command: String,
 }
 
@@ -953,12 +1028,15 @@ pub struct ThreadBackgroundTerminalsCleanResponse {}
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+/// `thread/rollback` 入参：从线程末尾回退 `num_turns` 个轮次。
 pub struct ThreadRollbackParams {
     pub thread_id: String,
     /// The number of turns to drop from the end of the thread. Must be >= 1.
     ///
     /// This only modifies the thread's history and does not revert local file changes
     /// that have been made by the agent. Clients are responsible for reverting these changes.
+    /// 要从线程尾部丢弃的轮次数，须 ≥ 1。⚠️ 仅修改线程「历史记录」，并不会回滚 agent
+    /// 已对本地文件做出的改动——还原这些文件改动是「客户端的责任」，协议层不负责。
     pub num_turns: u32,
 }
 
@@ -974,6 +1052,10 @@ pub struct ThreadRollbackResponse {
     pub thread: Thread,
 }
 
+/// `thread/list` 入参：分页列举线程，支持按 provider / 来源类型 / 是否归档 / cwd /
+/// 标题子串等过滤，并可选排序键与方向。各字段均可选，缺省走服务端合理默认值。
+/// 其中 `use_state_db_only` 控制是否「只查状态库、跳过扫描 JSONL rollout 修复元数据」，
+/// 关闭它（默认）会保留更慢但更准的 scan-and-repair 行为。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -1085,6 +1167,10 @@ pub enum SortDirection {
     Desc,
 }
 
+/// `thread/list` 响应。本文件多处列举响应共用同一套「双向游标」分页约定，集中说明如下：
+///   - `next_cursor`：不透明游标，传给下一次调用以「接着最后一项往后翻」；为 None 表示翻完。
+///   - `backwards_cursor`：不透明游标，配合「相反的 sortDirection」用于反向翻页；仅当本页
+///     至少有一条记录时才填充。对时间戳排序，它锚定在本页时间戳起点，以免漏掉同一秒内的更新。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -1146,6 +1232,12 @@ pub struct ThreadLoadedListResponse {
     pub next_cursor: Option<String>,
 }
 
+/// 线程的运行状态（serde 以 `type` 字段做内部标记）：
+///   - `NotLoaded`：未加载进内存。
+///   - `Idle`：已加载且空闲，无进行中的轮次。
+///   - `SystemError`：因系统错误处于异常态。
+///   - `Active { active_flags }`：有进行中的轮次；`active_flags` 进一步说明它当前
+///     在等待什么（等待审批 / 等待用户输入）。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
 #[ts(tag = "type")]
@@ -1186,6 +1278,8 @@ pub struct ThreadReadResponse {
     pub thread: Thread,
 }
 
+/// `thread/inject_items` 入参：把一批「原始 Responses API items」直接追加进线程的
+/// 模型可见历史，而「不」触发一个用户轮次。用于在不发起对话的前提下植入上下文。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -1273,6 +1367,10 @@ pub struct ThreadTokenUsageUpdatedNotification {
     pub token_usage: ThreadTokenUsage,
 }
 
+/// 线程的 token 用量：`total` 为累计、`last` 为最近一次请求的明细；
+/// `model_context_window` 为当前模型的上下文窗口大小（暂为可选，见 TODO）。
+/// 由核心类型 `CoreTokenUsageInfo` 经下方 `From` 转换得来，通过
+/// `ThreadTokenUsageUpdatedNotification` 推送给客户端用于展示用量进度。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -1323,6 +1421,10 @@ impl From<CoreTokenUsage> for TokenUsageBreakdown {
 }
 
 // Thread/Turn lifecycle notifications and item progress events
+// ── 线程生命周期通知 · 服务端单向推送（无需响应）─────────────────────────
+// 以下 `Thread*Notification` 由服务端经 `ServerNotification` 推送给客户端，反映线程
+// 的启动/状态变化/归档/关闭/改名/目标变更/token 用量更新等。结构都很直白，多为
+// 「thread_id + 该事件的少量字段」，故不逐个加注释。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
