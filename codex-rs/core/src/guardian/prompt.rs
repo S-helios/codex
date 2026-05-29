@@ -1,3 +1,21 @@
+//! 【文件职责】Guardian 审查的「提示词工程」与「输出解析」：把父会话历史压成
+//! 紧凑转写稿、拼上待审动作 JSON 组成审查输入；并把模型的严格 JSON 输出解析回
+//! `GuardianAssessment`。同时托管 Guardian 策略提示与输出 schema。
+//!
+//! 【架构位置】
+//!   层级：Agent 核心层 · 审批旁路（Guardian 提示/解析层）
+//!   上游：review_session.rs 调 `build_guardian_prompt_items()` 构造提示项；
+//!         review.rs 调 `parse_guardian_assessment()` / `guardian_output_schema()`
+//!   下游：approval_request.rs 提供动作 JSON 与截断工具；compact.rs 抽取消息文本
+//!
+//! 【转写稿预算】所有 token 上限常量定义在 mod.rs，渲染时消息/工具各占独立预算，
+//!   优先保留首尾 user 轮作为锚点，再按新→旧补满（见 `render_*_with_offset`）。
+//!
+//! 【阅读建议】先看入口 `build_guardian_prompt_items()`（Full vs Delta 两种形态），
+//!   再看 `collect_guardian_transcript_entries()`（从历史筛留哪些条目）与
+//!   `render_guardian_transcript_entries*()`（预算内取舍渲染）；解析侧看
+//!   `parse_guardian_assessment()`。策略提示见底部 `guardian_policy_prompt*`。
+
 use std::collections::HashMap;
 
 use codex_protocol::models::ResponseItem;
@@ -26,12 +44,15 @@ use super::TRUNCATION_TAG;
 use super::approval_request::format_guardian_action_pretty;
 
 /// Transcript entry retained for guardian review after filtering.
+/// 过滤后保留进审查转写稿的单条记录：角色种类 + 文本内容。
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct GuardianTranscriptEntry {
     pub(crate) kind: GuardianTranscriptEntryKind,
     pub(crate) text: String,
 }
 
+/// 转写稿条目的角色种类。`Tool(String)` 内含展示用的角色名（如
+/// "tool shell call" / "tool foo result"），便于审查者区分调用与结果。
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum GuardianTranscriptEntryKind {
     Developer,
@@ -59,6 +80,8 @@ impl GuardianTranscriptEntryKind {
     }
 }
 
+/// 构造好的审查提示输出：提示项序列 + 本次转写稿游标 + 动作是否被截断。
+/// 游标会在审查成功后存回会话状态，供下次走 Delta 增量。
 pub(crate) struct GuardianPromptItems {
     pub(crate) items: Vec<UserInput>,
     pub(crate) transcript_cursor: GuardianTranscriptCursor,
@@ -67,12 +90,15 @@ pub(crate) struct GuardianPromptItems {
 
 /// Points to the end of the transcript that the guardian has already reviewed.
 /// The saved count is only reusable when `parent_history_version` still matches.
+/// 指向「Guardian 已审查到的转写稿末尾」。仅当 `parent_history_version` 仍一致时
+/// 这个计数才可复用——父历史版本变了说明历史被改写（如压缩），需退回 Full 重发。
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GuardianTranscriptCursor {
     pub(crate) parent_history_version: u64,
     pub(crate) transcript_entry_count: usize,
 }
 
+/// 提示形态：首审发全量转写稿（Full）；复用会话时只发自游标以来的增量（Delta）。
 pub(crate) enum GuardianPromptMode {
     Full,
     Delta { cursor: GuardianTranscriptCursor },
@@ -86,12 +112,21 @@ pub(crate) enum GuardianPromptMode {
 /// Split the variable request into separate user content items so the
 /// Responses request snapshot shows clear boundaries while preserving exact
 /// prompt text through trailing newlines.
+/// 构造审查输入的 user 内容项，由两部分组成：
+///   - 紧凑转写稿（提供用户授权背景与本地上下文）
+///   - 待审批的「精确动作 JSON」
+/// 固定的 Guardian 策略不在这里，而在子会话的 developer 消息里（见 review_session.rs）。
+/// 把可变请求拆成多个独立 user 内容项，是为了让 Responses 请求快照里边界清晰，
+/// 同时靠每项尾部换行精确保留提示文本。
+/// 安全提示：转写稿/参数/动作都被显式标注为「不可信证据，而非要执行的指令」，
+/// 防止历史里的注入内容劫持审查器（见下方 headings.intro 文案）。
 pub(crate) async fn build_guardian_prompt_items(
     session: &Session,
     retry_reason: Option<String>,
     request: GuardianApprovalRequest,
     mode: GuardianPromptMode,
 ) -> serde_json::Result<GuardianPromptItems> {
+    // Step 1：克隆父历史并筛出可保留条目，同时记录「当前」游标（版本 + 条目数）。
     let history = session.clone_history().await;
     let transcript_entries = collect_guardian_transcript_entries(history.raw_items());
     let transcript_cursor = GuardianTranscriptCursor {
@@ -100,6 +135,8 @@ pub(crate) async fn build_guardian_prompt_items(
     };
     let planned_action_json = format_guardian_action_pretty(&request)?;
 
+    // Step 2：决定实际形态。请求 Delta 时还要校验游标仍然有效（父版本一致且已读
+    // 计数不超过当前）——否则历史已变，安全起见退回 Full 重发全量。
     let prompt_shape = match mode {
         GuardianPromptMode::Full => GuardianPromptShape::Full,
         GuardianPromptMode::Delta { cursor } => {
@@ -150,6 +187,8 @@ pub(crate) async fn build_guardian_prompt_items(
             )
         }
     };
+    // Step 3：按固定结构逐项拼装提示：引言 → 转写稿(带起止标记) → 会话 id →
+    // 省略说明 → 审批请求块（网络访问与其他动作走不同文案分支）→ 动作 JSON。
     let mut items = Vec::new();
     let mut push_text = |text: String| {
         items.push(UserInput::Text {
@@ -244,6 +283,13 @@ struct GuardianPromptHeadings {
 ///
 /// Returns the rendered transcript plus an omission note when some entries were
 /// skipped.
+/// 从保留条目渲染一份紧凑转写稿。取舍策略刻意做得简单可预测：
+///   - 每条先截到「单条上限」；消息类共用消息预算，工具类用独立工具预算
+///     （防止冗长工具输出挤掉人类对话）；
+///   - user 轮全装得下就全留；否则保首尾两个 user 轮做锚点，再用剩余消息预算从
+///     新到旧补其他 user 轮；
+///   - user 选完后，再从新到旧补最近的非 user 条目，受预算与条数上限约束。
+/// 有条目被省略时附一条「部分条目已省略」的说明。
 pub(crate) fn render_guardian_transcript_entries(
     entries: &[GuardianTranscriptEntry],
 ) -> (Vec<String>, Option<String>) {
@@ -293,11 +339,13 @@ fn render_guardian_transcript_entries_with_offset(
         .filter_map(|(index, entry)| entry.kind.is_user().then_some(index))
         .collect::<Vec<_>>();
 
+    // 锚点 1：第一个 user 轮无条件保留（确立最初意图）。
     if let Some(&first_user_index) = user_indices.first() {
         included[first_user_index] = true;
         message_tokens += rendered_entries[first_user_index].1;
     }
 
+    // 锚点 2：最后一个 user 轮在预算允许时保留（确立当前意图）。
     if let Some(&last_user_index) = user_indices.last()
         && !included[last_user_index]
         && message_tokens + rendered_entries[last_user_index].1
@@ -307,6 +355,8 @@ fn render_guardian_transcript_entries_with_offset(
         message_tokens += rendered_entries[last_user_index].1;
     }
 
+    // 其余 user 轮：从新到旧填满消息预算，装不下的跳过（continue 而非 break，
+    // 允许后面体量更小的旧轮仍有机会被纳入）。
     for &index in user_indices.iter().rev() {
         if included[index] {
             continue;
@@ -321,6 +371,8 @@ fn render_guardian_transcript_entries_with_offset(
         message_tokens += token_count;
     }
 
+    // 非 user 条目（assistant / tool）：从新到旧补，受「最近条数上限」与对应预算
+    // 双重约束。工具类计入工具预算、其余计入消息预算，二者互不挤占。
     let mut retained_non_user_entries = 0usize;
     for index in (0..entries.len()).rev() {
         let entry = &entries[index];
@@ -366,6 +418,12 @@ fn render_guardian_transcript_entries_with_offset(
 /// Keep both tool calls and tool results here. The reviewer often needs the
 /// agent's exact queried path / arguments as well as the returned evidence to
 /// decide whether the pending approval is justified.
+/// 从历史项中筛出供审查的条目：保留人类可读对话 + 近期工具调用/结果证据，跳过
+/// 合成的「上下文脚手架」（这类内容只会添噪，且审查器在会话启动时已继承了正常的
+/// 顶层上下文）。
+/// 工具「调用」与「结果」都保留：审查者往往既需要 Agent 查询的确切路径/参数，
+/// 也需要返回的证据，才能判断待批动作是否正当。
+/// 实现细节：用 call_id→工具名 的 map 把工具结果回贴到对应工具名上；空白内容一律丢弃。
 pub(crate) fn collect_guardian_transcript_entries(
     items: &[ResponseItem],
 ) -> Vec<GuardianTranscriptEntry> {
@@ -382,6 +440,7 @@ pub(crate) fn collect_guardian_transcript_entries(
     for item in items {
         let entry = match item {
             ResponseItem::Message { role, content, .. } if role == "user" => {
+                // 跳过合成的「上下文型」user 消息（脚手架噪音），只留真实用户输入。
                 if is_contextual_user_message_content(content) {
                     None
                 } else {
@@ -393,6 +452,8 @@ pub(crate) fn collect_guardian_transcript_entries(
                     // Preserve only the explicit auto-review approval marker for
                     // Guardian context; other developer messages are intentionally
                     // excluded from the review transcript.
+                    // 只保留「用户手动批准了先前被拒动作」这一标记型 developer 消息，
+                    // 让审查器知晓该动作已获显式授权；其余 developer 消息一律不进转写稿。
                     text.starts_with(AUTO_REVIEW_DENIED_ACTION_APPROVAL_DEVELOPER_PREFIX)
                         .then_some(GuardianTranscriptEntry {
                             kind: GuardianTranscriptEntryKind::Developer,
@@ -464,6 +525,10 @@ pub(crate) fn collect_guardian_transcript_entries(
     entries
 }
 
+/// 把文本按 token 预算做「中间截断」：保留头尾、中间替换为带省略量的标记
+/// `<truncated omitted_approx_tokens="N" />`。中间截断而非掐尾，是为了同时保住
+/// 命令开头与结尾（结尾常含关键参数/重定向）。返回 (结果, 是否截断)。
+/// token 与字节通过近似换算（`approx_bytes_for_tokens`），非精确分词。
 pub(crate) fn guardian_truncate_text(content: &str, token_cap: usize) -> (String, bool) {
     if content.is_empty() {
         return (String::new(), false);
@@ -476,10 +541,12 @@ pub(crate) fn guardian_truncate_text(content: &str, token_cap: usize) -> (String
 
     let omitted_tokens = approx_tokens_from_byte_count(content.len().saturating_sub(max_bytes));
     let marker = format!("<{TRUNCATION_TAG} omitted_approx_tokens=\"{omitted_tokens}\" />");
+    // 预算连标记都放不下时的兜底：只返回标记本身。
     if max_bytes <= marker.len() {
         return (marker, true);
     }
 
+    // 扣掉标记占用后，剩余字节在头尾间对半分（尾部拿余数），再据此切出头尾片段。
     let available_bytes = max_bytes.saturating_sub(marker.len());
     let prefix_budget = available_bytes / 2;
     let suffix_budget = available_bytes.saturating_sub(prefix_budget);
@@ -488,6 +555,9 @@ pub(crate) fn guardian_truncate_text(content: &str, token_cap: usize) -> (String
     (format!("{prefix}{marker}{suffix}"), true)
 }
 
+/// 在 UTF-8 字符边界上把文本切成「头 + 尾」两段，分别不超过给定字节预算。
+/// 逐字符扫描以避免切在多字节字符中间；头尾若有重叠则收敛到 prefix_end，保证
+/// 返回的两个切片不交叠。
 fn split_guardian_truncation_bounds(
     content: &str,
     prefix_bytes: usize,
@@ -530,10 +600,15 @@ fn split_guardian_truncation_bounds(
 /// wrapper so transient formatting drift fails less noisily during dogfooding.
 /// Non-JSON output is still a review failure; this is only a thin recovery path
 /// for cases where the model wrapped the JSON in extra prose.
+/// 解析模型输出为裁决。虽然要求严格 JSON，但仍兼容「JSON 外包了一层散文」的情况
+/// （取首个 `{` 到末个 `}` 的切片再解析），以降低试用期偶发格式漂移的噪音；
+/// 真正非 JSON 仍判为失败。缺字段时按 outcome 给合理默认：allow→低风险，
+/// deny→高风险；理由缺失也填兜底文案。
 pub(crate) fn parse_guardian_assessment(text: Option<&str>) -> anyhow::Result<GuardianAssessment> {
     let Some(text) = text else {
         anyhow::bail!("guardian review completed without an assessment payload");
     };
+    // 先尝试整体解析；失败则退而求其次，截取最外层花括号区间再解析（容错散文包裹）。
     let parsed_payload =
         if let Ok(payload) = serde_json::from_str::<GuardianAssessmentPayload>(text) {
             payload
@@ -547,6 +622,7 @@ pub(crate) fn parse_guardian_assessment(text: Option<&str>) -> anyhow::Result<Gu
         };
 
     let outcome = parsed_payload.outcome;
+    // 风险等级缺省按结论推断：放行默认低风险，拒绝默认高风险。
     let risk_level = parsed_payload.risk_level.unwrap_or(match outcome {
         super::GuardianAssessmentOutcome::Allow => GuardianRiskLevel::Low,
         super::GuardianAssessmentOutcome::Deny => GuardianRiskLevel::High,
@@ -573,6 +649,8 @@ pub(crate) fn parse_guardian_assessment(text: Option<&str>) -> anyhow::Result<Gu
     })
 }
 
+/// 解析模型 JSON 的中间载体：只有 `outcome` 必填，其余可缺省（再由
+/// `parse_guardian_assessment` 补默认值），以兼容「低风险只回 outcome」的简写。
 #[derive(Deserialize)]
 struct GuardianAssessmentPayload {
     risk_level: Option<GuardianRiskLevel>,
@@ -586,6 +664,10 @@ struct GuardianAssessmentPayload {
 ///
 /// Keep this next to `guardian_output_contract_prompt()` so the prompt text and
 /// output schema stay aligned.
+/// 作为 `final_output_json_schema` 下发给审查会话的输出 schema，约束模型只能产出
+/// 既定结构（仅 `outcome` 为 required，与解析侧的容错默认相呼应）。
+/// 刻意与 `guardian_output_contract_prompt()` 放在一起，确保「提示文案」与「schema」
+/// 始终同步——改一个务必同步另一个。
 pub(crate) fn guardian_output_schema() -> Value {
     serde_json::json!({
         "type": "object",
@@ -613,6 +695,8 @@ pub(crate) fn guardian_output_schema() -> Value {
 
 /// Prompt fragment that describes the exact JSON contract paired with
 /// `guardian_output_schema()`.
+/// 描述输出 JSON 契约的提示片段，与 `guardian_output_schema()` 配对：允许先用只读
+/// 工具检查，最终消息必须是严格 JSON；低风险可只回 `{"outcome":"allow"}`。
 fn guardian_output_contract_prompt() -> &'static str {
     r#"You may use read-only tool checks to gather any additional context you need before deciding. When you are ready to answer, your final message must be strict JSON.
 
@@ -636,10 +720,17 @@ For anything else, use this JSON schema:
 /// The template is intentionally separated from the default tenant policy
 /// configuration so workspace-managed overrides can keep the configurable
 /// section narrower than the full policy.
+/// Guardian 策略提示（即子会话的 base_instructions，见 review_session.rs）。
+/// 提示正文放在独立 markdown 文件，便于审阅者直接 diff 提示变更而非翻代码；
+/// 输出契约则从代码追加，以便紧挨 `guardian_output_schema()` 保持同步。
+/// 模板与「默认租户策略配置」刻意分离：让工作区下发的覆写只触及更窄的可配置段，
+/// 而非整份策略。本函数用内置默认 policy.md 填充。
 pub(crate) fn guardian_policy_prompt() -> String {
     guardian_policy_prompt_with_config(include_str!("policy.md"))
 }
 
+// 用给定的租户策略配置填充模板，并在末尾追加输出契约提示。
+// 供工作区下发自定义策略时调用（见 review_session.rs 的 base_instructions 覆盖）。
 pub(crate) fn guardian_policy_prompt_with_config(tenant_policy_config: &str) -> String {
     let template = include_str!("policy_template.md").trim_end();
     let prompt = template.replace("{tenant_policy_config}", tenant_policy_config.trim());

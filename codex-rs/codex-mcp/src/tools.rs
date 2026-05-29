@@ -4,6 +4,24 @@
 //! model-visible tool names must be sanitized, deduplicated, and kept within API
 //! limits. This module owns that translation as well as the shared [`ToolInfo`]
 //! type and helpers that adjust tool schemas before exposing them to the model.
+//!
+//! 【文件职责】管理 MCP 工具的「双重身份」：一边保留协议调用所需的原始工具标识，
+//!   一边把模型可见名做净化、去重、限长（API 要求 ≤64 字节）；同时持有共享类型
+//!   [`ToolInfo`] 与「暴露给模型前调整工具 schema」的辅助函数。
+//!
+//! 【架构位置】
+//!   层级：工具执行层（MCP 子系统的「工具名/schema 翻译」层）
+//!   上游：`connection_manager`（聚合工具后调 `normalize_tools_for_model_with_prefix`）、
+//!         `rmcp_client`（列举工具后构造 `ToolInfo`、调用过滤与 schema 整形）
+//!   下游：`mcp::sanitize_responses_api_tool_name`（字符集净化）
+//!
+//! 【核心难点】模型可见名的「唯一化」：原始 server/工具名可能重名或超长，需要在
+//!   净化后检测命名空间/工具名碰撞，对碰撞者追加 SHA1 哈希后缀，并在拼接后仍超长时
+//!   截断+哈希，最终保证每个 `<namespace><name>` 全局唯一且不超限。
+//!
+//! 【阅读建议】先看 `ToolInfo`（字段含义=工具的两重身份），再看
+//!   `normalize_tools_for_model_with_prefix`（去重/碰撞/哈希的主流程），
+//!   底部的 `*_hash_suffix` / `fit_callable_parts_with_hash` 是其调用的纯函数辅助。
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -27,6 +45,11 @@ pub(crate) const MCP_TOOLS_CACHE_WRITE_DURATION_METRIC: &str =
 
 const LEGACY_MCP_TOOL_NAME_PREFIX: &str = "mcp__";
 
+/// 一个 MCP 工具的完整描述，承载其「两重身份」：
+///   - 原始身份（`server_name` + `tool.name`）：用于按 server 路由、回传给 MCP server；
+///   - 模型可见身份（`callable_namespace` + `callable_name`）：净化/去重/限长后
+///     用于 Responses API 的工具声明。
+/// 该类型会被序列化进工具缓存，故字段上用 `alias`/`rename` 兼容历史序列化名。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolInfo {
     /// Raw MCP server name used for routing the tool call.
@@ -81,6 +104,10 @@ pub fn declared_openai_file_input_param_names(
 /// A tool is allowed to be used if both are true:
 /// 1. enabled is None (no allowlist is set) or the tool is explicitly enabled.
 /// 2. The tool is not explicitly disabled.
+///
+/// per-server 的工具白/黑名单。放行规则=「白名单命中（或无白名单）」且「不在黑名单」。
+/// `enabled` 为 None 表示「不设白名单」（默认全允许）；一旦设了白名单，
+/// 未列入者一律拒绝。黑名单优先级更高，可在白名单基础上再排除个别工具。
 #[derive(Default, Clone)]
 pub(crate) struct ToolFilter {
     pub(crate) enabled: Option<HashSet<String>>,
@@ -116,6 +143,12 @@ impl ToolFilter {
 /// Returns the model-visible view of a tool while preserving the raw metadata
 /// used by execution. Keep cache entries raw and call this at manager return
 /// boundaries.
+///
+/// 返回工具的「模型可见视图」：若其声明了 `openai/fileParams`（文件类入参），
+/// 则把这些入参的 schema 重写为「期望绝对本地文件路径」的字符串/字符串数组，
+/// 并补一段引导性 description。无文件入参时原样克隆返回。
+/// 约定：缓存里存「裸」工具，仅在管理器对外返回的边界处才调用本函数做整形，
+/// 避免把模型视图污染进缓存。
 pub(crate) fn tool_with_model_visible_input_schema(tool: &Tool) -> Tool {
     let file_params = declared_openai_file_input_param_names(tool.meta.as_deref());
     if file_params.is_empty() {
@@ -146,6 +179,15 @@ pub(crate) fn filter_tools(tools: Vec<ToolInfo>, filter: &ToolFilter) -> Vec<Too
 ///
 /// When `prefix_mcp_tool_names` is true, the historical `mcp__` namespace
 /// prefix is added without restoring the old trailing `__` namespace suffix.
+///
+/// 把一批工具的「模型可见名」规范化到唯一且 ≤64 字节。
+/// 原始 server/工具名仍保留在各 `ToolInfo` 上供协议调用；这里只调整
+/// `callable_namespace` / `callable_name`。`prefix_mcp_tool_names` 为真时补
+/// 历史 `mcp__` 命名空间前缀（但不再恢复旧的尾部 `__` 后缀）。
+///
+/// 算法分四阶段（见下方各 Step）：先按「原始身份」去重，再分别消解命名空间碰撞、
+/// 工具名碰撞（碰撞者追加哈希后缀），最后在拼接超长时做截断+哈希以保证唯一+限长。
+/// 排序基于 `raw_tool_identity`，使输出顺序稳定、与输入插入顺序无关。
 pub(crate) fn normalize_tools_for_model_with_prefix<I>(
     tools: I,
     prefix_mcp_tool_names: bool,
@@ -153,6 +195,8 @@ pub(crate) fn normalize_tools_for_model_with_prefix<I>(
 where
     I: IntoIterator<Item = ToolInfo>,
 {
+    // Step 1：按「原始身份」（server+namespace+connector / +callable+原始工具名）
+    // 去重，重复者直接跳过；同时对净化后的名字构造候选项，待后续消解碰撞。
     let mut seen_raw_names = HashSet::new();
     let mut candidates = Vec::new();
     for tool in tools {
@@ -185,6 +229,8 @@ where
         });
     }
 
+    // Step 2：消解「命名空间碰撞」——多个不同原始命名空间净化后落到同一个
+    // callable_namespace 的，给它们各自追加基于原始身份的哈希后缀以区分。
     let mut namespace_identities_by_base = HashMap::<String, HashSet<String>>::new();
     for candidate in &candidates {
         namespace_identities_by_base
@@ -205,6 +251,8 @@ where
         }
     }
 
+    // Step 3：消解「工具名碰撞」——在（已去碰撞的）命名空间内，若多个不同原始工具
+    // 净化后落到同一个 callable_name，则给它们追加哈希后缀。
     let mut tool_identities_by_base = HashMap::<(String, String), HashSet<String>>::new();
     for candidate in &candidates {
         tool_identities_by_base
@@ -229,8 +277,11 @@ where
         }
     }
 
+    // 按原始身份排序，使输出顺序稳定可复现（与输入顺序、HashMap 迭代序无关）。
     candidates.sort_by(|left, right| left.raw_tool_identity.cmp(&right.raw_tool_identity));
 
+    // Step 4：最终确定唯一且 ≤64 字节的 (namespace, name)。即使前几步已去碰撞，
+    // 拼接后仍可能超长或与已用名冲突，故用 `unique_callable_parts` 兜底截断+哈希。
     let mut used_names = HashSet::new();
     let mut model_tools = Vec::new();
     for mut candidate in candidates {
@@ -258,8 +309,12 @@ struct CallableToolCandidate {
 }
 
 const MCP_TOOL_NAME_DELIMITER: &str = "__";
+// 模型可见工具名（namespace+name 拼接后）的最大字节数：Responses API 的硬限制。
 const MAX_TOOL_NAME_LENGTH: usize = 64;
+// 碰撞/超长时追加的 SHA1 哈希后缀长度（取十六进制串前 12 位）：
+// 兼顾「足够低碰撞概率」与「不过度挤占有限的名字预算」。
 const CALLABLE_NAME_HASH_LEN: usize = 12;
+// 工具 meta 中声明「文件类入参」的键名（见 `tool_with_model_visible_input_schema`）。
 const META_OPENAI_FILE_PARAMS: &str = "openai/fileParams";
 
 fn callable_namespace_with_prefix(namespace: &str, prefix_mcp_tool_names: bool) -> String {
@@ -349,6 +404,10 @@ fn truncate_name(value: &str, max_len: usize) -> String {
     value.chars().take(max_len).collect()
 }
 
+// 在「namespace+name+哈希后缀」总长不超 `MAX_TOOL_NAME_LENGTH` 的约束下，
+// 给出截断方案（`reserved_len` 是分隔符等预留字节）。
+// 策略：优先保留完整 namespace、截短 name 再接哈希后缀；当 namespace 自身就太长、
+// 连后缀都放不下时，退化为「截短 namespace + 后缀」（此时 name 整段丢弃）。
 fn fit_callable_parts_with_hash(
     namespace: &str,
     tool_name: &str,
@@ -369,6 +428,10 @@ fn fit_callable_parts_with_hash(
     (truncate_name(namespace, max_namespace_len), suffix)
 }
 
+// 产出一个「既不超长、又未被占用」的 (namespace, name)。
+// 快路径：原样拼接若已合规且未被占用，直接采用。否则进入循环：用原始身份
+// （必要时叠加 attempt 计数）反复生成哈希后缀并截断适配，直到得到未占用的名字。
+// `used_names` 记录已分配名字，跨工具防重；`attempt` 递增以应对极罕见的二次碰撞。
 fn unique_callable_parts(
     namespace: &str,
     tool_name: &str,

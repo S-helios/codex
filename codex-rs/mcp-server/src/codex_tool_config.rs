@@ -1,4 +1,21 @@
 //! Configuration object accepted by the `codex` MCP tool-call.
+//!
+//! 【文件职责】定义 `codex` / `codex-reply` 两个 MCP 工具的入参结构、它们的
+//! JSON Schema 生成逻辑，以及把入参转换成 codex-core 的 `Config` 的逻辑。
+//!
+//! 【架构位置】
+//!   层级：MCP server 工具配置层
+//!   上游：message_processor.rs（反序列化客户端入参、调用 into_config / get_thread_id；
+//!         调用 create_tool_for_* 应答 tools/list）
+//!   下游：codex-core 的 `ConfigBuilder`（最终构建出生效的 Config）
+//!
+//! 【阅读建议】两个入参 struct（`CodexToolCallParam` / `CodexToolCallReplyParam`）
+//!   字段名即文档，可略读。重点看 `into_config()`（参数→Config 的映射）与
+//!   `create_tool_input_schema()`（从 schemars 生成的 schema 里筛出对外暴露的键）。
+//!
+//! 设计要点：这里刻意定义了 `CodexToolCallApprovalPolicy` / `CodexToolCallSandboxMode`
+//!   这两个"镜像枚举"，而非直接复用 core 里的同名类型——因为 schemars 的
+//!   `JsonSchema` 派生需要附加在本地类型上，再用 `From` 转回 core 类型。
 
 use codex_arg0::Arg0DispatchPaths;
 use codex_core::config::Config;
@@ -105,7 +122,13 @@ impl From<CodexToolCallSandboxMode> for SandboxMode {
 }
 
 /// Builds a `Tool` definition (JSON schema etc.) for the Codex tool-call.
+/// 为 `codex` 工具构建 MCP `Tool` 定义（名称、描述、输入/输出 JSON Schema）。
+/// 在 tools/list 响应中返回给客户端，让客户端知道如何调用此工具。
 pub(crate) fn create_tool_for_codex_tool_call_param() -> Tool {
+    // 从 `CodexToolCallParam` 派生 JSON Schema：
+    // - inline_subschemas：内联子 schema，尽量不产生 `$ref`，让输出扁平易读；
+    // - option_add_null_type=false：`Option<T>` 字段不额外标注 "null" 类型，
+    //   而是靠 required 列表表达可选性（对应测试里枚举字段是紧凑的 string）。
     let schema = SchemaSettings::draft2019_09()
         .with(|s| {
             s.inline_subschemas = true;
@@ -125,6 +148,9 @@ pub(crate) fn create_tool_for_codex_tool_call_param() -> Tool {
     .with_raw_output_schema(codex_tool_output_schema())
 }
 
+// `codex` 与 `codex-reply` 共用的输出 schema：约定工具结果含 threadId + content
+// 两个字段（与 codex_tool_runner 里 create_call_tool_result_with_thread_id 的
+// structured_content 对齐）。手写 JSON 字面量而非派生，因为输出结构简单且固定。
 fn codex_tool_output_schema() -> Arc<JsonObject> {
     let schema = serde_json::json!({
         "type": "object",
@@ -136,6 +162,7 @@ fn codex_tool_output_schema() -> Arc<JsonObject> {
     });
     match schema {
         serde_json::Value::Object(map) => Arc::new(map),
+        // 上面是对象字面量，不可能是其他 JSON 类型，故走不到此分支。
         _ => unreachable!("json literal must be an object"),
     }
 }
@@ -143,6 +170,13 @@ fn codex_tool_output_schema() -> Arc<JsonObject> {
 impl CodexToolCallParam {
     /// Returns the initial user prompt to start the Codex conversation and the
     /// effective Config object generated from the supplied parameters.
+    /// 消费工具入参，产出一对 (初始用户 prompt, 生效的 Config)。
+    /// prompt 单独剥离出来交给会话首轮使用，其余字段折叠进 Config。
+    ///
+    /// @param arg0_paths - 当前可执行文件/沙箱程序路径，注入 Config 以支持 arg0 重 exec
+    /// @returns          - `(prompt, Config)`；磁盘读取或配置构建失败时返回 io::Error
+    ///
+    /// 副作用：经 `ConfigBuilder` 读取 CODEX_HOME/config.toml 等磁盘配置。
     pub async fn into_config(
         self,
         arg0_paths: Arg0DispatchPaths,
@@ -160,6 +194,8 @@ impl CodexToolCallParam {
         } = self;
 
         // Build the `ConfigOverrides` recognized by codex-core.
+        // 把强类型的工具入参映射成 core 认得的 `ConfigOverrides`。镜像枚举借助
+        // `Into` 转回 core 类型（approval_policy / sandbox_mode），其余字段直传。
         let overrides = ConfigOverrides {
             model,
             cwd: cwd.map(PathBuf::from),
@@ -174,6 +210,8 @@ impl CodexToolCallParam {
             ..Default::default()
         };
 
+        // `config` 字段是客户端传来的零散键值（JSON 形式），逐项转成 TOML 值，
+        // 作为最低优先级的 cli_overrides 喂给 builder；上面的强类型 overrides 优先级更高。
         let cli_overrides = cli_overrides
             .unwrap_or_default()
             .into_iter()
@@ -208,6 +246,8 @@ pub struct CodexToolCallReplyParam {
 }
 
 impl CodexToolCallReplyParam {
+    /// 解析出本次续聊的目标 `ThreadId`：优先用 `thread_id`，回退到已废弃的
+    /// `conversation_id`（向后兼容仍在用 conversationId 的旧客户端），两者皆缺则报错。
     pub(crate) fn get_thread_id(&self) -> anyhow::Result<ThreadId> {
         if let Some(thread_id) = &self.thread_id {
             let thread_id = ThreadId::from_string(thread_id)?;
@@ -224,6 +264,8 @@ impl CodexToolCallReplyParam {
 }
 
 /// Builds a `Tool` definition for the `codex-reply` tool-call.
+/// 为 `codex-reply` 工具构建 MCP `Tool` 定义；schema 设置同 `codex` 工具，
+/// 区别仅在入参类型与名称/描述（续聊需要 threadId + 下一条 prompt）。
 pub(crate) fn create_tool_for_codex_tool_call_reply_param() -> Tool {
     let schema = SchemaSettings::draft2019_09()
         .with(|s| {
@@ -244,10 +286,13 @@ pub(crate) fn create_tool_for_codex_tool_call_reply_param() -> Tool {
     .with_raw_output_schema(codex_tool_output_schema())
 }
 
+// 把 schemars 生成的完整 RootSchema 收窄为 MCP `inputSchema` 期望的精简对象：
+// 只保留下面白名单里的"核心"键，其余 schemars 附带的元信息一律丢弃。
 fn create_tool_input_schema(
     schema: schemars::schema::RootSchema,
     panic_message: &str,
 ) -> Arc<JsonObject> {
+    // schema 来自本地类型派生，结构稳定；序列化失败属编译期就该暴露的错误，故 expect。
     #[expect(clippy::expect_used)]
     let schema_value = serde_json::to_value(&schema).expect(panic_message);
     let mut schema_object = match schema_value {
@@ -258,6 +303,8 @@ fn create_tool_input_schema(
     // Prefer keeping the "core" JSON Schema keys while still preserving `$defs`
     // in case any `$ref` leaks into the generated schema (even though we try
     // to inline subschemas).
+    // 优先保留 JSON Schema 的"核心"键；同时保留 `$defs`/`definitions` 作兜底——
+    // 即便上游设了 inline_subschemas，仍可能有 `$ref` 漏出来引用它们。
     let mut input_schema = JsonObject::new();
     for key in [
         "additionalProperties",

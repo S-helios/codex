@@ -5,6 +5,25 @@
 //! metadata, aggregates tools/resources/templates across servers, routes tool
 //! calls to the right client, and exposes the public manager API used by
 //! `codex-core`.
+//!
+//! 【文件职责】聚合所有 MCP server 连接：以 server 名为键持有一组正在运行的
+//!   异步 RMCP 客户端，对外提供「列举工具/资源/模板、按 server 路由工具调用、
+//!   等待 server 就绪」等聚合 API。
+//!
+//! 【架构位置】
+//!   层级：工具执行层（MCP 子系统的「连接池/门面」）
+//!   上游：`codex-core`（通过本管理器列举工具、发起工具调用）；
+//!         本 crate 的 `mcp::mod`（构造管理器、采集状态快照）
+//!   下游：`rmcp_client`（单个客户端的生命周期/启动）、`tools`（工具名规范化、过滤）
+//!
+//! 【数据流】
+//!   一组 `EffectiveMcpServer` 配置 → `new()` 并发启动每个 `AsyncManagedClient`
+//!   → 启动状态通过 `tx_event` 流式上报 → 就绪后 `list_all_tools()` /
+//!   `call_tool()` 按 server 名路由到对应客户端。
+//!
+//! 【阅读建议】先看 `McpConnectionManager` 结构体字段与 `new()`（并发启动逻辑），
+//!   再看 `list_all_tools()` / `call_tool()` 这两条主路径；底部的
+//!   `mcp_init_error_display` 等是错误信息格式化辅助，可后看。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -83,6 +102,11 @@ const MCP_UI_MODEL_VISIBILITY: &str = "model";
 /// Tools with visibility metadata are hidden unless they explicitly include `model`.
 ///
 /// <https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx#resource-discovery>
+///
+/// 判断某个工具是否应出现在「发给模型的工具声明」里。
+/// 规则采用「默认可见」语义：未声明 `ui.visibility` 元数据的工具一律可见；
+/// 一旦声明了 visibility，则只有显式包含 `model` 的工具才对模型可见
+/// （否则该工具仅用于 UI 展示等用途，不应暴露给模型调用）。
 pub fn tool_is_model_visible(tool: &ToolInfo) -> bool {
     let Some(visibility) = tool
         .tool
@@ -102,13 +126,25 @@ pub fn tool_is_model_visible(tool: &ToolInfo) -> bool {
 }
 
 /// A thin wrapper around a set of running [`RmcpClient`] instances.
+///
+/// 对一组正在运行的 [`RmcpClient`] 的薄封装（连接池 + 门面）。
+/// 注释说「thin」，实际持有了路由所需的全部辅助状态。
 pub struct McpConnectionManager {
+    // 以 server 名为键的客户端集合；每个值是「异步启动中/已就绪」的句柄。
+    // 工具调用、资源列举都先在这里按名查找再路由。
     clients: HashMap<String, AsyncManagedClient>,
+    // server 元数据（origin、是否支持并行调用、是否污染记忆等），
+    // 在 `with_server_metadata()` 中回填到每个 `ToolInfo` 上。
     server_metadata: HashMap<String, McpServerMetadata>,
+    // 工具/连接器到「插件来源」的映射，用于在工具描述里标注其所属插件。
     tool_plugin_provenance: Arc<ToolPluginProvenance>,
+    // 是否启用「host 自带的 codex_apps」MCP server（依赖 ChatGPT 登录态）。
     host_owned_codex_apps_enabled: bool,
+    // 模型可见工具名是否保留历史 `mcp__` 前缀（见 `tools` 模块的名称规范化）。
     prefix_mcp_tool_names: bool,
+    // elicitation（向用户征询授权/确认）请求的集中管理器，跨多个 server 共享。
     elicitation_requests: ElicitationRequestManager,
+    // 启动阶段的取消令牌：Drop 或 shutdown 时 cancel，用于中止仍在启动的客户端。
     startup_cancellation_token: CancellationToken,
 }
 
@@ -151,6 +187,12 @@ impl McpConnectionManager {
 
     /// Drain all MCP clients from this manager and return a future that stops
     /// them and terminates their stdio server processes.
+    ///
+    /// 抽空本管理器的全部 MCP 客户端，返回一个「负责关停它们、并终止其 stdio
+    /// 子进程」的 future。
+    /// 设计要点：本方法是同步的（只做 `take` + `cancel`，立即让管理器进入空态），
+    /// 真正的异步关停工作留在返回的 future 里——调用方可以自行决定何时/在哪 await，
+    /// 不必持有 `&mut self`。
     pub fn begin_shutdown(&mut self) -> impl std::future::Future<Output = ()> + Send + 'static {
         self.startup_cancellation_token.cancel();
         let clients = std::mem::take(&mut self.clients);
@@ -209,6 +251,16 @@ impl McpConnectionManager {
         self.elicitation_requests.set_auto_deny(auto_deny);
     }
 
+    /// 构造管理器并「并发」启动所有启用的 MCP server。
+    ///
+    /// 注意命名上的反直觉：返回的是 `(Self, CancellationToken)` 而非单纯 `Self`
+    /// （故 `clippy::new_ret_no_self` 被显式放行）。返回的 token 让调用方可在外部
+    /// 取消整个启动批次。
+    ///
+    /// 关键行为：本函数不等待 server 真正就绪——它为每个 server `spawn` 一个启动
+    /// 任务并立即返回；启动进度通过 `tx_event` 以 `McpStartupUpdate` 事件流式上报，
+    /// 全部结束后再发一条 `McpStartupComplete` 汇总。各客户端句柄 `clone` 后既存入
+    /// 管理器、又移动进启动任务，二者共享同一个 `Shared` future（见 `AsyncManagedClient`）。
     #[allow(clippy::new_ret_no_self, clippy::too_many_arguments)]
     pub async fn new(
         mcp_servers: &HashMap<String, EffectiveMcpServer>,
@@ -243,6 +295,8 @@ impl McpConnectionManager {
             .filter(|auth| auth.uses_codex_backend())
             .map(codex_model_provider::auth_provider_from_auth);
         let mcp_servers = mcp_servers.clone();
+        // 仅对「已启用」的 server 建立连接；逐个为其派生子取消令牌，
+        // 这样取消父 token 能级联中止所有在途启动任务。
         for (server_name, server) in mcp_servers
             .into_iter()
             .filter(|(_, server)| server.enabled())
@@ -276,6 +330,9 @@ impl McpConnectionManager {
                         } => bearer_token_env_var.is_some(),
                         McpServerTransportConfig::Stdio { .. } => false,
                     });
+            // 仅在「host 自带的 codex_apps server 且未显式配置 env bearer token」时，
+            // 注入 Codex 后端的运行时鉴权提供方；其余 server 一律不注入，
+            // 避免把 Codex 自身凭据泄露给第三方 MCP server。
             let runtime_auth_provider =
                 if server_name == CODEX_APPS_MCP_SERVER_NAME && !uses_env_bearer_token {
                     codex_apps_auth_provider.clone()
@@ -295,12 +352,18 @@ impl McpConnectionManager {
                 runtime_auth_provider,
                 client_elicitation_capability.clone(),
             );
+            // 同一个客户端句柄 clone 两份：一份留在管理器的 `clients` 里供后续路由，
+            // 一份移动进下面的启动任务去驱动并上报状态。二者背后是同一个
+            // `Shared` future，因此谁先 await 谁就推进启动，结果对双方都可见。
             clients.insert(server_name.clone(), async_managed_client.clone());
             let tx_event = tx_event.clone();
             let submit_id = startup_submit_id.clone();
             let auth_entry = auth_entries.get(&server_name).cloned();
             join_set.spawn(async move {
+                // await 客户端 future = 实际驱动该 server 的启动流程。
                 let mut outcome = async_managed_client.client().await;
+                // 即便启动「成功」，若期间收到取消信号也覆写为 Cancelled，
+                // 让最终汇总把它归类到 cancelled 而非 ready。
                 if cancel_token.is_cancelled() {
                     outcome = Err(StartupOutcomeError::Cancelled);
                 }
@@ -339,6 +402,9 @@ impl McpConnectionManager {
             elicitation_requests: elicitation_requests.clone(),
             startup_cancellation_token: cancel_token.clone(),
         };
+        // 后台任务：等所有 server 启动任务跑完，按 ready/cancelled/failed 三类
+        // 汇总成一条 `McpStartupComplete` 事件发出。管理器本身已先行返回，
+        // 调用方无需等待这里完成。
         tokio::spawn(async move {
             let outcomes = join_set.join_all().await;
             let mut summary = McpStartupCompleteEvent::default();
@@ -412,6 +478,11 @@ impl McpConnectionManager {
     }
 
     /// Returns all tools with model-visible names normalized.
+    ///
+    /// 聚合所有 server 的工具，并把模型可见名做规范化（去重 + 截断 + 必要时哈希）。
+    /// 副作用：对每个 server 会 await 其 `listed_tools()`——若该 server 仍在启动，
+    /// 这里会阻塞等待其就绪（或退回到缓存快照），因此本调用可能较慢，
+    /// 故附带 `trace` 级埋点便于诊断「卡在哪个 server」。
     #[instrument(level = "trace", skip_all, fields(mcp_server_count = self.clients.len()))]
     pub async fn list_all_tools(&self) -> Vec<ToolInfo> {
         let mut tools = Vec::new();
@@ -454,6 +525,13 @@ impl McpConnectionManager {
 
     /// Returns presentation metadata without waiting for uncached clients still initializing.
     /// Cached values will be used if available and the server is still starting up.
+    ///
+    /// 返回各 server 的展示用元信息（名称/标题/图标等），但「不」为仍在启动且无缓存的
+    /// server 阻塞等待。
+    /// 取舍：本方法面向 UI 展示，强调「尽快返回已知信息」而非完整性——
+    ///   - 启动未完成：有缓存就用缓存，否则跳过该 server；
+    ///   - 启动已完成：取实时 `server_info`，失败再退回缓存。
+    /// 与 `list_all_tools()`（会等待就绪）形成对比。
     pub async fn list_available_server_infos(&self) -> HashMap<String, McpServerInfo> {
         let mut server_infos = HashMap::new();
         for (server_name, client) in &self.clients {
@@ -682,6 +760,11 @@ impl McpConnectionManager {
     }
 
     /// Invoke the tool indicated by the (server, tool) pair.
+    ///
+    /// 按 `(server, tool)` 二元组路由并发起一次 MCP 工具调用。
+    /// 这里的 `tool` 是「原始 MCP 工具名」（非模型可见的规范化名），因为最终要
+    /// 原样发回给 MCP server。返回前会把响应 content 逐项转成 `serde_json::Value`，
+    /// 序列化失败的单项降级为占位串 `"<content>"` 而非整体失败。
     pub async fn call_tool(
         &self,
         server: &str,
@@ -690,6 +773,8 @@ impl McpConnectionManager {
         meta: Option<serde_json::Value>,
     ) -> Result<CallToolResult> {
         let client = self.client_by_name(server).await?;
+        // 先按该 server 的工具过滤器校验：被 disabled 的工具直接拒绝，
+        // 不发出真正的网络调用。
         if !client.tool_filter.allows(tool) {
             return Err(anyhow!(
                 "tool '{tool}' is disabled for MCP server '{server}'"
@@ -789,6 +874,8 @@ impl McpConnectionManager {
 }
 
 impl Drop for McpConnectionManager {
+    // 兜底清理：管理器被丢弃时取消启动 token 并清空客户端句柄，确保仍在启动的
+    // 任务被级联取消、不留悬挂的子进程。正常路径应优先走 `shutdown()`。
     fn drop(&mut self) {
         self.startup_cancellation_token.cancel();
         self.clients.clear();
@@ -808,6 +895,13 @@ async fn emit_update(
         .await
 }
 
+// 把启动失败的 `StartupOutcomeError` 翻译成「面向用户、可操作」的错误文案。
+// 按特定场景给出针对性提示（依优先级匹配）：
+//   1. GitHub MCP 官方端点 + 无 token：明确告知 GitHub 不支持 OAuth，
+//      并给出在 config.toml 配置 personal access token 的完整示例；
+//   2. 需要登录：提示运行 `codex mcp login <server>`；
+//   3. 启动超时：提示调大 `startup_timeout_sec` 并附带当前生效值；
+//   4. 其余：回退为通用失败信息。
 fn mcp_init_error_display(
     server_name: &str,
     entry: Option<&McpAuthStatusEntry>,

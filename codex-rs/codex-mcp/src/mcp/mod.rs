@@ -1,3 +1,24 @@
+//! MCP 子系统的「入口/装配」模块：配置类型、server 集合解析与状态快照采集。
+//!
+//! 【文件职责】持有 `codex-mcp` 对外的运行时配置 `McpConfig`，把「配置中的
+//!   server」与「运行时追加的 codex_apps server」合并为最终生效集合，并提供
+//!   「一次性建连接 → 采集工具/资源/鉴权状态快照 → 销毁」的便捷入口。
+//!
+//! 【架构位置】
+//!   层级：工具执行层（MCP 子系统的顶层装配点）
+//!   上游：`codex-core`（用 `McpConfig` 驱动 MCP 子系统、读 server 快照）
+//!   下游：`connection_manager`（真正的连接池）、`auth`（鉴权状态计算）、
+//!         `codex_apps`（apps server 的 URL/缓存键）
+//!
+//! 【数据流】
+//!   `McpConfig` → `effective_mcp_servers()` 得到生效 server 集合 →
+//!   `McpConnectionManager::new()` 建连接 → `collect_*_snapshot*()` 聚合快照。
+//!
+//! 【阅读建议】先看 `McpConfig` 字段（它界定了本 crate 需要哪些长期配置），
+//!   再看 `effective_mcp_servers*`（配置→生效集合的合并），
+//!   最后看 `collect_mcp_server_status_snapshot_*`（建连接+采集快照的全流程）。
+//!   底部的 `convert_mcp_*` / `sanitize_*` 是格式转换辅助，可后看。
+
 pub use auth::McpAuthStatusEntry;
 pub use auth::McpOAuthLoginConfig;
 pub use auth::McpOAuthLoginSupport;
@@ -42,9 +63,13 @@ use crate::connection_manager::McpConnectionManager;
 use crate::runtime::McpRuntimeContext;
 use crate::server::EffectiveMcpServer;
 
+// host 自带的 apps MCP server 的固定名称。它在代码多处被特判（鉴权注入、
+// 工具缓存、connector 元数据信任等），故抽成常量统一引用。
 pub const CODEX_APPS_MCP_SERVER_NAME: &str = "codex_apps";
+// 模型可见 MCP 工具名的历史前缀与分隔符：拼出形如 `mcp__<server>__` 的命名空间。
 const MCP_TOOL_NAME_PREFIX: &str = "mcp";
 const MCP_TOOL_NAME_DELIMITER: &str = "__";
+// codex_apps server 的 bearer token 环境变量名（用于 connectors 鉴权）。
 const CODEX_CONNECTORS_TOKEN_ENV_VAR: &str = "CODEX_CONNECTORS_TOKEN";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -68,6 +93,13 @@ pub fn qualified_mcp_tool_name_prefix(server_name: &str) -> String {
 
 /// Returns true when MCP permission prompts should resolve as approved instead
 /// of being shown to the user.
+///
+/// 判断某次 MCP 权限提示是否应「自动批准」而不弹给用户确认。
+/// 判定顺序（短路）：
+///   1. 工具本身配置为 `Approve` → 直接放行；
+///   2. 审批策略不是 `Never`（即用户希望被询问）→ 一律不自动批准；
+///   3. 审批策略为 `Never` 时，再看权限档：禁用/外部托管视为已放行，
+///      受管沙箱则仅当具备「整盘写」权限时才自动批准（否则仍需确认）。
 pub fn mcp_permission_prompt_is_auto_approved(
     approval_policy: AskForApproval,
     permission_profile: &PermissionProfile,
@@ -104,6 +136,11 @@ pub struct McpPermissionPromptAutoApproveContext {
 /// thread those values explicitly into runtime entry points such as
 /// [`effective_mcp_servers`] and snapshot collection helpers so config objects
 /// do not go stale when auth changes.
+///
+/// 从 `codex_core::config::Config` 提炼出的「MCP 运行时配置」。
+/// 设计约束（重要）：本结构只放「长期不变」的配置值；请求级/鉴权级的易变状态
+/// （如 `auth`）「不」存进来，而应作为参数显式传入 `effective_mcp_servers` 等入口。
+/// 原因是 auth 会随登录态变化，若把它固化进 config 对象，配置就会过期失真。
 #[derive(Debug, Clone)]
 pub struct McpConfig {
     /// Base URL for ChatGPT-hosted app MCP servers, copied from the root config.
@@ -148,6 +185,9 @@ pub struct McpConfig {
     pub plugin_capability_summaries: Vec<PluginCapabilitySummary>,
 }
 
+/// 工具/连接器到「插件来源」的映射表。
+/// 用途：当某个 MCP server 或 connector 是由插件提供时，据此在工具描述里标注
+/// 「本工具属于插件 X」，并能反查某 server 的归属插件 id。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolPluginProvenance {
     plugin_display_names_by_connector_id: HashMap<String, Vec<String>>,
@@ -215,6 +255,9 @@ impl ToolPluginProvenance {
     }
 }
 
+/// 根据当前配置与鉴权态，决定是否把 host 自带的 `codex_apps` server 注入生效集合。
+/// 启用条件满足则插入（覆盖同名项），否则显式移除——后者确保用户即使在 config 里
+/// 手写了同名 server，在未满足条件时也不会意外启用 apps server。
 pub fn with_codex_apps_mcp(
     mut servers: HashMap<String, EffectiveMcpServer>,
     auth: Option<&CodexAuth>,
@@ -262,6 +305,12 @@ pub fn tool_plugin_provenance(config: &McpConfig) -> ToolPluginProvenance {
     ToolPluginProvenance::from_config(config)
 }
 
+/// 一次性读取指定 server 的某个资源（URI）。
+///
+/// 这是个「自带短生命周期连接池」的便捷入口：只为目标 server 临时建一个
+/// `McpConnectionManager`，读完资源后立即 `cancel` 销毁。适用于不在常驻会话里、
+/// 偶发的单次资源读取。
+/// 副作用：会真正拉起/连接该 server（网络/子进程），开销不小，勿在热路径反复调用。
 pub async fn read_mcp_resource(
     config: &McpConfig,
     auth: Option<&CodexAuth>,
@@ -271,6 +320,7 @@ pub async fn read_mcp_resource(
 ) -> anyhow::Result<ReadResourceResult> {
     let mut mcp_servers = effective_mcp_servers(config, auth);
     let host_owned_codex_apps_enabled = host_owned_codex_apps_enabled(config, auth);
+    // 只保留目标 server，避免为无关 server 也建立连接。
     mcp_servers.retain(|name, _| name == server);
     let auth_statuses = compute_auth_statuses(
         mcp_servers.iter(),
@@ -278,6 +328,8 @@ pub async fn read_mcp_resource(
         auth,
     )
     .await;
+    // 管理器要求一个事件发送端，但这里是一次性调用、无人消费启动事件，
+    // 故建好通道后立即丢弃接收端：发送会静默失败（被忽略），等价于「黑洞」。
     let (tx_event, rx_event) = unbounded();
     drop(rx_event);
     let (manager, cancel_token) = McpConnectionManager::new(
@@ -317,6 +369,11 @@ pub struct McpServerStatusSnapshot {
     pub server_names: Vec<String>,
 }
 
+/// 采集一份「MCP server 状态快照」：临时建连接池 → 并发列举工具/资源/模板与鉴权态
+/// → 汇总成 `McpServerStatusSnapshot` → 立即销毁连接池。
+///
+/// `detail` 控制采集粒度：`ToolsAndAuthOnly` 时跳过资源/模板的拉取以提速。
+/// 无任何生效 server 时直接返回空快照，避免无谓建连接。
 pub async fn collect_mcp_server_status_snapshot_with_detail(
     config: &McpConfig,
     auth: Option<&CodexAuth>,
@@ -393,6 +450,10 @@ pub(crate) fn codex_apps_mcp_url(config: &McpConfig) -> String {
 /// The Responses API requires tool names to match `^[a-zA-Z0-9_-]+$`.
 /// MCP server/tool names are user-controlled, so sanitize the fully-qualified
 /// name we expose to the model by replacing any disallowed character with `_`.
+///
+/// 把暴露给模型的全限定工具名规整到 Responses API 允许的字符集。
+/// 注意：实现只保留 `[A-Za-z0-9_]`（连字符 `-` 也会被替换为 `_`），比 doc 里写的
+/// 正则更严格；全部被替换后若结果为空串，则回退为单个 `_`，保证名字非空。
 pub(crate) fn sanitize_responses_api_tool_name(name: &str) -> String {
     let mut sanitized = String::with_capacity(name.len());
     for c in name.chars() {
@@ -430,6 +491,10 @@ fn normalize_codex_apps_base_url(base_url: &str) -> String {
     base_url
 }
 
+// 由 base URL 推导 codex_apps server 的最终 MCP 端点。
+// 按 base URL 形态选择默认子路径：`/backend-api` → `wham/apps`；
+// 已含 `/api/codex` → `apps`；其余 → 先补 `/api/codex` 再接 `apps`。
+// `apps_mcp_path_override` 若有则覆盖默认子路径。
 fn codex_apps_mcp_url_for_base_url(base_url: &str, apps_mcp_path_override: Option<&str>) -> String {
     let base_url = normalize_codex_apps_base_url(base_url);
     let (base_url, default_path) = if base_url.contains("/backend-api") {
@@ -579,6 +644,9 @@ fn convert_mcp_resource_templates(
         .collect::<HashMap<_, _>>()
 }
 
+/// 从已建好的连接池里汇总快照：用 `tokio::join!` 并发拉取工具、资源、模板
+/// （后两者按 `detail` 决定是否跳过），再把工具按 server 名归组成
+/// `tools_by_server`，并把原始 RMCP 工具转换为协议层 `Tool`（转换失败的单项跳过）。
 async fn collect_mcp_server_status_snapshot_from_manager(
     mcp_connection_manager: &McpConnectionManager,
     auth_status_entries: HashMap<String, crate::mcp::auth::McpAuthStatusEntry>,

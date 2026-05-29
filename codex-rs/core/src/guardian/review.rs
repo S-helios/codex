@@ -1,3 +1,21 @@
+//! 【文件职责】Guardian 审查的主流程与对外入口：把一个审批请求送进受限审查
+//! 子会话裁决，将结果映射为 `ReviewDecision`，并负责埋点、警告事件、拒绝原因
+//! 暂存与「拒绝熔断」。
+//!
+//! 【架构位置】
+//!   层级：Agent 核心层 · 审批旁路
+//!   上游：审批处理处经 `routes_approval_to_guardian()` 判断后调用
+//!         `review_approval_request*()` / `spawn_approval_request_review()`
+//!   下游：`run_guardian_review_session()` 委托 review_session.rs 跑子会话；
+//!         prompt.rs 解析裁决；mod.rs 的熔断器与常量
+//!
+//! 【失败即拒】见 `run_guardian_review` 的契约注释——超时 / 会话失败 / 解析失败
+//!   一律阻断执行，但超时单独以 `ReviewDecision::TimedOut` 回传。
+//!
+//! 【阅读建议】先读对外入口 `review_approval_request()`，再读核心状态机
+//!   `run_guardian_review()`（事件发射 + 结果分支 + 熔断记录），
+//!   `run_guardian_review_session()` 负责挑模型/构 config 后委托子会话。
+
 use codex_analytics::GuardianApprovalRequestSource;
 use codex_analytics::GuardianReviewAnalyticsResult;
 use codex_analytics::GuardianReviewDecision;
@@ -44,6 +62,9 @@ use super::review_session::GuardianReviewSessionOutcome;
 use super::review_session::GuardianReviewSessionParams;
 use super::review_session::build_guardian_review_session_config;
 
+// 被拒后回灌给主 Agent 的行为约束文案：明确禁止「绕路 / 间接执行 / 规避策略」
+// 去达成同一被拒目标，只能改用实质更安全的方案或在告知风险后取得用户显式批准。
+// 与拒绝熔断配合，防止模型把一次拒绝当成「换个写法重试」的信号。
 const GUARDIAN_REJECTION_INSTRUCTIONS: &str = concat!(
     "The agent must not attempt to achieve the same outcome via workaround, ",
     "indirect execution, or policy circumvention. ",
@@ -52,16 +73,22 @@ const GUARDIAN_REJECTION_INSTRUCTIONS: &str = concat!(
     "Otherwise, stop and request user input.",
 );
 
+// 超时回灌文案：强调「超时 ≠ 不安全」，避免主 Agent 据此误判动作危险；
+// 允许重试一次或转而征询用户。对应 `ReviewDecision::TimedOut` 分支。
 const GUARDIAN_TIMEOUT_INSTRUCTIONS: &str = concat!(
     "The automatic permission approval review did not finish before its deadline. ",
     "Do not assume the action is unsafe based on the timeout alone. ",
     "You may retry once, or ask the user for guidance or explicit approval.",
 );
 
+// 为一次审查生成全局唯一 id，用于关联审查事件、暂存拒绝原因等。
 pub(crate) fn new_guardian_review_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// 取出（并从暂存 map 中移除）指定审查的拒绝原因，拼成回灌给主 Agent 的
+/// 提示文本。若找不到或理由为空，则用兜底文案；末尾附上行为约束指令。
+/// 副作用：会 `remove` 掉 `guardian_rejections` 中该 review_id 的记录（消费一次）。
 pub(crate) async fn guardian_rejection_message(session: &Session, review_id: &str) -> String {
     let rejection = session
         .services
@@ -83,16 +110,23 @@ pub(crate) async fn guardian_rejection_message(session: &Session, review_id: &st
     }
 }
 
+// 超时时回灌给主 Agent 的固定文案（见上面的 INSTRUCTIONS 常量）。
 pub(crate) fn guardian_timeout_message() -> String {
     GUARDIAN_TIMEOUT_INSTRUCTIONS.to_string()
 }
 
+/// 一次审查的内部结果：要么拿到完整裁决，要么是各类错误。
+/// 注意这是「子会话执行层」的结果，再由 `run_guardian_review` 翻译成对外的
+/// `ReviewDecision`（含 fail-closed 逻辑）。
 #[derive(Debug)]
 pub(super) enum GuardianReviewOutcome {
     Completed(GuardianAssessment),
     Error(GuardianReviewError),
 }
 
+/// 审查失败的细分原因。区分这些 case 是为了：① 埋点统计 failure_reason；
+/// ② 让 Timeout / Cancelled 走与「真实失败」不同的对外状态（超时不视作拒绝、
+/// 中止回传 Abort）。其余三类（构造提示/会话/解析失败）统一 fail closed 为拒绝。
 #[derive(Debug)]
 pub(super) enum GuardianReviewError {
     PromptBuild { message: String },
@@ -144,6 +178,10 @@ fn guardian_risk_level_str(level: GuardianRiskLevel) -> &'static str {
 /// Whether this turn should route allowed approval prompts through the guardian
 /// reviewer instead of surfacing them to the user. ARC may still block actions
 /// earlier in the flow.
+/// 判定本轮是否应把审批交给 Guardian 自动裁决（而非弹给用户）：仅当审批策略为
+/// `OnRequest` 或 `Granular`，且配置选定了 `AutoReview` 审查器时才走 Guardian。
+/// 注：ARC（access/approval rules）可能在更早阶段就拦掉动作，这里只决定「放行后
+/// 是否改走自动审查」这一岔路。
 pub(crate) fn routes_approval_to_guardian(turn: &TurnContext) -> bool {
     matches!(
         turn.approval_policy.value(),
@@ -151,6 +189,8 @@ pub(crate) fn routes_approval_to_guardian(turn: &TurnContext) -> bool {
     ) && turn.config.approvals_reviewer == ApprovalsReviewer::AutoReview
 }
 
+// 判断某个会话来源是否就是 Guardian 审查子会话（SubAgent 名为 "guardian"）。
+// 用于在通用会话逻辑中识别并特殊处理 Guardian 自身的会话。
 pub(crate) fn is_guardian_reviewer_source(
     session_source: &codex_protocol::protocol::SessionSource,
 ) -> bool {
@@ -182,6 +222,7 @@ fn track_guardian_review(
         .track_guardian_review(tracking, result, completed_at_ms);
 }
 
+// 向熔断器记录一次「非拒绝」结果（放行/中止/超时等），清零连续拒绝计数。
 async fn record_guardian_non_denial(session: &Arc<Session>, turn_id: &str) {
     session
         .services
@@ -191,6 +232,10 @@ async fn record_guardian_non_denial(session: &Arc<Session>, turn_id: &str) {
         .record_non_denial(turn_id);
 }
 
+/// 记录一次拒绝；若熔断器判定需中断本轮，则发一条用户可见的 GuardianWarning，
+/// 并异步中断该轮（`abort_turn_if_active`）。
+/// 副作用：发事件 + 可能 spawn 一个中断任务。
+/// 防御：若该轮的 turn_context 已不存在（轮已结束），则不再发警告 / 中断。
 async fn record_guardian_denial(session: &Arc<Session>, turn: &Arc<TurnContext>, turn_id: &str) {
     let action = session
         .services
@@ -243,6 +288,11 @@ pub(crate) async fn record_guardian_denial_for_test(
 /// This function always fails closed: timeouts, review-session failures, and
 /// parse failures all block execution, but timeouts are still surfaced to the
 /// caller as distinct from explicit guardian denials.
+/// 审查主状态机：构造审查上下文 → 发「进行中」事件 → 跑子会话拿裁决 →
+/// 按结果发「完成/超时/中止」事件、记埋点、写熔断器，最终返回 `ReviewDecision`。
+/// 失败即拒：任何错误都阻断执行；但「超时」回传 `TimedOut`、「中止」回传 `Abort`，
+/// 与模型明确 Deny 区分开。
+/// 副作用：多次 `send_event`、写 `guardian_rejections` 暂存、更新熔断器。
 async fn run_guardian_review(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
@@ -252,6 +302,7 @@ async fn run_guardian_review(
     approval_request_source: GuardianApprovalRequestSource,
     external_cancel: Option<CancellationToken>,
 ) -> ReviewDecision {
+    // Step 1：从请求中抽取追踪所需的标识与动作摘要，建立审查追踪上下文。
     let target_item_id = guardian_request_target_item_id(&request).map(str::to_string);
     let assessment_turn_id = guardian_request_turn_id(&request, &turn.sub_id).to_string();
     let action_summary = guardian_assessment_action(&request);
@@ -266,6 +317,7 @@ async fn run_guardian_review(
         GUARDIAN_REVIEW_TIMEOUT.as_millis() as u64,
     );
     let started_at_ms = review_tracking.started_at_ms.try_into().unwrap_or_default();
+    // Step 2：先广播一条「审查进行中」事件，让 UI 立刻显示审查已开始。
     session
         .send_event(
             turn.as_ref(),
@@ -285,6 +337,8 @@ async fn run_guardian_review(
         )
         .await;
 
+    // Step 3：若外部已取消，直接短路为 Abort——不必再花时间拉起子会话。
+    // 同样要补发终态事件、记埋点、并按「非拒绝」更新熔断器。
     if external_cancel
         .as_ref()
         .is_some_and(CancellationToken::is_cancelled)
@@ -327,6 +381,8 @@ async fn run_guardian_review(
 
     let schema = guardian_output_schema();
     let terminal_action = action_summary.clone();
+    // Step 4：拉起受限审查子会话跑模型，拿到内部结果与埋点数据。
+    // Box::pin 是因为该 future 体积很大（内含整套子会话状态机）。
     let (outcome, analytics_result) = Box::pin(run_guardian_review_session(
         session.clone(),
         turn.clone(),
@@ -338,6 +394,9 @@ async fn run_guardian_review(
     .await;
 
     let completed_at_ms = now_unix_timestamp_ms();
+    // Step 5：把子会话结果翻译成 (裁决, 是否计入熔断拒绝)。
+    // 超时 / 中止在此直接 return 对应的对外状态；三类「真失败」则 fail-closed
+    // 合成一个 Deny 裁决（但不计入熔断，因为不是模型的主动拒绝）继续往下走。
     let (assessment, count_denial_for_circuit_breaker) = match outcome {
         GuardianReviewOutcome::Completed(assessment) => {
             let approved = matches!(assessment.outcome, GuardianAssessmentOutcome::Allow);
@@ -516,6 +575,8 @@ async fn run_guardian_review(
     } else {
         GuardianAssessmentStatus::Denied
     };
+    // Step 6：暂存/清理拒绝原因。放行则清掉残留记录；拒绝则按 review_id 存入，
+    // 供主 Agent 后续通过 `guardian_rejection_message()` 取用并消费。
     {
         let mut rationales = session.services.guardian_rejections.lock().await;
         if approved {
@@ -547,6 +608,8 @@ async fn run_guardian_review(
         )
         .await;
 
+    // Step 7：更新熔断器。仅「模型主动 Deny」计入拒绝（可能触发中断本轮）；
+    // fail-closed 合成的拒绝按非拒绝处理，避免审查器自身故障误触发熔断。
     if count_denial_for_circuit_breaker {
         record_guardian_denial(&session, &turn, &assessment_turn_id).await;
     } else {
@@ -561,6 +624,7 @@ async fn run_guardian_review(
 }
 
 /// Public entrypoint for approval requests that should be reviewed by guardian.
+/// 主轮（MainTurn）审批的标准入口：以「无外部取消」方式跑一次审查并返回裁决。
 pub(crate) async fn review_approval_request(
     session: &Arc<Session>,
     turn: &Arc<TurnContext>,
@@ -582,6 +646,7 @@ pub(crate) async fn review_approval_request(
     .await
 }
 
+// 带外部取消令牌 + 可指定来源（如委派子 Agent）的入口，供需要中途取消的调用方使用。
 pub(crate) async fn review_approval_request_with_cancel(
     session: &Arc<Session>,
     turn: &Arc<TurnContext>,
@@ -603,6 +668,11 @@ pub(crate) async fn review_approval_request_with_cancel(
     .await
 }
 
+/// 在「独立 OS 线程 + 独立 current-thread runtime」上跑审查，立即返回一个
+/// oneshot 接收端供调用方异步等待裁决。
+/// 为何另起线程而非 `tokio::spawn`：调用点可能身处不同的 runtime 上下文，
+/// 用专属 runtime 隔离子会话的事件循环，避免与调用方的执行器相互阻塞。
+/// 失败即拒：若连 runtime 都建不起来，直接回传 `Denied`。
 pub(crate) fn spawn_approval_request_review(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
@@ -649,6 +719,19 @@ pub(crate) fn spawn_approval_request_review(
 /// context. It may still reuse the parent's managed-network allowlist for
 /// read-only checks, but it intentionally runs without inherited exec-policy
 /// rules.
+/// 在「上锁、可复用」的审查子会话中跑 Guardian。
+/// 关键约束（也是安全设计核心）：
+///   - 子会话锁死为只读沙箱、`approval_policy = never`、关闭非必要 Agent 特性，
+///     确保审查器本身不会改状态、也不会再触发新的审批（防递归）。
+///   - 复用策略：主干（trunk）空闲时后续审批续在同一会话，保持 prompt-cache key
+///     稳定（省 token）；主干忙时则从「最后提交的 rollout」临时 fork 一个一次性
+///     会话，让并行审批互不阻塞、也不污染缓存线程。
+///   - 主干会在「有效审查配置变化」时重建；未来若做压缩，必须把 Guardian 策略
+///     原样保留为顶层 developer 上下文。
+///   - 网络：可复用父会话的受管网络白名单做只读检查，但故意不继承 exec-policy。
+/// 本函数负责：挑选审查模型与推理强度 → 构造受限 config → 委托
+/// `GuardianReviewSessionManager::run_review` 跑会话 → 把会话产物解析为
+/// `GuardianReviewOutcome`。
 pub(super) async fn run_guardian_review_session(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
@@ -682,6 +765,9 @@ pub(super) async fn run_guardian_review_session(
             fallback
         }
     };
+    // 选审查模型：优先用 provider 指定的「审批审查专用模型」；找不到则回退到
+    // 当前轮所用模型。推理强度尽量取 Low（审查任务相对轻量、追求快），不支持
+    // 时再退回模型默认值。
     let preferred_model_id = turn.provider.approval_review_preferred_model();
     let preferred_model = available_models
         .iter()
@@ -741,6 +827,9 @@ pub(super) async fn run_guardian_review_session(
     )
     .await;
 
+    // 把子会话产物归一为 `GuardianReviewOutcome`：成功完成则解析最后一条
+    // assistant 消息为裁决 JSON；缺消息 / 解析失败 / 各类会话错误分别映射为
+    // 对应的 `GuardianReviewError`，交由上层 fail-closed 处理。
     match session_outcome {
         GuardianReviewSessionOutcome::Completed(Ok(last_agent_message)) => match last_agent_message
         {

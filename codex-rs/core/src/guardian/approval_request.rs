@@ -1,3 +1,17 @@
+//! 【文件职责】定义「待 Guardian 审查的审批请求」统一模型 `GuardianApprovalRequest`，
+//! 并提供三类派生：① 序列化为发给模型的「动作 JSON」；② 转成审查事件用的
+//! `GuardianAssessmentAction`；③ 转成埋点用的 `GuardianReviewedAction`。
+//!
+//! 【架构位置】
+//!   层级：Agent 核心层 · 审批旁路（Guardian 子系统数据建模层）
+//!   上游：各工具/审批处把具体审批（shell/exec/applyPatch/网络/MCP/请求权限）
+//!         构造为本枚举
+//!   下游：prompt.rs 取「动作 JSON」拼进提示；review.rs / metrics.rs 取另外两种派生
+//!
+//! 【阅读建议】先看枚举 `GuardianApprovalRequest` 列举的审批种类，再看三个 `guardian_*`
+//!   转换函数（按 variant 一一映射）；`truncate_guardian_action_value` 与
+//!   `format_guardian_action_pretty` 负责把动作 JSON 截断到预算并美化输出。
+
 use std::path::Path;
 
 use codex_analytics::GuardianReviewedAction;
@@ -13,8 +27,12 @@ use serde_json::Value;
 use super::GUARDIAN_MAX_ACTION_STRING_TOKENS;
 use super::prompt::guardian_truncate_text;
 
+/// 待 Guardian 审查的审批请求，按工具类型分 variant。每个 variant 携带审查所需的
+/// 完整上下文（命令/路径/补丁/网络目标/MCP 调用参数等），由对应工具在请求审批时构造。
+/// `id` 多为目标项 item id，用于回写审查事件；网络与请求权限两类另带显式 `turn_id`。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum GuardianApprovalRequest {
+    // 经 shell 工具执行的命令。
     Shell {
         id: String,
         command: Vec<String>,
@@ -23,6 +41,7 @@ pub(crate) enum GuardianApprovalRequest {
         additional_permissions: Option<AdditionalPermissionProfile>,
         justification: Option<String>,
     },
+    // 经统一执行工具（unified exec）执行的命令；额外带 tty 标记。
     ExecCommand {
         id: String,
         command: Vec<String>,
@@ -32,6 +51,7 @@ pub(crate) enum GuardianApprovalRequest {
         justification: Option<String>,
         tty: bool,
     },
+    // 直接 execve（仅 Unix）：以 program + argv 形式发起，source 区分发起工具。
     #[cfg(unix)]
     Execve {
         id: String,
@@ -41,12 +61,15 @@ pub(crate) enum GuardianApprovalRequest {
         cwd: AbsolutePathBuf,
         additional_permissions: Option<AdditionalPermissionProfile>,
     },
+    // 应用补丁：审查关注写入的文件集合与补丁内容本身。
     ApplyPatch {
         id: String,
         cwd: AbsolutePathBuf,
         files: Vec<AbsolutePathBuf>,
         patch: String,
     },
+    // 网络访问：带独立 turn_id；`trigger` 记录触发该网络访问的命令（若有），
+    // 用于让 Guardian 判断网络访问是否为某授权命令的合理后果（见 prompt.rs）。
     NetworkAccess {
         id: String,
         turn_id: String,
@@ -56,6 +79,7 @@ pub(crate) enum GuardianApprovalRequest {
         port: u16,
         trigger: Option<GuardianNetworkAccessTrigger>,
     },
+    // MCP 工具调用：携带 server / 工具名 / 参数及连接器与工具的元信息。
     McpToolCall {
         id: String,
         server: String,
@@ -68,6 +92,7 @@ pub(crate) enum GuardianApprovalRequest {
         tool_description: Option<String>,
         annotations: Option<GuardianMcpAnnotations>,
     },
+    // 模型主动请求提升权限：带独立 turn_id、可选理由与目标权限档。
     RequestPermissions {
         id: String,
         turn_id: String,
@@ -76,6 +101,9 @@ pub(crate) enum GuardianApprovalRequest {
     },
 }
 
+/// 网络访问的「触发动作」：记录是哪条命令引发了这次网络访问，连同其沙箱权限等。
+/// 让 Guardian 把审查重心放在「触发命令是否获授权且合规」上，而非要求用户对每个
+/// 具体网络连接单独授权（见 prompt.rs 中针对 trigger 的提示文案）。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GuardianNetworkAccessTrigger {
@@ -92,6 +120,8 @@ pub(crate) struct GuardianNetworkAccessTrigger {
     pub(crate) tty: Option<bool>,
 }
 
+/// MCP 工具自带的语义注解（来自 MCP 协议），作为审查的风险线索：
+/// 是否破坏性 / 是否开放世界 / 是否只读。均为可选，缺省时不序列化。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct GuardianMcpAnnotations {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -213,6 +243,9 @@ fn guardian_command_source_tool_name(source: GuardianCommandSource) -> &'static 
     }
 }
 
+/// 递归地把动作 JSON 里的每个字符串叶子截断到 `GUARDIAN_MAX_ACTION_STRING_TOKENS`，
+/// 返回 (截断后的值, 是否发生过截断)。对象会先按键排序再处理——保证序列化结果
+/// 稳定（便于 prompt-cache 命中与测试快照一致）。
 fn truncate_guardian_action_value(value: Value) -> (Value, bool) {
     match value {
         Value::String(text) => {
@@ -250,12 +283,16 @@ fn truncate_guardian_action_value(value: Value) -> (Value, bool) {
     }
 }
 
+/// 格式化后的动作文本及「是否被截断」标志，供拼提示与埋点使用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FormattedGuardianAction {
     pub(crate) text: String,
     pub(crate) truncated: bool,
 }
 
+/// 把审批请求序列化为发给审查模型的「动作 JSON」（未截断）。
+/// 每个 variant 映射到一个带 `tool` 字段的扁平结构；shell 与 exec 命令复用
+/// `serialize_command_guardian_action`（仅 tty 取值不同）。
 pub(crate) fn guardian_approval_request_to_json(
     action: &GuardianApprovalRequest,
 ) -> serde_json::Result<Value> {
@@ -372,6 +409,9 @@ pub(crate) fn guardian_approval_request_to_json(
     }
 }
 
+/// 把审批请求转成审查事件所用的 `GuardianAssessmentAction`（动作摘要）。
+/// 与上面 JSON 版相比更精简，命令会经 `shlex_join` 拼成单行字符串，便于在
+/// 审查事件 / UI 中展示。
 pub(crate) fn guardian_assessment_action(
     action: &GuardianApprovalRequest,
 ) -> GuardianAssessmentAction {
@@ -440,6 +480,8 @@ pub(crate) fn guardian_assessment_action(
     }
 }
 
+/// 把审批请求转成埋点用的 `GuardianReviewedAction`（只保留分类维度，不含敏感
+/// 的命令/补丁内容），供 metrics.rs 打 `action` 等标签。
 pub(crate) fn guardian_reviewed_action(
     request: &GuardianApprovalRequest,
 ) -> GuardianReviewedAction {
@@ -500,6 +542,8 @@ pub(crate) fn guardian_reviewed_action(
     }
 }
 
+// 取请求关联的「目标项 item id」，用于把审查结果回写到对应历史项。
+// NetworkAccess 没有这样的目标项（它不对应单个工具调用项），故返回 None。
 pub(crate) fn guardian_request_target_item_id(request: &GuardianApprovalRequest) -> Option<&str> {
     match request {
         GuardianApprovalRequest::Shell { id, .. }
@@ -513,6 +557,8 @@ pub(crate) fn guardian_request_target_item_id(request: &GuardianApprovalRequest)
     }
 }
 
+// 取请求归属的轮 id：NetworkAccess 与 RequestPermissions 自带显式 turn_id（它们
+// 可能脱离当前轮上下文产生），其余类型回退到调用方传入的 default_turn_id。
 pub(crate) fn guardian_request_turn_id<'a>(
     request: &'a GuardianApprovalRequest,
     default_turn_id: &'a str,
@@ -529,6 +575,8 @@ pub(crate) fn guardian_request_turn_id<'a>(
     }
 }
 
+/// 生成最终拼进提示词的动作文本：序列化 → 截断到预算 → 美化（pretty JSON）。
+/// 返回的 `truncated` 标志会一路带到埋点（`reviewed_action_truncated`）。
 pub(crate) fn format_guardian_action_pretty(
     action: &GuardianApprovalRequest,
 ) -> serde_json::Result<FormattedGuardianAction> {

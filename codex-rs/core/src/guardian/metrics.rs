@@ -1,3 +1,14 @@
+//! 【文件职责】把一次 Guardian 审查的结果发成 OpenTelemetry 指标：计数、时延、
+//! 首 token 时延、token 用量直方图，并附上一组描述本次审查的标签维度。
+//!
+//! 【架构位置】
+//!   层级：Agent 核心层 · 审批旁路（Guardian 观测埋点）
+//!   上游：review.rs 的 `track_guardian_review()` 调用 `emit_guardian_review_metrics()`
+//!   下游：codex_otel 的 `SessionTelemetry`（counter/histogram/record_duration）
+//!
+//! 【阅读建议】只需看顶部三个 `emit_*` 函数即可；下方一长串 `*_tag()` 都是把枚举
+//!   映射成稳定的指标标签字符串，逐个自解释、按需略读。
+
 use std::time::Duration;
 
 use codex_analytics::GuardianApprovalRequestSource;
@@ -18,6 +29,8 @@ use codex_protocol::protocol::GuardianRiskLevel;
 use codex_protocol::protocol::GuardianUserAuthorization;
 use codex_protocol::protocol::TokenUsage;
 
+/// 发射一次审查的全部指标：计数 +1、记录完成时延；若有则记首 token 时延与
+/// token 用量直方图。所有指标共用同一组标签维度（见 `guardian_review_metric_tags`）。
 pub(crate) fn emit_guardian_review_metrics(
     session_telemetry: &SessionTelemetry,
     result: &GuardianReviewAnalyticsResult,
@@ -51,6 +64,8 @@ pub(crate) fn emit_guardian_review_metrics(
     }
 }
 
+// 把一次审查的 token 用量按类型（total/input/cached_input/...）逐项打成直方图，
+// 每项在基础标签上再追加一个 `token_type` 维度以便分类聚合。负值用 0 兜底。
 fn emit_guardian_token_usage_histograms(
     session_telemetry: &SessionTelemetry,
     token_usage: &TokenUsage,
@@ -77,6 +92,9 @@ fn emit_guardian_token_usage_histograms(
     }
 }
 
+// 组装本次审查的标签维度集合（决策 / 终态 / 失败原因 / 来源 / 动作类型 / 会话种类
+// / 是否带先前上下文 / 是否截断 / 风险 / 授权 / 结论 / 模型 / 推理强度）。
+// 模型与推理强度经 `sanitize_metric_tag_value` 清洗，缺省值统一记为 "none"。
 fn guardian_review_metric_tags(
     result: &GuardianReviewAnalyticsResult,
     approval_request_source: GuardianApprovalRequestSource,

@@ -1,3 +1,29 @@
+//! 【文件职责】MCP 工具调用在 core 侧的业务编排主入口。模型发起一个 MCP 工具
+//! 调用后，最终落到本文件的 `handle_mcp_tool_call`，由它完成完整链路：
+//! 解析参数 → 查元数据 → 定审批模式 → 发 started 事件 → 请求审批 → 执行 →
+//! 发 completed 事件 → 上报指标，返回 `HandledMcpToolCall`。
+//!
+//! 审批是这里最复杂、最易出 bug 的部分（`maybe_request_mcp_tool_approval` 是一棵
+//! 多层决策树），围绕它还有一组「记住决策」的逻辑（会话级 / 持久化 / Guardian
+//! 委托）和审批提示/引导（elicitation）的构造与解析。
+//!
+//! 【架构位置】
+//!   层级：Agent 核心层（MCP 客户端方向，工具调用编排）
+//!   上游：工具路由（模型 tool call 分派到 MCP 工具时调 `handle_mcp_tool_call`）
+//!   下游：`session/mcp.rs`（`call_tool` / `request_mcp_server_elicitation`）、
+//!         `guardian`（审批委托）、`connectors`（codex_apps 策略）、config 持久化
+//!
+//! 【数据流】tool call(server, tool, arguments)
+//!           → 审批决策 → [Accept] Session::call_tool → server → 结果
+//!           → 清洗/截断 → completed 事件 + 回喂模型的 `CallToolResult`
+//!
+//! 【阅读建议】先读 `handle_mcp_tool_call`（主线），它调用的两个核心是
+//!   `maybe_request_mcp_tool_approval`（审批决策树）和 `handle_approved_mcp_tool_call`
+//!   （实际执行）。审批「记住」相关看 `apply_mcp_tool_approval_decision` /
+//!   `maybe_persist_mcp_tool_approval`。其余 `build_*` / `parse_*` / `persist_*`
+//!   是审批提示构造、应答解析、config 写入的辅助，按需查阅即可。
+//!   对照 learn_docs/4_工具与多Agent/19_mcp_integration.md §3.4、§5、§7。
+
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -104,6 +130,15 @@ const MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES: usize = DEFAULT_OUTPUT_BYTES_CAP;
 
 /// Handles the specified tool call and dispatches the appropriate MCP tool-call
 /// item lifecycle events to the `Session`.
+/// MCP 工具调用的总入口：完成「解析 → 查元数据 → 定审批 → started 事件 →
+/// 审批 → 执行 → completed 事件 → 指标」全链路，并向 `Session` 发出对应的
+/// 工具调用生命周期事件（started/completed/skip）。
+///
+/// @returns - `HandledMcpToolCall`：回喂模型的 `CallToolResult` + 实际入参
+///            `tool_input`（可能被重写过，如 OpenAI 文件上传）。
+///
+/// 副作用：发会话事件、上报指标，并可能向用户请求审批/引导。
+/// 异常：参数解析失败、被禁用、被拒绝等都不抛错，而是返回承载错误的结果。
 pub(crate) async fn handle_mcp_tool_call(
     sess: Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -115,6 +150,8 @@ pub(crate) async fn handle_mcp_tool_call(
 ) -> HandledMcpToolCall {
     // Parse the `arguments` as JSON. An empty string is OK, but invalid JSON
     // is not.
+    // Step 1：把 `arguments` 解析为 JSON。空串视作「无参数」（None）合法；
+    // 非法 JSON 直接短路返回错误结果（不发起调用）。
     let arguments_value = if arguments.trim().is_empty() {
         None
     } else {
@@ -136,6 +173,8 @@ pub(crate) async fn handle_mcp_tool_call(
         arguments: arguments_value.clone(),
     };
 
+    // Step 2：聚合该工具的元数据（注释/连接器/插件/文件参数等），供审批提示、
+    // 埋点与事件项使用。
     let metadata =
         lookup_mcp_tool_metadata(sess.as_ref(), turn_context.as_ref(), &server, &tool_name).await;
     let item_metadata = McpToolCallItemMetadata {
@@ -146,6 +185,8 @@ pub(crate) async fn handle_mcp_tool_call(
             .as_ref()
             .and_then(|metadata| metadata.plugin_id.clone()),
     };
+    // Step 3：确定审批模式。codex_apps 工具用连接器侧的 app 策略（含启用开关），
+    // 其它自定义 MCP 用用户在 config/插件里配的 `custom_mcp_tool_approval_mode`。
     let app_tool_policy = if server == CODEX_APPS_MCP_SERVER_NAME {
         connectors::app_tool_policy(
             &turn_context.config,
@@ -170,6 +211,8 @@ pub(crate) async fn handle_mcp_tool_call(
             .await
     };
 
+    // codex_apps 工具若被配置禁用，直接跳过（发 skip 事件 + 计数）并返回，
+    // 不进入审批/执行。
     if server == CODEX_APPS_MCP_SERVER_NAME && !app_tool_policy.enabled {
         let result = notify_mcp_tool_call_skip(
             sess.as_ref(),
@@ -200,6 +243,7 @@ pub(crate) async fn handle_mcp_tool_call(
         .as_ref()
         .and_then(|metadata| metadata.connector_name.clone());
 
+    // Step 4：发 started 事件，UI 立即出现「工具调用进行中」。
     notify_mcp_tool_call_started(
         sess.as_ref(),
         turn_context.as_ref(),
@@ -209,6 +253,8 @@ pub(crate) async fn handle_mcp_tool_call(
     )
     .await;
 
+    // Step 5：请求审批。返回 `None` 表示无需审批（直接走最后的执行分支）；
+    // 返回 `Some(决策)` 则按决策映射：接受类 → 执行；拒绝/取消 → 发 skip 事件。
     if let Some(decision) = maybe_request_mcp_tool_approval(
         &sess,
         turn_context,
@@ -279,6 +325,7 @@ pub(crate) async fn handle_mcp_tool_call(
         };
     }
 
+    // Step 6：审批返回 None（无需审批）→ 直接执行。
     handle_approved_mcp_tool_call(
         sess.as_ref(),
         turn_context.as_ref(),
@@ -290,17 +337,27 @@ pub(crate) async fn handle_mcp_tool_call(
     .await
 }
 
+/// `handle_mcp_tool_call` 的返回值。`result` 回喂模型；`tool_input` 是工具实际
+/// 收到的入参（重写后），与原始 `arguments` 可能不同（如 OpenAI 文件上传重写）。
 pub(crate) struct HandledMcpToolCall {
     pub(crate) result: CallToolResult,
     pub(crate) tool_input: JsonValue,
 }
 
+/// 写入工具调用事件项（`McpToolCallItem`）的附加字段：app UI 资源 URI 与来源
+/// 插件 id。与审批用的 `McpToolApprovalMetadata` 分开，只携带事件展示所需信息。
 #[derive(Clone)]
 struct McpToolCallItemMetadata {
     mcp_app_resource_uri: Option<String>,
     plugin_id: Option<String>,
 }
 
+/// 审批通过后的实际执行路径。负责：必要的参数重写（OpenAI 文件上传）、构造
+/// request meta、调用工具、记录耗时、发 completed 事件、上报指标与埋点。
+/// 全程包在一个 tracing span 里（`mcp.tools.call`）以便观测。
+///
+/// 副作用：发 completed 事件、上报指标/埋点；可能标记线程记忆被污染、触发
+///   codex_apps 鉴权引导。错误以 `CallToolResult` 形式回喂模型，不向上抛。
 async fn handle_approved_mcp_tool_call(
     sess: &Session,
     turn_context: &TurnContext,
@@ -310,6 +367,7 @@ async fn handle_approved_mcp_tool_call(
     item_metadata: McpToolCallItemMetadata,
 ) -> HandledMcpToolCall {
     let server = invocation.server.clone();
+    // 若该 server 会污染记忆且配置要求，标记本线程「记忆模式被外部上下文污染」。
     maybe_mark_thread_memory_mode_polluted(sess, turn_context, &server).await;
     let tool_name = invocation.tool.clone();
     let arguments_value = invocation.arguments.clone();
@@ -324,6 +382,8 @@ async fn handle_approved_mcp_tool_call(
         .map(str::to_string);
 
     let start = Instant::now();
+    // 按需把入参里的文件参数重写为 OpenAI 文件引用（仅 codex_apps 声明了文件
+    // 参数时生效）。重写失败时 `tool_input` 回退到原始参数。
     let rewrite = rewrite_mcp_tool_arguments_for_openai_files(
         sess,
         turn_context,
@@ -337,6 +397,8 @@ async fn handle_approved_mcp_tool_call(
             .clone()
             .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
     };
+    // 构造执行 future 并用 tracing span 包裹（span 字段含 server/tool/连接器
+    // /传输方式等），便于分布式追踪。`rewrite?` 把重写错误并入结果。
     let result = async {
         let rewritten_arguments = rewrite?;
         let request_meta =
@@ -544,6 +606,9 @@ fn truncate_str_to_char_boundary(value: &str, max_chars: usize) -> &str {
     }
 }
 
+/// 真正执行一次 MCP 工具调用：补齐 request meta（线程 id、沙箱状态、调用追踪）→
+/// 经 `Session::call_tool` 路由到对应 server → 对结果做模型适配清洗 → 必要时
+/// 触发 codex_apps 鉴权引导。错误统一转成 `Err(String)`。
 async fn execute_mcp_tool_call(
     sess: &Session,
     turn_context: &TurnContext,
@@ -553,6 +618,7 @@ async fn execute_mcp_tool_call(
     metadata: Option<&McpToolApprovalMetadata>,
     request_meta: Option<JsonValue>,
 ) -> Result<CallToolResult, String> {
+    // 给 request meta 注入线程 id；若 server 声明支持沙箱状态能力，再补沙箱状态。
     let request_meta =
         with_mcp_tool_call_thread_id_meta(request_meta, &sess.conversation_id.to_string());
     let request_meta = augment_mcp_tool_request_meta_with_sandbox_state(
@@ -563,6 +629,7 @@ async fn execute_mcp_tool_call(
     )
     .await
     .map_err(|e| format!("failed to build MCP tool request metadata: {e:#}"))?;
+    // 开一条 rollout 调用追踪，把追踪信息也并入 request meta，再发起调用。
     let mcp_call_trace = sess
         .services
         .rollout_thread_trace
@@ -577,6 +644,7 @@ async fn execute_mcp_tool_call(
         )
         .await
         .map_err(|e| format!("tool call error: {e:?}"))?;
+    // 按模型能力清洗结果（不支持图片输入时把 image 块替换为占位文本）。
     let result = sanitize_mcp_tool_result_for_model(
         turn_context
             .model_info
@@ -595,6 +663,10 @@ async fn execute_mcp_tool_call(
     .await)
 }
 
+/// codex_apps 工具调用返回鉴权失败时，按需向用户发起一次「去 URL 授权」引导。
+/// 只在 host 端 codex_apps server、启用 `AuthElicitation` 特性、且审批策略允许
+/// 引导时触发；用户接受后刷新 codex_apps 工具缓存并把结果标记为「已完成鉴权」。
+/// 任一前置不满足或用户未接受，原样返回结果。
 async fn maybe_request_codex_apps_auth_elicitation(
     sess: &Session,
     turn_context: &TurnContext,
@@ -603,6 +675,7 @@ async fn maybe_request_codex_apps_auth_elicitation(
     metadata: Option<&McpToolApprovalMetadata>,
     result: CallToolResult,
 ) -> CallToolResult {
+    // 非 host 端 codex_apps server 不涉及该鉴权引导。
     if !sess
         .services
         .mcp_connection_manager
@@ -771,6 +844,8 @@ async fn maybe_mark_thread_memory_mode_polluted(
     .await;
 }
 
+// 按模型能力清洗回喂给模型的结果：模型不支持图片输入时，把结果里的 image 内容
+// 块替换为说明性文本，避免给模型发它无法处理的图片。支持图片则原样返回。
 fn sanitize_mcp_tool_result_for_model(
     supports_image_input: bool,
     result: Result<CallToolResult, String>,
@@ -802,6 +877,8 @@ fn sanitize_mcp_tool_result_for_model(
     })
 }
 
+// 为「事件/rollout 持久化」截断工具结果。回喂模型的结果不走这里，截断只作用于
+// 事件副本：超大结果会被 rollout 长期存储，故超过字节上限时折叠成一段文本预览。
 fn truncate_mcp_tool_result_for_event(
     result: &Result<CallToolResult, String>,
 ) -> Result<CallToolResult, String> {
@@ -809,6 +886,8 @@ fn truncate_mcp_tool_result_for_event(
         Ok(call_tool_result) => {
             // The app-server rebuilds `ThreadItem::McpToolCall` from this item,
             // so avoid persisting multi-megabyte results in rollout storage.
+            // app-server 会用这个事件项重建 `ThreadItem::McpToolCall`，因此不能
+            // 把数 MB 的结果原样写进 rollout 存储。
             let Ok(serialized) = serde_json::to_string(call_tool_result) else {
                 return Ok(call_tool_result.clone());
             };
@@ -957,6 +1036,10 @@ async fn maybe_track_codex_app_used(
     );
 }
 
+/// 审批决策。三种「接受」对应不同的记忆范围：`Accept` 只此一次；
+/// `AcceptForSession` 记住到本会话；`AcceptAndRemember` 持久化到 config。
+/// `Decline` 带可选拒绝消息，`Cancel` 表示用户取消。落地由
+/// `apply_mcp_tool_approval_decision` 处理。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum McpToolApprovalDecision {
     Accept,
@@ -966,6 +1049,9 @@ enum McpToolApprovalDecision {
     Cancel,
 }
 
+/// 一个 MCP 工具的全部审批/展示元数据，由 `lookup_mcp_tool_metadata` 聚合。
+/// 喂给审批提示、Guardian 复核请求、埋点。codex_apps 专属字段
+/// （`codex_apps_meta` / `openai_file_input_params`）对自定义 MCP 为 `None`。
 pub(crate) struct McpToolApprovalMetadata {
     annotations: Option<ToolAnnotations>,
     connector_id: Option<String>,
@@ -1134,6 +1220,8 @@ pub(crate) fn is_mcp_tool_approval_question_id(question_id: &str) -> bool {
         .is_some_and(|suffix| suffix.starts_with('_'))
 }
 
+/// 审批记忆/持久化的缓存键。codex_apps 工具必须带 `connector_id` 才能构成完整
+/// 键（否则无法记住，见 `session_mcp_tool_approval_key`）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct McpToolApprovalKey {
     server: String,
@@ -1153,6 +1241,20 @@ fn mcp_tool_approval_prompt_options(
     }
 }
 
+/// MCP 工具调用的审批决策树。返回 `None` = 无需询问、直接放行；返回 `Some(决策)`
+/// = 已得到（自动或用户的）决策。按以下顺序逐层判断（任一命中即返回）：
+///   ① 自动放行（审批策略 + profile + 工具模式判定无需问）→ None
+///   ② 工具本身不要求审批 且 模式不是 Prompt → None
+///   ③ 会话级已记住 → Accept
+///   ④ permission_request 钩子：Allow→Accept / Deny→Decline / None→继续
+///   ⑤ 路由到 Guardian：委托 Guardian 复核
+///   ⑥ ToolCallMcpElicitation 特性开 → 走 MCP elicitation 提示
+///   ⑦ 降级到 RequestUserInput（兼容旧路径）
+///
+/// 关键：⑤⑥⑦ 三条返回前都调 `apply_mcp_tool_approval_decision` 落地决策，
+/// 这是「记住」的唯一落点——漏掉它「本会话内允许」就不生效。
+///
+/// 副作用：可能调钩子、向 Guardian/用户发起审批，并把决策写入记忆/config。
 async fn maybe_request_mcp_tool_approval(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -1162,6 +1264,7 @@ async fn maybe_request_mcp_tool_approval(
     metadata: Option<&McpToolApprovalMetadata>,
     approval_mode: AppToolApproval,
 ) -> Option<McpToolApprovalDecision> {
+    // ① 审批策略/profile/工具模式联合判定为「自动放行」→ 不问。
     if mcp_permission_prompt_is_auto_approved(
         turn_context.approval_policy.value(),
         &turn_context.permission_profile(),
@@ -1173,12 +1276,14 @@ async fn maybe_request_mcp_tool_approval(
         return None;
     }
 
+    // ② 工具注释不要求审批（非破坏性/只读等）且模式不是 Prompt → 不问。
     let annotations = metadata.and_then(|metadata| metadata.annotations.as_ref());
     let approval_required = requires_mcp_tool_approval(annotations);
     if !approval_required && approval_mode != AppToolApproval::Prompt {
         return None;
     }
 
+    // ③ 命中会话级已记住的批准（仅 Auto 模式有 key）→ 直接 Accept，不再问。
     let session_approval_key = session_mcp_tool_approval_key(invocation, metadata, approval_mode);
     let persistent_approval_key =
         persistent_mcp_tool_approval_key(invocation, metadata, approval_mode);
@@ -1188,6 +1293,7 @@ async fn maybe_request_mcp_tool_approval(
         return Some(McpToolApprovalDecision::Accept);
     }
 
+    // ④ 跑外部 permission 钩子，钩子可直接 Allow/Deny，None 则继续后续判断。
     match run_permission_request_hooks(
         sess,
         turn_context,
@@ -1218,6 +1324,7 @@ async fn maybe_request_mcp_tool_approval(
         .features
         .enabled(Feature::ToolCallMcpElicitation);
 
+    // ⑤ 路由到 Guardian：委托 Guardian 模型复核，翻译其决策并落地后返回。
     if routes_approval_to_guardian(turn_context) {
         let review_id = new_guardian_review_id();
         let decision = review_approval_request(
@@ -1245,6 +1352,8 @@ async fn maybe_request_mcp_tool_approval(
         persistent_approval_key.as_ref(),
         tool_call_mcp_elicitation_enabled,
     );
+    // ⑥/⑦ 共用：先准备审批提示。`render_*` 按 (server, connector_id, tool_title)
+    // 三元组尝试匹配内置模板让提示更友好，未命中则回退到通用展示参数与问句。
     let question_id = format!("{MCP_TOOL_APPROVAL_QUESTION_ID_PREFIX}_{call_id}");
     let rendered_template = render_mcp_tool_approval_template(
         &invocation.server,
@@ -1267,6 +1376,8 @@ async fn maybe_request_mcp_tool_approval(
             .as_ref()
             .map(|rendered_template| rendered_template.question.as_str()),
     );
+    // ⑥ 特性开启：把审批做成一次 MCP elicitation（带「记住」选项的表单），
+    // 解析应答 → 按模式归一化 → 落地 → 返回。
     if tool_call_mcp_elicitation_enabled {
         let request_id = rmcp::model::RequestId::String(
             format!("{MCP_TOOL_APPROVAL_QUESTION_ID_PREFIX}_{call_id}").into(),
@@ -1307,6 +1418,7 @@ async fn maybe_request_mcp_tool_approval(
         return Some(decision);
     }
 
+    // ⑦ 兼容旧路径：用通用的 RequestUserInput 提问，解析应答 → 归一化 → 落地。
     let args = RequestUserInputArgs {
         questions: vec![question],
     };
@@ -1328,6 +1440,10 @@ async fn maybe_request_mcp_tool_approval(
     Some(decision)
 }
 
+/// 计算会话级审批缓存键。返回 `None` 即「此调用无法被记住」，影响提示里是否
+/// 出现「本会话内允许」选项。两个早退很关键（见 19_mcp_integration §5.3 / §9）：
+///   - 仅 `AppToolApproval::Auto` 模式能记住，其它模式直接 `None`。
+///   - codex_apps server 但缺 `connector_id` 时无法记住（键不完整）。
 fn session_mcp_tool_approval_key(
     invocation: &McpInvocation,
     metadata: Option<&McpToolApprovalMetadata>,
@@ -1406,6 +1522,9 @@ async fn mcp_tool_approval_decision_from_guardian(
     clippy::await_holding_invalid_type,
     reason = "MCP approval metadata reads through the session-owned manager guard"
 )]
+/// 从连接管理器聚合某工具的全部审批/展示元数据。取管理器读锁、列出全部工具、
+/// 按 (server, tool_name) 找到目标后组装 `McpToolApprovalMetadata`；codex_apps
+/// 工具会额外查连接器描述。工具不存在则返回 `None`。
 pub(crate) async fn lookup_mcp_tool_metadata(
     sess: &Session,
     turn_context: &TurnContext,
@@ -1461,6 +1580,8 @@ pub(crate) async fn lookup_mcp_tool_metadata(
             .and_then(serde_json::Value::as_object)
             .cloned(),
         // Disallow custom MCPs from uploading files via fileParams.
+        // 禁止自定义 MCP 通过 fileParams 上传文件——文件上传是 codex_apps 专属
+        // 能力（见 `openai_file_input_params_for_server`）。
         openai_file_input_params: openai_file_input_params_for_server(
             server,
             tool_info.tool.meta.as_deref(),
@@ -1740,6 +1861,10 @@ fn build_mcp_tool_approval_display_params(
     Some(display_params)
 }
 
+/// 把 elicitation 表单应答解析成审批决策。优先读 meta 里的 persist 字段区分
+/// 「本会话 / 以后都允许」；否则回退到按选项标签解析（复用旧的
+/// `parse_mcp_tool_approval_response`），其中「Accept 动作 + 解析出 Cancel」
+/// 视为普通 Accept。无应答（通道关闭）= Cancel。
 fn parse_mcp_tool_approval_elicitation_response(
     response: Option<ElicitationResponse>,
     question_id: &str,
@@ -1844,6 +1969,8 @@ fn parse_mcp_tool_approval_response(
     }
 }
 
+// Prompt 模式下没有「记住」语义，故把误传回的 AcceptForSession/AcceptAndRemember
+// 收敛为一次性 Accept，避免被错误持久化。
 fn normalize_approval_decision_for_mode(
     decision: McpToolApprovalDecision,
     approval_mode: AppToolApproval,
@@ -1860,6 +1987,7 @@ fn normalize_approval_decision_for_mode(
     }
 }
 
+// 查会话级记忆是否命中。只认 `ApprovedForSession`——其它决策不视为已记住。
 async fn mcp_tool_approval_is_remembered(sess: &Session, key: &McpToolApprovalKey) -> bool {
     let store = sess.services.tool_approvals.lock().await;
     matches!(store.get(key), Some(ReviewDecision::ApprovedForSession))
@@ -1870,6 +1998,11 @@ async fn remember_mcp_tool_approval(sess: &Session, key: McpToolApprovalKey) {
     store.put(key, ReviewDecision::ApprovedForSession);
 }
 
+/// 把审批决策落地（「记住」的唯一落点）。
+/// - `AcceptForSession` → 写会话级记忆（有 session key 时）。
+/// - `AcceptAndRemember` → 尝试持久化到 config；缺 persistent key 时降级为
+///   会话级记忆。
+/// - `Accept` / `Decline` / `Cancel` → 不记。
 async fn apply_mcp_tool_approval_decision(
     sess: &Session,
     turn_context: &TurnContext,
@@ -1896,6 +2029,10 @@ async fn apply_mcp_tool_approval_decision(
     }
 }
 
+/// 把审批持久化到 config（写 `approval_mode = "approve"`）。codex_apps 走
+/// `persist_codex_app_tool_approval`（需 connector_id，缺则降级会话级），普通
+/// MCP 走 `persist_non_app_mcp_tool_approval`。持久化失败也降级为会话级记忆，
+/// 不让本次批准白点。成功后 `reload_user_config_layer` 让新配置即时生效。
 async fn maybe_persist_mcp_tool_approval(
     sess: &Session,
     turn_context: &TurnContext,
@@ -1904,6 +2041,7 @@ async fn maybe_persist_mcp_tool_approval(
     let tool_name = key.tool_name.clone();
 
     let persist_result = if key.server == CODEX_APPS_MCP_SERVER_NAME {
+        // codex_apps 缺 connector_id 无法写 config 路径 → 退回会话级记忆。
         let Some(connector_id) = key.connector_id.clone() else {
             remember_mcp_tool_approval(sess, key).await;
             return;
@@ -2081,6 +2219,9 @@ fn project_mcp_tool_approval_config_folder(
         })
 }
 
+/// 仅凭工具注释（hint）判断是否「需要审批」。优先级：明确破坏性 → 必须审批；
+/// 明确只读 → 不需；否则按「破坏性默认 true 或 开放世界默认 true」从严处理
+/// （缺省 hint 时倾向要求审批，安全优先）。
 fn requires_mcp_tool_approval(annotations: Option<&ToolAnnotations>) -> bool {
     let destructive_hint = annotations.and_then(|annotations| annotations.destructive_hint);
     if destructive_hint == Some(true) {

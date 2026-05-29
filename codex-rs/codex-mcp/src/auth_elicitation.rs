@@ -2,10 +2,31 @@
 //!
 //! This module owns protocol-neutral auth elicitation parsing and payload shaping.
 //! Session orchestration stays in `codex-core`.
+//!
+//! 【文件职责】处理「connector 鉴权失败 → 引导用户重新授权」的纯逻辑：
+//!   从工具调用结果里解析出鉴权失败信息，并据此构造一条 elicitation（征询用户去
+//!   完成登录/重连）的载荷。本模块只做「解析 + 组装载荷」，不涉及会话编排。
+//!
+//! 【架构位置】
+//!   层级：工具执行层（auth elicitation 的「数据塑形」层，协议中立）
+//!   上游：`codex-core`（拿到工具结果后调用这里解析、再驱动实际的 elicitation 流程）
+//!   下游：仅依赖 `codex_protocol::mcp::CallToolResult` 等数据类型，无 I/O
+//!
+//! 【数据流】
+//!   `CallToolResult`（含失败 meta）→ `connector_auth_failure_from_tool_result()`
+//!   解析出 `CodexAppsConnectorAuthFailure` → `build_auth_elicitation()` 组装成
+//!   带 message/url/meta 的 `CodexAppsAuthElicitation`。
+//!
+//! 【阅读建议】先看 `connector_auth_failure_from_tool_result`（解析入口、含信任校验），
+//!   再看 `build_auth_elicitation`（载荷组装）；顶部一组 `const` 是 meta 的键名约定。
 
 use codex_protocol::mcp::CallToolResult;
 use serde::Serialize;
 
+// 以下一组常量是工具结果 `meta` 里「connector 鉴权失败」信息的键名约定。
+// 嵌套结构形如：meta[_codex_apps][connector_auth_failure][is_auth_failure / auth_reason / ...]。
+// 解析（`connector_auth_failure_from_tool_result`）与回写（`build_auth_elicitation`）
+// 共用这套键名，故抽成常量保持两端一致。
 pub const MCP_TOOL_CODEX_APPS_META_KEY: &str = "_codex_apps";
 pub const CONNECTOR_AUTH_FAILURE_META_KEY: &str = "connector_auth_failure";
 pub const CONNECTOR_AUTH_FAILURE_IS_AUTH_FAILURE_KEY: &str = "is_auth_failure";
@@ -36,6 +57,8 @@ pub struct CodexAppsAuthElicitation {
     pub elicitation_id: String,
 }
 
+/// 「解析结果 + 待发起的 elicitation」打包：上层既需要原始失败信息（用于后续
+/// 重试/上报），也需要现成的 elicitation 载荷，故一并返回省得重算。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexAppsAuthElicitationPlan {
     pub auth_failure: CodexAppsConnectorAuthFailure,
@@ -60,16 +83,26 @@ struct CodexAppsConnectorAuthFailureMeta<'a> {
     error_action: Option<&'a str>,
 }
 
+/// 尝试从工具调用结果中解析出「connector 鉴权失败」信息；非鉴权失败则返回 None。
+///
+/// 解析需通过一系列校验，任一不满足都返回 None（用 `?` 短路）：
+///   - 结果必须 `is_error == true`；
+///   - meta 中必须存在 `_codex_apps.connector_auth_failure` 且 `is_auth_failure == true`；
+///   - 调用方必须提供非空 `connector_id`，且若 meta 里也带了 connector_id，二者必须一致
+///     （信任校验：防止把 A 连接器的失败错配到 B 连接器的授权引导上）。
+/// `connector_name` 缺省时回退用 `connector_id`；`install_url` 为 None 时整体失败返回 None。
 pub fn connector_auth_failure_from_tool_result(
     result: &CallToolResult,
     connector_id: Option<&str>,
     connector_name: Option<&str>,
     install_url: Option<String>,
 ) -> Option<CodexAppsConnectorAuthFailure> {
+    // Step 1：只有标记为错误的结果才可能是鉴权失败。
     if result.is_error != Some(true) {
         return None;
     }
 
+    // Step 2：按约定键路径逐层下钻到 connector_auth_failure 对象。
     let auth_failure = result
         .meta
         .as_ref()?
@@ -78,6 +111,7 @@ pub fn connector_auth_failure_from_tool_result(
         .as_object()?
         .get(CONNECTOR_AUTH_FAILURE_META_KEY)?
         .as_object()?;
+    // 必须显式标记 is_auth_failure=true，否则视为普通错误、不触发授权引导。
     if auth_failure
         .get(CONNECTOR_AUTH_FAILURE_IS_AUTH_FAILURE_KEY)
         .and_then(serde_json::Value::as_bool)
@@ -86,6 +120,7 @@ pub fn connector_auth_failure_from_tool_result(
         return None;
     }
 
+    // Step 3：信任校验——调用方须给出 connector_id；若 meta 也带了 id 则必须吻合。
     let connector_id = connector_id
         .map(str::trim)
         .filter(|connector_id| !connector_id.is_empty())?;
@@ -137,6 +172,9 @@ pub fn build_auth_elicitation_plan(
     })
 }
 
+/// 由鉴权失败信息组装一条 elicitation 载荷：把失败字段回写进 `_codex_apps.
+/// connector_auth_failure` meta、生成面向用户的引导文案、附上安装/重连 URL，
+/// 并基于 `call_id` 派生稳定的 elicitation id。
 pub fn build_auth_elicitation(
     call_id: &str,
     auth_failure: &CodexAppsConnectorAuthFailure,
@@ -163,6 +201,11 @@ pub fn build_auth_elicitation(
     }
 }
 
+/// 用户完成授权后，构造回灌给模型的工具结果：告知「授权已完成，请重试本次调用」。
+///
+/// 注意 `is_error: Some(true)` 是「有意为之」：本次原始工具调用并未真正成功，
+/// 仍需模型主动重试一次；用 error 标记可促使模型把它当作待重试而非已完成，
+/// 避免误以为操作已生效。
 pub fn auth_elicitation_completed_result(
     auth_failure: &CodexAppsConnectorAuthFailure,
     meta: Option<serde_json::Value>,
@@ -197,6 +240,11 @@ fn string_auth_failure_field(
         .map(ToString::to_string)
 }
 
+// 按 `auth_reason` 给出贴合场景的用户引导文案：
+//   oauth_upgrade_required → 重新连接以授予新权限；
+//   reauthentication_required → 重新连接以恢复访问；
+//   missing_link → 首次登录该连接器；
+//   其他/缺省 → 通用「去 ChatGPT 登录后继续」。
 fn auth_elicitation_message(auth_failure: &CodexAppsConnectorAuthFailure) -> String {
     match auth_failure.auth_reason.as_deref() {
         Some("oauth_upgrade_required") => format!(
