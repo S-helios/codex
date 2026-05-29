@@ -23,25 +23,22 @@
 //! WebSocket prewarm is treated as the first websocket connection attempt for a turn. If it
 //! fails, normal stream retry/fallback logic handles recovery on the same turn.
 //!
-//! 【文件职责】Codex 与「模型提供方 API」对话的会话级 / 回合级封装。
-//! 核心是两层客户端：
-//!   · `ModelClient`——会话级（贯穿整个 Codex session），持有稳定配置：
-//!     鉴权、provider 选择、thread id，以及「WebSocket → HTTP」降级状态。
-//!   · `ModelClientSession`——回合级（每个 turn 新建一个），在一个回合内复用
-//!     同一条 Responses WebSocket 连接，并缓存 `x-codex-turn-state` 粘性路由
-//!     令牌。**切勿跨回合复用**，否则会把上一回合的路由令牌串到下一回合，
-//!     违反客户端 / 服务端契约。
+//! 【文件职责】会话级 / 回合级「与模型 provider 通话」的封装。把协议层定义的
+//! 「说什么」落到「怎么把话发出去」：建连、鉴权、流式收发、重试与传输降级。
 //!
-//! 【为何分两层】把「整段会话稳定」的状态放 ModelClient，把「每回合可变」的
-//!   设置（模型选择、推理档位、遥测上下文、回合元数据）做成方法显式入参——
-//!   让回合生命周期在调用点一目了然，也免得 ModelClient 背着一整个 Config。
+//! 【两个主角】
+//!   · `ModelClient`：会话级，活在整个 session，持有稳定配置（auth、provider 选择、
+//!     conversation id、传输降级状态）。
+//!   · `ModelClientSession`：回合级，每回合由 `new_session()` 派生。懒加载一条
+//!     Responses-over-WebSocket 连接并在同一回合内复用，缓存 `x-codex-turn-state`
+//!     做粘性路由。
 //!
-//! 【WebSocket 预热】v2 专属：先发一个 `response.create generate=false` 把连接
-//!   建好并等其完成，下一个真正请求即可复用同一连接与 previous_response_id。
-//!   预热被算作本回合的「第一次 WS 连接尝试」，失败就走正常的重试 / 降级到 HTTP。
+//! 【为什么连接绑回合】模型、推理强度、工具集等可能逐轮变化，连接绑回合便于隔离
+//!   差异、回合结束干净释放；跨回合复用会把上一回合的 turn-state 误带进下一回合，
+//!   违反客户端 / 服务端契约。
 //!
-//! 【阅读建议】先看 ModelClient / ModelClientSession 两个结构体及字段注释，
-//!   再顺着 stream() 主路径理解「预热 → WS 流式 → 失败降级 HTTP」三段式。
+//! 【阅读建议】先看 `ModelClient` / `ModelClientSession` 两个结构，再看
+//!   `new_session()`（派生回合会话）与 `stream()`（回合内发起流式请求的总入口）。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -235,10 +232,9 @@ impl RequestRouteTelemetry {
 /// Turn-scoped settings (model selection, reasoning controls, telemetry context, and turn
 /// metadata) are passed explicitly to the relevant methods to keep turn lifetime visible at the
 /// call site.
-///
-/// 会话级 API 客户端。真正的状态都在 `Arc<ModelClientState>` 里——所以 clone
-/// 极廉价，多处可共享同一份会话状态（含跨回合的 WS→HTTP 降级标志）。
-/// `prompt_cache_key_override` 用于子代理 / 压缩等场景覆盖默认的提示缓存键。
+/// 会话级句柄：活在整个 session，持有与 provider 通话的稳定状态（auth、provider、
+/// conversation id、传输降级）。回合相关参数刻意不存这里，而是显式传给各方法，
+/// 让「回合生命周期」在调用点一目了然。
 #[derive(Debug, Clone)]
 pub struct ModelClient {
     state: Arc<ModelClientState>,
@@ -258,10 +254,10 @@ pub struct ModelClient {
 /// Create a fresh `ModelClientSession` for each Codex turn. Reusing it across turns would replay
 /// the previous turn's sticky-routing token into the next turn, which violates the client/server
 /// contract and can cause routing bugs.
-///
-/// 回合级流式会话：从 ModelClient 派生，一个回合用一个。它懒加载一条 Responses
-/// WebSocket 连接并在回合内复用；同时缓存「上一次完整请求」（仅当新请求是其
-/// 增量延续时才走增量 WS 负载）和 `x-codex-turn-state` 粘性路由令牌。
+/// 回合级流式会话：从 `ModelClient` 派生，懒开一条 Responses WebSocket 并在本回合
+/// 多次请求间复用。缓存两样回合态：① 上一次完整请求（仅当本次是其增量延展时才
+/// 复用增量 WS 负载）；② `x-codex-turn-state` 粘性路由令牌（回合开始时由服务端
+/// 下发，回合内所有请求原样回带，「绝不」跨回合带过去——否则路由错乱）。
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
@@ -403,6 +399,8 @@ impl ModelClient {
     ///
     /// This constructor does not perform network I/O itself; the session opens a websocket lazily
     /// when the first stream request is issued.
+    /// 为「一个回合」派生全新的流式会话。本身不做网络 I/O——WebSocket 推迟到第一次
+    /// stream 请求时才懒加载。每回合都要新建，不可跨回合复用（理由见结构体注释）。
     pub fn new_session(&self) -> ModelClientSession {
         ModelClientSession {
             client: self.clone(),
@@ -1266,9 +1264,6 @@ impl ModelClientSession {
             turn.has_metadata_header = turn_metadata_header.is_some()
         )
     )]
-    /// Responses 协议的 HTTP（SSE 流式）路径。外层 `loop` 专为处理 401：遇到
-    /// 未授权就经 handle_unauthorized 刷新令牌 / 恢复，再带 pending_retry 重试；
-    /// 其它错误映射后直接返回。成功则把底层 SSE 流包装成统一的 ResponseStream。
     async fn stream_responses_api(
         &self,
         prompt: &Prompt,
@@ -1368,9 +1363,6 @@ impl ModelClientSession {
     }
 
     /// Streams a turn via the Responses API over WebSocket transport.
-    /// WS 流式路径。`warmup=true` 时是预热（generate=false，只为提前建连）。
-    /// 返回 WebsocketStreamOutcome：要么给出可用的流，要么判定需降级 HTTP
-    /// （交由上层 stream() 接手切换）。同样内置 401 恢复逻辑。
     #[allow(clippy::too_many_arguments)]
     #[instrument(
         name = "model_client.stream_responses_websocket",
@@ -1618,10 +1610,10 @@ impl ModelClientSession {
     /// fall back to the HTTP Responses API transport otherwise. The trace context may be enabled or
     /// disabled, but is always explicit so transport paths do not need separate trace/no-trace
     /// branches.
-    /// 回合内发起模型请求的统一入口。按 wire_api 分派：Responses 协议下，若本
-    /// 会话仍允许 WebSocket，先试 WS 流式；WS 明确要求降级（FallbackToHttp）时
-    /// 永久切到 HTTP（try_switch_fallback_transport）再走 HTTP 流式。两条路径
-    /// 最终都返回统一的 ResponseStream。
+    /// 回合内发起「一次」模型流式请求的总入口。优先走 Responses WebSocket 传输
+    /// （provider 支持且连接健康时），失败则降级到 HTTP Responses API。回合相关
+    /// 设置全部由调用方显式传入；trace 上下文也始终显式，使两条传输路径无需各写
+    /// 一份「带 trace / 不带 trace」分支。返回流式的 `ResponseStream`。
     pub async fn stream(
         &mut self,
         prompt: &Prompt,

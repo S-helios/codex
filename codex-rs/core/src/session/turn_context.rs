@@ -1,18 +1,18 @@
-//! 「单轮上下文」`TurnContext`——一次模型回合（turn）执行时所需的全部只读快照。
+//! 回合上下文：单个回合冻结的配置快照与派生的沙箱策略。
 //!
-//! 为什么要把这些字段从 `Session` 里拆出来单独打包？因为同一个会话里，模型、
-//! 推理强度、审批策略、沙箱权限、工作目录都可能「逐轮」变化（用户中途切模型、
-//! 改权限……）。把它们冻结成一份 `TurnContext`，本轮内的所有代码读同一份快照，
-//! 既避免「执行到一半配置被改」的竞态，也让回合可被独立追踪/重放。
+//! 【文件职责】定义 [`TurnContext`]——一个回合执行期间所需的全部冻结配置：模型信息、
+//!   provider、推理强度 / 摘要、审批策略、权限 profile、网络代理、工作目录、指令文本、
+//!   环境选择、技能上下文、计时 / 元数据状态等。并提供从权限 profile 派生「文件系统 /
+//!   网络 / 合并」沙箱策略的方法。
 //!
-//! 三条主线：
-//! ① 构造——`make_turn_context` 是底层工厂；`new_turn_with_sub_id` 先把
-//!    `SessionSettingsUpdate` 应用到会话配置、再产出新一轮 `TurnContext`；
-//!    `new_default_turn*` 用当前配置直接造一轮（无改动）。
-//! ② 派生——`sandbox_policy`/`file_system_sandbox_context` 把权限档位翻译成
-//!    具体沙箱策略；`model_context_window` 算出本轮可用的上下文窗口上限。
-//! ③ 序列化——`to_turn_context_item` 把本轮关键设置打成一条历史项，写进 thread
-//!    历史，供「设置变更 diff」与回放使用。
+//! 【架构位置】介于 `SessionConfiguration`（会话级只读基线）与 `turn.rs`（回合执行）
+//!   之间的「回合级快照」：每个回合从会话配置派生一份 `TurnContext`，回合内的临时偏移
+//!   （改 cwd / 审批策略 / 模型等）只落在这里，绝不回写会话——这是「会话不变量 vs 回合
+//!   临时态」分层的承载体。
+//!
+//! 【关键设计】`cwd` 字段已 `#[deprecated]`，新代码应改用「选定的回合环境」的 cwd
+//!   （`environments`），因为多环境 / 多 cwd 场景下单一 cwd 已不足以表达。
+
 use super::*;
 use crate::SkillLoadOutcome;
 use crate::config::GhostSnapshotConfig;
@@ -62,13 +62,10 @@ impl TurnEnvironment {
 }
 
 /// The context needed for a single turn of the thread.
-///
-/// 一轮对话的「冻结配置」。字段大致分四组：① 身份/追踪（sub_id、trace_id、
-/// session_source）；② 模型与推理（model_info、provider、reasoning_effort）；
-/// ③ 权限与沙箱（approval_policy、permission_profile、network、environments）；
-/// ④ 提示词与能力（developer/user_instructions、dynamic_tools、features）。
-/// 注意 `cwd` 已标 `#[deprecated]`——新代码应从「选定的 turn environment」取 cwd，
-/// 这是「多工作区/多环境」改造留下的过渡痕迹。
+/// 单个回合所需的上下文快照。由会话配置（`SessionConfiguration`）在回合开始时派生而来，
+/// 把「这个回合用哪个模型、什么审批 / 沙箱策略、哪个 cwd、哪些指令与技能」等全部定死，
+/// 回合执行（`run_turn`）全程只读此快照。两个 `AtomicBool`（`server_model_warning_emitted`
+/// / `model_verification_emitted`）做「每回合至多告警一次」的幂等闸，故用原子而非 `&mut`。
 #[derive(Debug)]
 pub struct TurnContext {
     pub(crate) sub_id: String,
@@ -132,6 +129,9 @@ impl TurnContext {
         self.permission_profile.network_sandbox_policy()
     }
 
+    /// 把权限 profile 派生出的「文件系统沙箱策略」与「网络沙箱策略」合成为统一的
+    /// [`SandboxPolicy`]（向后兼容形态），供旧式沙箱调用点使用。新代码倾向直接用
+    /// 上面两个细分策略；本方法是过渡期的兼容聚合。
     pub(crate) fn sandbox_policy(&self) -> SandboxPolicy {
         let file_system_sandbox_policy = self.file_system_sandbox_policy();
         let network_sandbox_policy = self.network_sandbox_policy();
@@ -159,10 +159,6 @@ impl TurnContext {
             .unwrap_or_else(|| "default".to_string())
     }
 
-    /// 本轮「实际可用」的上下文窗口（token 数）。不是直接用模型标称窗口，而是
-    /// 乘以 `effective_context_window_percent`——codex 故意留出一截余量（不把窗口
-    /// 用满），给输出/推理留空间，也降低踩到服务端硬上限的风险。压缩、token 预算
-    /// 判断都以这个「打折后」的值为准。
     pub(crate) fn model_context_window(&self) -> Option<i64> {
         let effective_context_window_percent = self.model_info.effective_context_window_percent;
         self.model_info
@@ -188,10 +184,6 @@ impl TurnContext {
         self.goal_tools_supported && self.features.get().enabled(Feature::Goals)
     }
 
-    /// 基于当前轮「换一个模型」派生出新的 `TurnContext`（其余设置尽量沿用）。
-    /// 难点是推理强度的迁移：若当前 effort 新模型也支持就保留；否则取新模型
-    /// 支持档位的「中位数」（`len-1`/2 那一档）兜底，再不行用模型默认值。
-    /// 这样换模型不会因为「旧档位非法」而报错或丢失用户意图。
     pub(crate) async fn with_model(
         &self,
         model: String,
@@ -297,9 +289,6 @@ impl TurnContext {
             .map_or_else(|| self.cwd.clone(), |path| self.cwd.join(path))
     }
 
-    /// 为「单次命令执行」算出文件系统沙箱上下文。允许叠加 `additional_permissions`
-    /// （某条命令临时多给的权限），与基础权限档位合并后得到本次实际生效的读写边界。
-    /// 这是 turn 级权限 → exec 级沙箱的桥接点。
     pub(crate) fn file_system_sandbox_context(
         &self,
         additional_permissions: Option<AdditionalPermissionProfile>,
@@ -354,9 +343,6 @@ impl TurnContext {
             .unwrap_or(compact::SUMMARIZATION_PROMPT)
     }
 
-    /// 把本轮的关键设置「拍扁」成一条 `TurnContextItem` 写进历史。它是后续
-    /// 「设置变更检测」的快照基准：下一轮若 cwd/审批/沙箱/模型等变了，会与这条
-    /// 做 diff，只把变动部分作为「设置更新」注入给模型，而非每轮全量重述。
     pub(crate) fn to_turn_context_item(&self) -> TurnContextItem {
         TurnContextItem {
             turn_id: Some(self.sub_id.clone()),
@@ -465,10 +451,6 @@ impl Session {
         config
     }
 
-    /// `TurnContext` 的底层工厂——把会话级配置 + 本轮解析出的环境/模型/沙箱等
-    /// 一次性组装成一份不可变快照。参数多到要 `#[allow(too_many_arguments)]`，
-    /// 正因为它要「冻结一整轮所需的一切」。上层一般不直接调它，而是走
-    /// `new_turn_from_configuration`（已备好各依赖）再转交到这里。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn make_turn_context(
         thread_id: ThreadId,
@@ -580,13 +562,6 @@ impl Session {
         }
     }
 
-    /// 「应用一批设置变更 → 产出新一轮上下文」的入口。流程：在持锁临界区内
-    /// 把 `SessionSettingsUpdate` 应用到会话配置（校验非法值会直接报错回滚），
-    /// 解析新的 turn environments，并记录权限档位是否变化等;出锁后再做副作用
-    /// （通知配置贡献者、刷新 shell 快照、权限变了就重建网络代理），最后委托
-    /// `new_turn_from_configuration` 真正造出 `TurnContext`。
-    /// 设计要点：所有「改会话状态」的活都压在锁内最小范围，I/O 类副作用挪到锁外，
-    /// 既保证状态一致又不长时间持锁。
     pub(crate) async fn new_turn_with_sub_id(
         &self,
         sub_id: String,

@@ -1,10 +1,16 @@
-//! 【文件职责】工具执行的「注册表 + 分发引擎」。ToolRegistry 按 ToolName 持有一张
-//! 「名字 → 处理器（CoreToolRuntime）」表；dispatch_any_with_terminal_outcome 是所有
-//! 本地工具调用的统一执行入口，串起完整生命周期：
-//!   计数 → 查表 → 遥测打点 → notify_tool_start → PreToolUse hook（可拦截 / 改写入参）
-//!   → 执行 handler → PostToolUse hook（可叫停 / 改写输出）→ notify_tool_finish。
-//! 【架构位置】上游是 router.rs（已把调用包成 ToolInvocation），下游是各具体工具
-//!   handler（handlers/ 目录，如 shell、apply_patch、多代理等）。
+//! 工具注册表与单次工具调用的「执行管线」。
+//!
+//! 【文件职责】定义 [`ToolRegistry`]（`名字 → Arc<dyn CoreToolRuntime>` 映射，建表时查重）
+//!   及其 `dispatch_any*`——一次工具调用的完整生命周期：累加回合工具计数 → 起 dispatch
+//!   trace 与 OTel → 跑 pre-tool-use hook → 调具体工具 → 跑 post-tool-use hook → 收尾埋点。
+//!   工具找不到时回一条「不支持」的 `RespondToModel` 错误（让模型自行纠偏，而非崩溃）。
+//!
+//! 【架构位置】`router.rs` 解析出调用后交给本表执行；本表内部对每个工具套上 hook 与遥测。
+//!   与 `orchestrator.rs` 的分工：orchestrator 管「审批 + 沙箱 + 重试」横切，registry 管
+//!   「定位工具 + hook + 计量」的执行管线，二者经 `CoreToolRuntime` 抽象衔接。
+//!
+//! 【关键设计】`dispatch_any_with_terminal_outcome` 标了 `#[expect(await_holding_invalid_type)]`：
+//!   「活动回合的工具计数」必须原子累加，故允许在持 turn_state 锁期间跨 await。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,10 +59,6 @@ pub use codex_tools::ToolExposure;
 ///
 /// Implementers provide the shared `ToolExecutor` behavior plus optional
 /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
-///
-/// 本地工具的统一运行时契约：在通用 ToolExecutor 之上，附加 core 私有的元数据钩子
-/// ——工具搜索信息、payload 类型匹配、取消时是否等待优雅收尾、遥测标签等。handlers/
-/// 下每个具体工具都实现它（多数经宏 / 适配器生成），registry 只面向这个 trait 对象分发。
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
     fn search_info(&self) -> Option<ToolSearchInfo> {
         None
@@ -339,8 +341,9 @@ impl CoreToolRuntime for ExposureOverride {
     }
 }
 
-/// 工具注册表：一张 ToolName → 处理器 的映射。from_tools 构建时若发现同名重复会
-/// error_or_panic（防止两个工具抢同一个名字导致分发歧义）。
+/// 工具注册表：按工具名索引到统一抽象 `CoreToolRuntime` 的实现。建表（`from_tools`）时
+/// 同名工具会触发 `error_or_panic`（开发期防重复注册）。所有内置 / MCP / 插件工具最终都
+/// 收敛成这张表里的一条 `Arc<dyn CoreToolRuntime>`，对上层（router）呈现统一调用面。
 pub struct ToolRegistry {
     tools: HashMap<ToolName, Arc<dyn CoreToolRuntime>>,
 }
@@ -419,12 +422,11 @@ impl ToolRegistry {
             .await
     }
 
-    /// 工具调用的统一执行入口，承载完整生命周期。terminal_outcome_reached：某些
-    /// 「终态」工具会自行声明已结束，此标志用于避免重复 notify_tool_finish（见
-    /// notify_tool_finish_if_unclaimed）。关键阶段（按代码顺序）：原子自增 tool_calls
-    /// 计数 → 按名查表（查不到即回错给模型）→ payload 类型校验 → PreToolUse hook
-    /// （Blocked 直接拒、可改写入参）→ 执行 handler → PostToolUse hook（可叫停、可用
-    /// 反馈文本替换模型可见输出）→ 通知结束并返回结果。
+    /// 单次工具调用的执行管线（真正干活处）。依次：把本次调用计入回合 `tool_calls`、
+    /// 准备沙箱 / 策略遥测标签、起 dispatch trace；按名定位工具——找不到则回
+    /// `RespondToModel("unsupported tool")` 让模型改正；找到则收集遥测标签后，经 hook 包裹
+    /// 调用具体工具，最后统一打成功 / 失败埋点。`terminal_outcome_reached` 透传给支持
+    /// 「提前终态」的工具（见 router 同名参数）。
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "tool dispatch must keep active-turn accounting atomic"
@@ -565,8 +567,6 @@ impl ToolRegistry {
             }
         }
 
-        // response_cell 是个「出参信元」：handler 的真正结果要从下面的遥测闭包里带出来，
-        // 而闭包本身只向日志返回 (预览, 成功与否)，故用 Mutex<Option<_>> 暂存真结果。
         let response_cell = tokio::sync::Mutex::new(None);
         let invocation_for_tool = invocation.clone();
         let log_payload = invocation.payload.log_payload();

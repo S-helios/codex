@@ -1,12 +1,17 @@
 //! Turn-scoped state and active turn metadata scaffolding.
 //!
 //! 【文件职责】单个「回合」运行期的可变状态。两个主角：
-//!   · [`ActiveTurn`]：当前正在跑的回合的元数据（运行任务句柄 + 共享的 TurnState）；
-//!   · [`TurnState`]：回合内的可变数据，核心是若干 `pending_*` 表——它们正是
-//!     「事件出 + oneshot 回」审批模式的回程登记处：发起审批 / 权限 / 用户输入 /
-//!     elicitation / 动态工具请求时，把对应的 `oneshot::Sender` 按 key 存进来，
-//!     收到客户端答复时取出并 send；打断时 `clear_pending_waiters` 一次性丢弃所有
-//!     sender，令各等待方因通道关闭而 fail-closed。
+//!   · [`ActiveTurn`]：当前正在跑的回合的元数据（运行任务句柄 + 共享 TurnState）；
+//!   · [`TurnState`]：回合内可变数据，核心是若干 `pending_*` 表——它们正是「事件出
+//!     + oneshot 回」审批模式的回程登记处。
+//!
+//! 【架构位置】层级：会话 / 回合状态层；被 session/mod.rs 与各审批、工具回调并发
+//!   共享（故 `TurnState` 外面套 `Arc<Mutex<>>`）。
+//!
+//! 【关键设计】发起审批 / 权限 / 用户输入 / elicitation / 动态工具请求时，把对应的
+//!   `oneshot::Sender` 按 key 存进 `pending_*`；收到客户端答复时取出并 send；打断时
+//!   [`TurnState::clear_pending_waiters`] 一次性丢弃所有 sender，令各等待方因通道关闭
+//!   而 fail-closed（绝不「出错就放行」）。
 
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use std::collections::HashMap;
@@ -34,9 +39,8 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TokenUsage;
 
 /// Metadata about the currently running turn.
-///
-/// 「当前回合」的把手：task 是正在跑的任务（None 表示当前空闲），turn_state 用
-/// `Arc<Mutex<>>` 包裹，因为它要在 agent 主循环与各审批 / 工具回调之间并发共享。
+/// 「当前回合」的把手：`task` 是正在跑的任务（`None` 表示当前空闲），`turn_state`
+/// 用 `Arc<Mutex<>>` 包裹，因为它要在 agent 主循环与各审批 / 工具回调间并发共享。
 pub(crate) struct ActiveTurn {
     pub(crate) task: Option<RunningTask>,
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
@@ -53,6 +57,10 @@ pub(crate) struct ActiveTurn {
 /// - If the same task later gets explicit same-turn work again (a steered user
 ///   prompt or a tool call after an untagged preamble), we reopen `CurrentTurn`
 ///   so that pending child mail is drained into that follow-up request.
+/// 子 Agent 邮件「并入本回合还是留给下回合」的开关：回合开始是 `CurrentTurn`
+/// （子邮件可搭上本回合的下次模型请求）；一旦本回合已输出可见的最终答案，切到
+/// `NextTurn`（晚到的子邮件留到下回合，不去续接已展示的答案）；若同一任务又被显式
+/// 安排了同回合工作（被 steer 的用户输入 / 无标记前导后的工具调用），重开 `CurrentTurn`。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum MailboxDeliveryPhase {
     /// Incoming mailbox messages can still be consumed by the current turn.
@@ -72,9 +80,8 @@ impl Default for ActiveTurn {
     }
 }
 
-/// 回合任务的三种类型：Regular 常规对话回合、Review 代码审查回合、
-/// Compact 上下文压缩回合（见 compact.rs）。不同类型在历史记录、事件与
-/// 计量上有细微差别。
+/// 回合任务的三种类型：`Regular` 常规对话回合、`Review` 代码审查回合、`Compact`
+/// 上下文压缩回合。三者在历史记录、事件与计量上有细微差别。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TaskKind {
     Regular,
@@ -82,9 +89,10 @@ pub(crate) enum TaskKind {
     Compact,
 }
 
-/// 「正在运行的回合任务」句柄集合：done 用于等待任务结束的通知，cancellation_token
-/// 做协作式取消，handle 是 `AbortOnDropHandle`——本结构一旦被 drop 就强制 abort 底层
-/// tokio task（防止回合泄漏成幽灵任务），turn_context 是该回合冻结的配置快照。
+/// 「正在运行的回合任务」句柄集合：`done` 用于等待任务结束的通知；
+/// `cancellation_token` 做协作式取消；`handle` 是 `AbortOnDropHandle`——本结构一旦
+/// 被 drop 就强制 abort 底层 tokio task（防止回合泄漏成幽灵任务）；`turn_context`
+/// 是该回合冻结的配置快照。
 pub(crate) struct RunningTask {
     pub(crate) done: Arc<Notify>,
     pub(crate) kind: TaskKind,
@@ -98,12 +106,11 @@ pub(crate) struct RunningTask {
 }
 
 /// Mutable state for a single turn.
-///
 /// 「单回合可变状态」。前五个 `pending_*` 表是「事件出 + oneshot 回」模式的回程
 /// 登记处（按 approval_id / 请求 key 索引未决的 `oneshot::Sender`）；`pending_input`
-/// 是回合中途追加的用户输入队列；`mailbox_delivery_phase` 决定子 Agent 邮件并入
-/// 本回合还是留给下回合；其余是本回合的计量（tool_calls 调用数、起始 token 用量、
-/// 是否引用了记忆等）与开关（已授予的额外权限、严格自动审查）。
+/// 是回合中途追加的用户输入队列；`mailbox_delivery_phase` 决定子 Agent 邮件并入本
+/// 回合还是留给下回合；其余是计量（`tool_calls` 调用数、起始 token 用量、是否引用
+/// 了记忆）与开关（已授予的额外权限、严格自动审查）。
 #[derive(Default)]
 pub(crate) struct TurnState {
     pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>,
@@ -143,8 +150,8 @@ impl TurnState {
     }
 
     /// 打断 / 回合收尾时调用：清空全部未决等待者。被 drop 的 `oneshot::Sender` 会让
-    /// 对应等待方的 recv 立即返回 Err，从而走 fail-closed 默认（如审批默认 Abort），
-    /// 不会有人永久挂起。
+    /// 对应等待方的 recv 立即返回 `Err`，从而走 fail-closed 默认（如审批默认 Abort），
+    /// 杜绝有人永久挂起。
     pub(crate) fn clear_pending_waiters(&mut self) {
         self.pending_approvals.clear();
         self.pending_request_permissions.clear();

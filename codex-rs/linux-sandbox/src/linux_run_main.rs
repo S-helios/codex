@@ -1,16 +1,17 @@
-//! 【文件职责】`codex-linux-sandbox` 辅助二进制的入口。主进程要在沙箱里跑命令时，
-//! 并不直接对自己施加限制，而是 re-exec 进这个 helper，由它「建立隔离环境 → 收紧
-//! 权限 → execvp 真正命令」。对应总览中 Linux 沙箱「Landlock + Bubblewrap」一路。
+//! Linux 沙箱辅助进程 `codex-linux-sandbox` 的主入口：建立隔离的文件系统视图 + 收紧系统调用，
+//! 然后 exec 进真实命令。
 //!
-//! 【两段式架构】默认走 bubblewrap：
-//!   · 外层：先用 bwrap 构建文件系统视图（可能依赖 setuid），再带
-//!     `--apply-seccomp-then-exec` 重新进入本二进制；
-//!   · 内层：此时文件视图已隔离，再施加 seccomp + no_new_privs，最后 execvp。
-//!   分两段是因为 seccomp 一旦收紧就可能挡住 bwrap 自身需要的系统调用，故顺序不能反。
-//! 另有 `--use-legacy-landlock` 旧路径：不走 bwrap，仅用 Landlock 施加文件系统限制。
+//! 【文件职责】实现 [`run_main`]——`manager.rs` 把目标命令包成
+//!   `codex-linux-sandbox <参数> -- <真实命令>` 后，本进程被自调起来负责落地隔离。默认走
+//!   bubblewrap（bwrap）两阶段管线；旧机器可 `--use-legacy-landlock` 回落到纯 Landlock。
 //!
-//! 【阅读建议】从 `run_main` 看主流程的四条互斥分支，其余函数是 bwrap 参数构建、
-//!   合成挂载清理、protected-create 监视、信号转发等支撑逻辑。
+//! 【架构位置】Linux 平台隔离的「执行端」，与 macOS 的 `seatbelt.rs`（策略编译）对位，但这里是
+//!   一个真正被 exec 起来的独立进程。靠 [`CODEX_LINUX_SANDBOX_ARG0`] 识别「我是被自调成沙箱」。
+//!
+//! 【关键设计】两阶段 bwrap 管线（外/内）：① 外层先跑 bwrap 建好文件系统命名空间（bwrap 可能
+//!   依赖 setuid，须先于收紧权限）；② 再用 `--apply-seccomp-then-exec` 重入本二进制，在已隔离的
+//!   环境里上 seccomp + `no_new_privs`，最后 `execvp` 进真实命令。先建 fs 视图、后收紧系统调用，
+//!   顺序不能反。另有信号转发（[`FORWARDED_SIGNALS`] → bwrap 子进程）与受管代理路由两条支线。
 
 use clap::Parser;
 use std::ffi::CString;
@@ -91,11 +92,9 @@ enum ProtectedCreateRemoval {
 /// The type name remains `LandlockCommand` for compatibility with existing
 /// wiring, but bubblewrap is now the default filesystem sandbox and Landlock
 /// is the legacy fallback.
-///
-/// 「Linux 沙箱 helper 的 CLI 契约」。主进程把沙箱策略拆成这些 flag 传给 helper：
-/// 策略 cwd 与命令 cwd（可因 symlink 别名而不同）、权限档、是否走 legacy Landlock、
-/// 内部的两段式开关 `--apply-seccomp-then-exec`、代理网络相关、是否跳过挂载 /proc，
-/// 以及末尾 trailing 的真正待执行命令。多数 flag 标 hide=true，属内部实现细节。
+/// 沙箱辅助进程的 CLI 参数（clap 解析）。注意：类型名沿用 `LandlockCommand` 只是为了兼容既有
+/// 接线，实际默认后端早已是 bubblewrap，Landlock 退居 `--use-legacy-landlock` 才走的旧回落。
+/// 真实命令通过 `trailing_var_arg` 收在 `command`，靠 `--` 与本进程自身参数隔开。
 pub struct LandlockCommand {
     /// It is possible that the cwd used in the context of the sandbox policy
     /// is different from the cwd of the process to spawn.
@@ -163,12 +162,10 @@ pub struct LandlockCommand {
 ///    filesystem view.
 /// 2. Apply in-process restrictions (no_new_privs + seccomp).
 /// 3. `execvp` into the final command.
-///
-/// 返回类型 `!`：本函数要么 execvp 成功（进程映像被替换），要么 panic 退出，绝不
-/// 正常返回。主流程按优先级分四条互斥分支：① 内层阶段（已带 seccomp-then-exec
-/// 标志，即 bwrap 之后的二次进入）；② danger-full-access 且非代理网络 → 直接 exec；
-/// ③ 默认 bwrap 外层（建好文件视图后再回到本二进制收紧）；④ legacy Landlock 仅
-/// 施加文件系统限制。
+/// 沙箱辅助进程入口（返回类型 `!`：要么 exec 成功换掉本进程、要么 panic，绝不正常返回）。
+/// 解析参数与权限后，按四条互斥路径之一收尾并 exec：① `--apply-seccomp-then-exec`（内层阶段）
+/// 上 seccomp 后 exec；② 全盘可写且无代理路由时直接上 seccomp 后 exec（无需 bwrap 隔离 fs）；
+/// ③ 默认走 bwrap 外层阶段，建好 fs 视图再重入本二进制跑内层；④ 旧回落：仅用 Landlock 后 exec。
 pub fn run_main() -> ! {
     let LandlockCommand {
         sandbox_policy_cwd,
@@ -339,6 +336,9 @@ fn ensure_legacy_landlock_mode_supports_policy(
     }
 }
 
+/// 外层阶段：拼好 bwrap 参数并 exec（返回 `!`）。「proc fallback」指：本想挂载新 `/proc`
+/// （PID 隔离需要），但某些受限容器禁 `--proc /proc`；故先 preflight 探测，若不支持就静默关掉
+/// `mount_proc` 再继续——保持静默是为了不让沙箱内部诊断信息泄进子进程的 stderr。
 fn run_bwrap_with_proc_fallback(
     sandbox_policy_cwd: &Path,
     command_cwd: Option<&Path>,

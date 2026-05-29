@@ -1,11 +1,20 @@
-//! 【文件职责】macOS Seatbelt 沙箱的「策略生成器」。把 Codex 的文件/网络沙箱策略翻译成
-//! Seatbelt Policy Language（SBPL，.sb 脚本）文本，并拼出最终交给 `/usr/bin/sandbox-exec`
-//! 的参数：`-p <策略文本> -D<参数名>=<路径> … -- <真实命令>`。
-//! 【为何用 -D 参数而非把路径直接写进策略】路径以 `(param "KEY")` 占位、用 -D 注入，既避免
-//!   把含特殊字符的路径塞进 SBPL 文本引发注入/转义问题，也让策略文本本身可缓存/可读。
-//! 【三大块策略】文件读（file-read*）、文件写（file-write*，含受保护元数据如 .git 的排除）、
-//!   网络（按代理/受管网络情况收紧或放行，无可用端点时「fail closed」彻底禁网）。最终再拼上
-//!   基础策略 MACOS_SEATBELT_BASE_POLICY 等。glob 不被 Seatbelt 原生支持，故转成锚定正则。
+//! macOS Seatbelt 沙箱配置生成器：把权限策略翻译成 `sandbox-exec` 的 SBPL 策略文本与参数。
+//!
+//! 【文件职责】实现 [`create_seatbelt_command_args`]——据文件系统/网络权限策略，拼出一份
+//!   完整的 Seatbelt Policy Language（SBPL）策略，再组装成 `sandbox-exec -p <policy>
+//!   -D<KEY>=<dir> ... -- <原命令>` 的参数数组。策略由若干段拼接而成：基础策略
+//!   `seatbelt_base_policy.sbpl` + 文件读策略 + 文件写策略 + 拒读 glob + 网络策略
+//!   （+ 受限只读平台默认）。可写/可读根目录以 `-D` 参数注入，避免把路径硬编码进策略字符串。
+//!
+//! 【架构位置】`manager.rs::transform` 在 `SandboxType::MacosSeatbelt` 分支调本文件，把
+//!   生成的参数拼到 `/usr/bin/sandbox-exec` 之后，最终由 `exec.rs` spawn。是 macOS 平台
+//!   隔离的「策略编译」环节，与 Linux 侧的 landlock/seccomp（`landlock.rs`+`linux_run_main.rs`）对应。
+//!
+//! 【关键设计】网络策略「fail-closed」：当存在受管网络要求或代理配置、却推断不出可用的
+//!   loopback 端点时，[`dynamic_network_policy_for_network`] 返回空策略（即默认拒网），
+//!   宁可断网也不静默放宽。另外 `sandbox-exec` 路径硬编码为 `/usr/bin`（见
+//!   [`MACOS_PATH_TO_SEATBELT_EXECUTABLE`]），防攻击者在 PATH 上注入伪造版本。
+
 use codex_network_proxy::NetworkProxy;
 use codex_network_proxy::PROXY_URL_ENV_KEYS;
 use codex_network_proxy::has_proxy_url_env_vars;
@@ -262,12 +271,10 @@ fn dynamic_network_policy(
     )
 }
 
-/// 生成网络相关的 SBPL 段，是安全上最敏感的一块。三种走向：
-/// ① 受限网络（有代理端口 / 配了代理 / 强制受管网络 / 禁网但要放行 unix socket）→ 只放行
-///    loopback、必要的 DNS、指定代理端口与 unix socket，再拼基础网络策略。
-/// ② 「fail closed」：声明了代理配置或强制受管网络，却推断不出可用 loopback 端点 → 返回空串
-///    （= 完全禁网），宁可禁死也不静默放宽——这是刻意的安全默认。
-/// ③ 普通放行：无代理且策略允许联网 → 放行全部出入站。否则（禁网）返回空串。
+/// 生成网络相关的 SBPL 策略段。优先级：① 若有代理端口/代理配置/受管网络要求/（禁网但允许
+/// unix socket），走「受限网络」——只放行 loopback 上的指定端口、DNS、unix socket，其余靠
+/// 基础网络策略约束；② 有代理配置但推断不出可用端点 → 返回空（fail-closed 断网）；③ 有受管
+/// 网络要求但无可用代理 → 同样 fail-closed；④ 普通启用网络 → 放行全部出入站；⑤ 否则空（禁网）。
 fn dynamic_network_policy_for_network(
     network_policy: NetworkSandboxPolicy,
     enforce_managed_network: bool,
@@ -346,11 +353,10 @@ struct SeatbeltAccessRoot {
     protected_metadata_names: Vec<String>,
 }
 
-/// 为某类文件操作（action 如 "file-read*"/"file-write*"）生成 `(allow …)` 策略段。每个根都
-/// 落成一个 -D 参数（param_prefix_N）。若根带「排除子路径」或「受保护元数据名」，则用
-/// `(require-all (subpath 根) (require-not …))` 收紧：既禁掉精确路径又禁其子树（光 subpath
-/// 会给「首次创建该受保护目录本身」留口子，如 mkdir .codex，故同时排 literal + subpath）。
-/// 返回 (策略文本, 需注入的 -D 参数列表)。
+/// 为一组根目录生成「允许 `action`（file-read*/file-write*）但排除若干子路径」的 SBPL 片段，
+/// 同时返回要以 `-D<KEY>=<path>` 注入的参数表（根路径不内联进策略文本，而用参数占位，既避免
+/// 转义问题也更安全）。被排除的子路径同时禁 `literal` 与 `subpath`——只禁 subpath 会留下「首次
+/// 创建该受保护目录本身」（如 `mkdir .codex`）的缺口。
 fn build_seatbelt_access_policy(
     action: &str,
     param_prefix: &str,
@@ -500,10 +506,6 @@ fn canonicalize_glob_static_prefix_for_sandbox(pattern: &str) -> Option<String> 
     (normalized_pattern != pattern).then_some(normalized_pattern)
 }
 
-/// 把 git 风格的 glob 子集翻译成 Seatbelt 能用的锚定正则（`^…$`）：`*`/`?` 只在单层路径段内
-/// 匹配（`[^/]*`/`[^/]`），`**/` 可跨零或多层（`(.*/)?`），方括号字符类保留，未闭合的 `[`
-/// 当字面量。完全没有 glob 元字符时按「精确路径 + 其子树」处理（补 `(/.*)?`）。
-/// 用途：file-system 策略的「不可读 glob」需转成 deny 规则，而 Seatbelt 不认 glob 语法。
 fn seatbelt_regex_for_unreadable_glob(pattern: &str) -> Option<String> {
     if pattern.is_empty() {
         return None;
@@ -622,11 +624,10 @@ pub struct CreateSeatbeltCommandArgsParams<'a> {
     pub extra_allow_unix_sockets: &'a [AbsolutePathBuf],
 }
 
-/// 本文件的主入口：根据文件/网络策略生成完整 SBPL 文本并组装 sandbox-exec 参数。
-/// 流程：①按「是否全盘读/写」分别生成 file-read* / file-write* 段（受限时列出可读/可写根 +
-/// 排除只读子路径 + 保护 .git 等元数据）；②生成 deny 段把不可读 glob 转正则禁掉；③生成网络段；
-/// ④把各段 + 基础策略拼成 full_policy；⑤所有路径作为 -D 参数注入，最后 `-- command` 收尾。
-/// 返回值即 sandbox-exec 之后的全部 argv（不含 sandbox-exec 本身，由 manager.transform 补上）。
+/// 据权限策略生成完整的 `sandbox-exec` 参数。流程：① 按是否「全盘可写/可读」分别构造
+/// 文件写、文件读策略段（受限时枚举可写/可读根，并把根路径抽成 `-D` 参数）；② 据代理/网络
+/// 策略生成网络段（可能 fail-closed 为空）；③ 把基础策略 + 各段拼成完整 SBPL；④ 组装成
+/// `["-p", <policy>, "-D...", "--", <原命令...>]`。`--` 之后才是被沙箱包裹的真实命令。
 pub fn create_seatbelt_command_args(args: CreateSeatbeltCommandArgsParams<'_>) -> Vec<String> {
     let CreateSeatbeltCommandArgsParams {
         command,

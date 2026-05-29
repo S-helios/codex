@@ -1,9 +1,16 @@
-//! 【文件职责】工具调用的「路由层」。ToolRouter 持有本回合的工具注册表
-//! （ToolRegistry）与对模型可见的工具规格（model_visible_specs），负责两件事：
-//!   1. build_tool_call：把模型返回的 ResponseItem（FunctionCall / ToolSearchCall /
-//!      CustomToolCall）翻译成内部统一的 ToolCall。
-//!   2. dispatch_*：把 ToolCall 包成 ToolInvocation，交给 registry 真正执行。
-//! 【架构位置】上游是 turn.rs 采样循环，下游是 registry.rs（按名分发到具体 handler）。
+//! 工具路由器：把模型发来的工具调用按名分派到对应处理器，并对外暴露「模型可见」的工具规格。
+//!
+//! 【文件职责】定义 [`ToolRouter`]——持有一份 [`ToolRegistry`]（名字 → 处理器映射）与
+//!   `model_visible_specs`（要告诉模型「你有哪些工具」的规格清单）。核心方法是把一次
+//!   `ToolCall`（含工具名、call_id、payload）`dispatch_*` 到注册表里对应工具执行，返回
+//!   归一化的 `AnyToolResult`。还负责从 `ResponseItem` 解析出标准 `ToolCall`。
+//!
+//! 【架构位置】回合执行（`turn.rs`）与工具实现之间的「分发中枢」：上由 `built_tools`
+//!   在每回合装配（汇聚 MCP / 插件 / connector / 动态工具），下游是 `registry.rs`
+//!   （真正执行）与 `orchestrator.rs`（审批 / 沙箱 / 计时等横切编排）。
+//!
+//! 【关键设计】`model_visible_specs` 与实际可调工具是两套：有些工具注册了但不暴露给模型
+//!   （如内部 / 延迟工具），所以「能调」不等于「可见」，路由按 registry 而非 specs 判定。
 
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
@@ -31,6 +38,8 @@ use tracing::instrument;
 
 pub use crate::tools::context::ToolCallSource;
 
+/// 一次标准化的工具调用：工具名 + 调用 id（回程对账用）+ 入参载荷。模型返回的各种
+/// 调用形态（function call / custom tool call 等）都先归一成它，再交给路由分派。
 #[derive(Clone, Debug)]
 pub struct ToolCall {
     pub tool_name: ToolName,
@@ -38,8 +47,8 @@ pub struct ToolCall {
     pub payload: ToolPayload,
 }
 
-/// 回合级工具路由器：registry 管「怎么执行」，model_visible_specs 管「告诉模型有
-/// 哪些工具可用」（这份规格会被序列化进发给模型的请求里）。
+/// 工具路由器：`registry` 是「名字 → 处理器」的实际分派表，`model_visible_specs` 是
+/// 「要让模型知道自己有哪些工具」的对外规格清单。二者刻意分离（注册≠暴露）。
 pub struct ToolRouter {
     registry: ToolRegistry,
     model_visible_specs: Vec<ToolSpec>,
@@ -101,10 +110,6 @@ impl ToolRouter {
             .unwrap_or(false)
     }
 
-    /// 把模型输出条目翻译成内部 ToolCall。三类可执行调用各走一支：普通 FunctionCall
-    /// （带 namespace+name）、execution=="client" 的 ToolSearchCall（解析成搜索参数）、
-    /// CustomToolCall（自由文本 input）。其余条目返回 Ok(None)，表示「这不是一次需要
-    /// 本地执行的工具调用」（如纯文本消息、服务端自行执行的 tool_search）。
     #[instrument(level = "trace", skip_all, err)]
     pub fn build_tool_call(item: ResponseItem) -> Result<Option<ToolCall>, FunctionCallError> {
         match item {
@@ -178,6 +183,9 @@ impl ToolRouter {
         .await
     }
 
+    /// 分派一次工具调用并允许调用方观测「是否已抵达终态」。与上面的 code-mode 版同走
+    /// `_inner`，区别仅是传入一个 `terminal_outcome_reached` 原子标志——某些工具（如交互式
+    /// 终端）在产出最终结果前会先到达一个「终态」，该标志让上层据此提前推进，不必死等。
     #[instrument(level = "trace", skip_all, err)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn dispatch_tool_call_with_terminal_outcome(
@@ -202,10 +210,6 @@ impl ToolRouter {
         .await
     }
 
-    /// 真正的分发：拆出 (tool_name, call_id, payload) 组装成 ToolInvocation，再转交
-    /// registry 按工具名找到对应 handler 执行。terminal_outcome_reached 供「终态类」
-    /// 工具（如交还控制权 / 结束）做协作式取消。上面两个 pub 包装方法只是这层「带 /
-    /// 不带终态标志」的两个入口。
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_tool_call_with_code_mode_result_inner(
         &self,

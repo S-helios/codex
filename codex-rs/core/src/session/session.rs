@@ -1,3 +1,22 @@
+//! Session 核心数据结构：会话级「上帝对象」与其冻结配置快照。
+//!
+//! 【文件职责】定义两个中枢类型：
+//!   · [`Session`]——一次会话的运行期中枢，聚合事件出口、可变状态
+//!     `Mutex<SessionState>`、当前回合 `Mutex<Option<ActiveTurn>>`、输入队列与各类
+//!     服务句柄 `SessionServices`；方法实现分散在本文件 `impl Session`（本文件下半段）
+//!     与 `session/mod.rs` 的 `impl Session`（含审批回程等重逻辑）。
+//!   · [`SessionConfiguration`]——会话创建时冻结的配置快照（模型 provider、审批策略、
+//!     沙箱权限、工作目录、指令文本等），生命周期内视作只读。
+//!
+//! 【架构位置】会话状态层的根。上承 `codex_thread.rs` / `thread_manager.rs`
+//!   （线程 → 会话映射），下连 `state/`（SessionState / SessionServices 实体）、
+//!   `turn.rs`（回合执行）与 `client.rs`（模型请求）。
+//!
+//! 【关键设计】`Session` 全程以 `Arc<Session>` 被 agent 主循环、审批回调、工具调用
+//!   多处并发共享，故对可变字段一律用内部可变性（`Mutex<…>`）而非 `&mut self`。
+//!   配置进了 `SessionConfiguration` 即只读；回合内的临时偏移走 `TurnContext`，
+//!   两者互不污染（会话快照 vs 回合快照的分层）。
+
 use super::input_queue::InputQueue;
 use super::*;
 use crate::config::ConstraintError;
@@ -16,29 +35,46 @@ use tokio::sync::Semaphore;
 /// Context for an initialized model agent
 ///
 /// A session has at most 1 running task at a time, and can be interrupted by user input.
+/// 「会话上帝对象」：一次已初始化模型代理的全部运行期上下文。一个会话同一时刻最多
+/// 跑一个任务（见 `active_turn`），可被用户输入打断。它不是数据容器而是协调中枢——
+/// 事件出口、可变状态、当前回合、输入队列、各服务句柄都挂在它上面，并以 `Arc<Session>`
+/// 在并发各方间共享，故几乎所有可变字段都包了 `Mutex` / `watch` / `Atomic`。
 pub(crate) struct Session {
     pub(crate) conversation_id: ThreadId,
     pub(crate) installation_id: String,
+    // 事件单向出口：agent / 工具 / 审批各方把 `Event` 投进来，由 EQ 侧泵给客户端。
     pub(super) tx_event: Sender<Event>,
+    // agent 运行状态的广播源（idle / running / …），供多个观察者 watch。
     pub(super) agent_status: watch::Sender<AgentStatus>,
     pub(super) out_of_band_elicitation_paused: watch::Sender<bool>,
+    // 会话级可变状态（历史、token 计量、审批前缀缓存等），实体在 `state/session.rs`。
     pub(super) state: Mutex<SessionState>,
     /// Serializes rebuild/apply cycles for the running proxy; each cycle
     /// rebuilds from the current SessionState while holding this lock.
+    /// 串行化受管网络代理的「重建 + 应用」周期：每轮持锁期间从当前 SessionState 重建，
+    /// 防止并发刷新互相覆盖。
     pub(super) managed_network_proxy_refresh_lock: Semaphore,
     /// The set of enabled features should be invariant for the lifetime of the
     /// session.
+    /// 本会话启用的特性集合，生命周期内恒定不变（创建时定死，回合不得改写）。
     pub(super) features: ManagedFeatures,
     pub(super) pending_mcp_server_refresh_config: Mutex<Option<McpServerRefreshConfig>>,
     pub(crate) conversation: Arc<RealtimeConversationManager>,
+    // 「当前回合」槽位：`None` 表示空闲。这是「同一时刻最多一个任务」约束的落点。
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) input_queue: InputQueue,
     pub(crate) goal_runtime: GoalRuntimeState,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
+    // 各类外部服务句柄（MCP、rollout、通知、模型 client 等）的聚合，见 `state/service.rs`。
     pub(crate) services: SessionServices,
+    // 内部子提交 id 的单调计数器（用于会话自发起的内部 Submission，与用户提交区分）。
     pub(super) next_internal_sub_id: AtomicU64,
 }
 
+/// 会话级配置快照：创建会话时把外部 `Config` 中与本会话相关的项「冻结」成一份，
+/// 生命周期内当作只读基线。回合执行时若需临时偏移（如改 cwd / 审批策略），不改这里，
+/// 而是派生一份 `TurnContext`（见 `turn_context.rs`）——保证「会话不变量」与「回合临时态」
+/// 分层清晰。`derive(Clone)` 让派生回合快照时可廉价复制。
 #[derive(Clone)]
 pub(crate) struct SessionConfiguration {
     /// Provider identifier ("openai", "openrouter", ...).

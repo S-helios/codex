@@ -4,12 +4,21 @@ Runtime: shell
 Executes shell requests under the orchestrator: asks for approval when needed,
 builds sandbox transform inputs, and runs them under the current SandboxAttempt.
 */
-//! 【文件职责】shell 工具的运行时（ShellRuntime），实现 orchestrator 驱动的 ToolRuntime
-//! 契约。三块职责经三个 trait 体现：Sandboxable（沙箱偏好 / 失败可升级）、Approvable
-//! （审批键、发起审批）、ToolRuntime（网络审批声明 + run 真正执行）。
-//! 【run 做了什么】按用户 shell 包裹命令（注入环境快照、PowerShell 关 profile / 强制
-//!   UTF-8），可选走 zsh-fork 升级后端，最终经 build_sandbox_command + execute_env 落到
-//!   exec.rs 执行。
+//! shell 工具运行时：在编排器框架下执行 shell 命令。
+//!
+//! 【文件职责】定义 [`ShellRuntime`]，实现三个能力 trait：`Sandboxable`（声明可沙箱、
+//!   失败可升级）、`Approvable`（按 [`ApprovalKey`] 缓存审批结果，相同命令不重复问）、
+//!   `ToolRuntime`（`run` 真正构造并执行命令）。`run` 里处理 shell 包装（快照 env、
+//!   PowerShell UTF-8 前缀、Windows 提权关 profile）、可选的 zsh-fork 后端、沙箱命令构造、
+//!   超时与取消、网络拒绝联动。
+//!
+//! 【架构位置】被 `orchestrator.rs` 驱动（审批 → 沙箱 → run → 升级重试），底层调用
+//!   `exec.rs` 真正 spawn 子进程，沙箱命令由 `tools/runtimes/` 的辅助函数按平台构造。
+//!
+//! 【关键设计】`escalate_on_failure() == true` + `sandbox_preference() == Auto`：默认在沙箱内跑，
+//!   被沙箱拒绝时由编排器升级策略重试；审批用 `ApprovalKey`（命令 + cwd + 权限）做缓存键，
+//!   配合 `with_cached_approval` 实现「同一命令一次审批、重试不再打断」。
+
 #[cfg(unix)]
 pub(crate) mod unix_escalation;
 pub(crate) mod zsh_fork_backend;
@@ -52,8 +61,8 @@ use futures::future::BoxFuture;
 use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
 
-/// 一次 shell 调用的请求参数：命令、shell 类型、cwd、超时、取消令牌、环境变量、网络
-/// 代理、沙箱权限与审批要求等。由工具 handler 填好后交给 ShellRuntime 执行。
+/// 一次 shell 执行请求的全部输入：命令、shell 类型、cwd、超时、取消令牌、环境变量、
+/// 网络代理、沙箱权限与额外权限、审批要求等。由工具分派层组装后交给 `ShellRuntime::run`。
 #[derive(Clone, Debug)]
 pub struct ShellRequest {
     pub command: Vec<String>,
@@ -93,6 +102,9 @@ pub struct ShellRuntime {
     backend: ShellRuntimeBackend,
 }
 
+/// 审批缓存键：用「命令 + cwd + 沙箱权限 + 额外权限」唯一标识一次需审批的执行。
+/// 同一 key 已批准过就直接复用，不再打断用户——这正是沙箱升级重试时「无需 re-approval」的依据。
+/// 派生 `Hash`/`Eq` 即为入缓存表服务。
 #[derive(serde::Serialize, Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct ApprovalKey {
     command: Vec<String>,
@@ -136,9 +148,6 @@ impl Approvable<ShellRequest> for ShellRuntime {
         }]
     }
 
-    /// 发起审批：若本次走 guardian（审查代理），交给 review_approval_request；否则用
-    /// with_cached_approval 包一层——同一条命令 + 同样权限在本会话内已批准过就直接复用，
-    /// 不再二次打扰用户（这正是 orchestrator「重试时不重新审批」的底层支撑）。
     fn start_approval_async<'a>(
         &'a mut self,
         req: &'a ShellRequest,
@@ -235,10 +244,11 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         })
     }
 
-    /// 在给定 SandboxAttempt 下执行 shell 命令。先按用户 shell 把命令包装好（环境快照、
-    /// PowerShell 关闭 profile、强制 UTF-8）；ZshFork 后端满足条件时优先走其升级路径，
-    /// 否则 build_sandbox_command 组装沙箱命令、挂上超时与（网络拒绝）取消令牌，最终
-    /// execute_env 真正运行并返回输出。
+    /// 真正构造并执行命令（编排器在每次沙箱尝试时调用）。先按 shell 类型做一系列包装：
+    /// 用 session 快照恢复 env（`maybe_wrap_shell_lc_with_snapshot`）、Windows 提权沙箱下
+    /// 关闭 PowerShell profile、PowerShell 加 UTF-8 前缀；若选了 zsh-fork 后端则先试它、
+    /// 不满足条件再回落标准路径；最后 `build_sandbox_command` 把命令裹进当前 `attempt` 的
+    /// 沙箱，挂上超时与取消（含网络拒绝触发的取消），交 `exec.rs` 执行。
     async fn run(
         &mut self,
         req: &ShellRequest,

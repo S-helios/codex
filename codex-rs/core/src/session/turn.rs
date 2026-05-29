@@ -1,18 +1,17 @@
-//! 【文件职责】单个「回合（turn）」的执行引擎。`run_turn` 是 Codex agent 的
-//! 核心循环：把回合输入交给模型，反复「采样 → 执行工具 → 回填结果」，直到模型
-//! 给出最终助手消息、或被打断 / 出错才结束。
+//! 回合执行引擎：单个「回合」从输入到完成的完整采样循环。
 //!
-//! 【一个回合 = 多次采样】一次回合内通常包含多轮 sampling_request：
-//!   · 模型回函数调用 → 执行工具、把输出回填历史 → 再采样（needs_follow_up=true）
-//!   · 模型只回助手消息 → 记录历史、回合结束（needs_follow_up=false）
+//! 【文件职责】实现 [`run_turn`]——回合的主循环：注入技能 / 插件 / 上下文 → 反复向
+//!   模型发采样请求 → 对返回的函数调用就地执行并把输出回灌下一轮、对纯助手消息就记录
+//!   并收尾。沿途处理 token 压缩（pre-sampling / auto-compact）、各类 hook、计量埋点与
+//!   打断（`cancellation_token`）。[`built_tools`] 负责为本回合装配可用工具集。
 //!
-//! 【穿插的横切逻辑】循环里还编织着：自动压缩（token 超限时 run_auto_compact）、
-//!   pending input 引导（用户中途输入）、各类 hook（session start / stop /
-//!   legacy after-agent）、技能 / 插件注入、回合级 diff 跟踪、遥测与目标模式。
+//! 【架构位置】会话状态层的「执行核心」，由 `session/mod.rs` 调起。向上消费 `TurnContext`
+//!   （回合冻结配置）与 `Session`（会话状态），向下驱动 `client.rs`（模型流）与
+//!   `tools/`（工具执行），并把产出经 `record_conversation_items` 写回历史 + rollout。
 //!
-//! 【阅读建议】先读 run_turn 的主 `loop`：drain 输入 → for_prompt 拼请求 →
-//!   run_sampling_request → 据 needs_follow_up / token 状态决定 continue 或 break；
-//!   run_sampling_request 内部再看流式事件处理与工具分发。
+//! 【关键设计】「一次采样 ≈ 一个条目」：模型每轮通常只回一个函数调用或一条助手消息；
+//!   函数调用 → 执行 → 输出进下轮请求；纯助手消息 → 记录 → 回合结束。压缩在采样前先做，
+//!   以免上下文超限。
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -146,10 +145,12 @@ use tracing::warn;
 /// - If the model sends only an assistant message, we record it in the
 ///   conversation history and consider the turn complete.
 ///
-/// 回合主入口。开头先做一次性准备：预采样压缩、记录上下文更新、技能 / 插件注入、
-/// session-start hook、连接器选择等；随后进入 `loop` 反复采样直到收尾。
-/// 返回 `Option<String>`：Some 是本回合最后一条助手消息（供上层引用），
-/// None 表示因错误 / 中断提前结束（错误已通过 lifecycle 事件上报）。
+/// 回合主循环：接收初始回合输入，反复发采样请求，模型每轮回「函数调用」或「助手消息」。
+/// 函数调用 → 就地执行 → 把输出回灌进下一轮请求；纯助手消息 → 记录进历史并判定回合结束。
+/// 进入循环前先做一串前置：pre-sampling 压缩（防上下文超限，失败即发 error 生命周期事件
+/// 并据 UsageLimit 联动 goal_runtime）、记录上下文更新、装配技能 / 插件 / connector、跑
+/// session-start 与输入 hook、记录注入条目与计量。`prewarmed_client_session` 允许复用预热好的
+/// 模型会话连接；`cancellation_token` 用于协作式打断。返回最后一条助手消息文本（若有）。
 pub(crate) async fn run_turn(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -250,8 +251,6 @@ pub(crate) async fn run_turn(
             break;
         }
 
-        // 步骤①：把当前对话历史快照按模型支持的输入模态 for_prompt 成请求体。
-        // 每轮循环都重新拼一次——因为上一轮可能刚把工具输出 / 压缩结果写进了历史。
         // Construct the input that we will send to the model.
         let sampling_request_input: Vec<ResponseItem> = {
             sess.clone_history()
@@ -308,9 +307,6 @@ pub(crate) async fn run_turn(
                     "post sampling token usage"
                 );
 
-                // 步骤②：本轮采样后若 token 触顶且仍需继续 → 触发「回合中途自动
-                // 压缩」，压缩完 continue 重新采样。注释意在打消死循环顾虑：只要
-                // 压缩能把 token 显著压到限额以下，就不会反复触发。
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                 if token_limit_reached && needs_follow_up {
                     if let Err(err) = run_auto_compact(
@@ -343,10 +339,6 @@ pub(crate) async fn run_turn(
                     continue;
                 }
 
-                // 步骤③：模型不再需要后续（无工具调用、也无待处理输入）→ 收尾。
-                // 先跑 stop hook：它可以「拦截结束」并塞入续写提示（should_block →
-                // 记录提示后 continue 再来一轮），也可以放行；最后跑 legacy after-agent
-                // hook，然后 break 退出回合循环。
                 if !needs_follow_up {
                     last_agent_message = sampling_request_last_agent_message;
                     let stop_outcome = run_turn_stop_hooks(
@@ -737,9 +729,6 @@ async fn auto_compact_token_status(
     }
 }
 
-/// 回合开始、采样前的压缩检查：先处理「切到更小上下文窗口模型」时的预压缩
-/// （maybe_run_previous_model_inline_compact），再看自动压缩预算 / 可用窗口是否
-/// 已耗尽，是则在采样前就 run_auto_compact 腾出空间。
 async fn run_pre_sampling_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -766,10 +755,6 @@ async fn run_pre_sampling_compact(
 /// context-window model.
 ///
 /// Returns `Err(_)` only when compaction was attempted and failed.
-///
-/// 「模型降档」优化：本回合切到上下文窗口更小的模型、而历史已超出新窗口 / 新模型
-/// 的自动压缩阈值时，先用**上一个模型**对历史做一次压缩，免得新模型一上来就因装不下
-/// 旧历史而失败。三个条件全满足才执行：超限 && 模型确实换了 && 旧窗口比新窗口大。
 async fn maybe_run_previous_model_inline_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -822,9 +807,6 @@ async fn maybe_run_previous_model_inline_compact(
     Ok(())
 }
 
-/// 执行一次自动压缩：把冗长的对话历史交给模型 / 远端服务总结成更短的形式，
-/// 腾出上下文空间。按 provider 能力与 Feature 选择远端 v1/v2 或本地内联压缩路径；
-/// reason / phase 仅用于遥测区分（上下文超限 / 模型降档；回合前 / 回合中）。
 async fn run_auto_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -962,10 +944,6 @@ pub(crate) fn build_prompt(
         cwd = %turn_context.cwd.display()
     )
 )]
-/// 「一次采样请求」的重试包装层。先构建本回合的工具路由 / 运行时，再 `loop`：
-/// 调 try_run_sampling_request 真正发请求；ContextWindowExceeded / UsageLimitReached
-/// 是不可重试的硬错误（更新状态后直接上抛），其余可重试错误交给
-/// handle_retryable_response_stream_error 做退避重试，直到成功或重试耗尽。
 async fn run_sampling_request(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -1060,9 +1038,6 @@ async fn run_sampling_request(
     }
 }
 
-/// 组装本回合可用的工具集合（ToolRouter）：合并内置工具、已连接 MCP server 暴露
-/// 的工具、扩展 / 插件工具等，并按当前回合配置（apps_enabled 等）过滤。每回合重建
-/// 一次——因为可用工具会随配置变化、随已连接的 MCP server 增减而变化。
 #[expect(
     clippy::await_holding_invalid_type,
     reason = "tool router construction reads through the session-owned manager guard"
@@ -1075,6 +1050,10 @@ async fn run_sampling_request(
         apps_enabled = turn_context.apps_enabled()
     )
 )]
+/// 为本回合装配可用工具集，产出一个 [`ToolRouter`]（按工具名路由调用的分发器）。
+/// 汇聚多个来源：MCP 服务器暴露的工具、已加载插件、（apps 开启时）可访问的 connector，
+/// 再结合回合配置裁剪与启用状态。每回合现算是因为可用工具随模型 / apps 开关 / MCP 连接
+/// 动态变化。`cancellation_token` 让列举 MCP 工具等耗时步骤可被打断。
 pub(crate) async fn built_tools(
     sess: &Session,
     turn_context: &TurnContext,
@@ -1740,11 +1719,6 @@ async fn drain_in_flight(
         model = %turn_context.model_info.slug
     )
 )]
-/// 真正发起一次流式采样并消费事件流。先 client_session.stream() 拿到 ResponseStream，
-/// 再在 `loop` 里逐个处理 ResponseEvent：OutputItemDone 把完成的条目落历史 / 派发工具
-/// 调用（放进 in_flight 这个 FuturesOrdered 并行执行），OutputTextDelta 等增量事件喂给
-/// 流式解析器实时推送给客户端，直到 Completed 收尾。返回 SamplingRequestResult
-/// { needs_follow_up, last_agent_message }——只要本轮产生了工具调用就 needs_follow_up=true。
 async fn try_run_sampling_request(
     tool_runtime: ToolCallRuntime,
     sess: Arc<Session>,

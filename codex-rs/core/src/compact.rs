@@ -1,12 +1,19 @@
-//! 【文件职责】对话「压缩 / 摘要」（compaction）—— Codex 应对上下文窗口上限的核心优化。
-//! 当历史过长时，让模型把既往对话总结成一段摘要，再用「摘要 + 最近若干条用户消息」整体
-//! 替换原历史，从而大幅压缩 token 占用、把宝贵的上下文留给后续推理。
-//! 【三个触发口】run_inline_auto_compact_task（回合中自动触发）、run_compact_task（用户
-//!   手动 /compact）、以及供 turn.rs 预采样阶段调用的内联压缩；它们最终都汇到
-//!   run_compact_task_inner（跑 pre/post-compact hook + 埋点）→ run_compact_task_inner_impl
-//!   （真正干活：发摘要请求、拿摘要、重建历史）。
-//! 【与 remote 压缩的关系】should_use_remote_compact_task 判断 provider 是否支持服务端压缩；
-//!   本文件实现的是「本地内联」实现（CompactionImplementation::Responses）。
+//! 上下文压缩（compaction）：把过长历史交给模型总结成摘要，再用「摘要 + 近期用户消息」
+//! 替换原历史，腾出上下文窗空间。
+//!
+//! 【文件职责】实现压缩任务的完整流程：判定走本地还是远端压缩（`should_use_remote_compact_task`）、
+//!   运行压缩回合（`run_compact_task` → `_inner` → `_inner_impl`：用 `SUMMARIZATION_PROMPT`
+//!   让模型产出摘要，带重试 / 上下文超限时丢最旧条目的降级）、以及把结果组装成新历史
+//!   （`build_compacted_history`：摘要 + 受 token 预算约束的近期用户消息）。
+//!
+//! 【架构位置】上下文层的「空间回收器」：由 `turn.rs` 在 pre-sampling 或 auto-compact 时
+//!   调起，读写 `ContextManager`（history.rs），产出经 rollout 落盘。本地 / 远端两套实现
+//!   （compact_remote*.rs）共享这里的组装逻辑。
+//!
+//! 【关键设计】`InitialContextInjection` 决定压缩后是否把「初始上下文」重新注入：手动 / 回合前
+//!   压缩用 `DoNotInject`（清基线、下个常规回合全量重注）；回合中压缩用 `BeforeLastUserMessage`
+//!   （模型被训练成「压缩后摘要是历史最后一项」，故把初始上下文插在最后一条真实用户消息之上）。
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -66,14 +73,12 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 /// Mid-turn compaction must use `BeforeLastUserMessage` because the model is trained to see the
 /// compaction summary as the last item in history after mid-turn compaction; we therefore inject
 /// initial context into the replacement history just above the last real user message.
-/// 控制压缩后「初始上下文」（系统/开发者提示词等）如何重新注入替换历史：
-/// - DoNotInject：预采样 / 手动压缩用。它清掉 reference_context_item，下一个常规回合会从头
-///   完整重注入初始上下文，故这里不必插。
-/// - BeforeLastUserMessage：回合中（mid-turn）压缩用。因为模型被训练成「压缩后摘要应是历史
-///   最后一项」，所以必须把初始上下文插到「最后一条真实用户消息之上」，让摘要保持在末尾。
+/// 压缩后是否 / 如何把「初始上下文」重新注入替换历史（见文件头【关键设计】）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InitialContextInjection {
+    /// 回合中压缩用：把初始上下文插在「最后一条真实用户消息」之上，保证压缩摘要仍是历史末项。
     BeforeLastUserMessage,
+    /// 回合前 / 手动压缩用：不注入，并清空基线，留给下个常规回合全量重注。
     DoNotInject,
 }
 
@@ -186,11 +191,12 @@ async fn run_compact_task_inner(
     result.map(|_| ())
 }
 
-/// 压缩的「实干」函数：①把压缩提示词作为一条 user 输入追加到历史副本；②循环调用模型
-/// （drain_to_completed）直到拿到完整回复，期间带重试与「上下文仍超限就丢最旧一条再试」
-/// 的降级；③取模型最后一条 assistant 消息作为摘要正文，配 SUMMARY_PREFIX 成摘要；④用
-/// 「（预算内的）最近用户消息 + 摘要」build_compacted_history 重建历史，按需插回初始上下文；
-/// ⑤replace_compacted_history 整体替换会话历史并重算 token。返回摘要正文。
+/// 压缩任务的真正实现体。流程：① 发「压缩条目开始」事件、把触发输入并进历史副本；
+/// ② 循环向模型发 `SUMMARIZATION_PROMPT` 请求摘要，复用同一 client_session 以保住回合态
+/// （sticky 路由、ws 增量请求跟踪）跨重试存活；③ 错误处理三分支——`Interrupted` 直接上抛；
+/// `ContextWindowExceeded` 且还有多条历史时「丢最旧一条、重置重试计数再来」（从头删以保前缀
+/// 缓存、留住近期消息），只剩一条还超则放弃；其他错误走指数退避重试至上限。④ 拿到摘要后用
+/// `build_compacted_history` 组装新历史，按 `initial_context_injection` 决定是否回插初始上下文。
 async fn run_compact_task_inner_impl(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -251,8 +257,6 @@ async fn run_compact_task_inner_impl(
             Err(e @ CodexErr::ContextWindowExceeded) => {
                 if turn_input_len > 1 {
                     // Trim from the beginning to preserve cache (prefix-based) and keep recent messages intact.
-                    // 连「压缩请求」本身都塞不下时的降级：从**最旧**一条开始丢（而非丢新的），
-                    // 既保住前缀缓存命中、又尽量保留近期消息；丢一条后重置 retries 再试。
                     error!(
                         "Context window exceeded while compacting; removing oldest history item. Error: {e}"
                     );
@@ -492,6 +496,10 @@ pub(crate) fn insert_initial_context_before_last_real_user_or_summary(
     compacted_history
 }
 
+/// 组装压缩后的新历史：初始上下文 + 受 token 预算（`COMPACT_USER_MESSAGE_MAX_TOKENS`=20k）
+/// 约束的近期用户消息 + 摘要。用户消息从新到旧择取直到预算耗尽（超预算的那条截断后纳入），
+/// 保留近期原始用户输入既助模型衔接、又不让历史重新膨胀。薄封装，固定预算后转
+/// `build_compacted_history_with_limit`。
 pub(crate) fn build_compacted_history(
     initial_context: Vec<ResponseItem>,
     user_messages: &[String],
@@ -505,9 +513,6 @@ pub(crate) fn build_compacted_history(
     )
 }
 
-/// 重建压缩后历史：在 max_tokens 预算内**从最近往前**挑用户消息（reverse 遍历），逐条扣减
-/// 预算，放不下整条时截断末尾那条；选完再 reverse 回正序拼到 history，最后追加摘要消息。
-/// 「保新弃旧」的取舍：最近的用户意图比久远的更可能与当前任务相关。
 fn build_compacted_history_with_limit(
     mut history: Vec<ResponseItem>,
     user_messages: &[String],
@@ -561,9 +566,6 @@ fn build_compacted_history_with_limit(
     history
 }
 
-/// 发起一次模型请求并把流「抽干」到 Completed：边收边把 OutputItemDone 记进会话历史（摘要
-/// 正文就这样落到历史里，供上层取最后一条 assistant 消息），收到 Completed 更新 token 用量
-/// 后返回；流提前关闭视为错误。是压缩回合里「单次采样」的最小执行单元。
 async fn drain_to_completed(
     sess: &Session,
     turn_context: &TurnContext,

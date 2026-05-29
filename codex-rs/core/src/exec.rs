@@ -1,10 +1,23 @@
-//! 【文件职责】把一次「命令执行」请求真正落地为子进程：组装受沙箱约束的 argv/env、
-//! 拉起子进程、按超时 / 取消策略采集 stdout/stderr（可边跑边流式推送 delta），并归一
-//! 化退出码（超时、被信号杀死等都映射成约定码）。
-//! 【调用链】工具层（shell handler 等）→ process_exec_tool_call → build_exec_request
-//!   （经 SandboxManager.transform 决定「具体怎么在沙箱里跑」）→ sandboxing::execute_env
-//!   → exec → spawn_child_async + consume_output。
-//! 【退出码约定】超时码 124、SIGKILL=9、128+signal 等遵循 shell 惯例，便于模型 / 用户解读。
+//! 通用命令执行层：把一条「要跑什么」的描述真正变成子进程并收集其输出。
+//!
+//! 【文件职责】定义命令执行的可移植描述与执行流水线：
+//!   - 数据结构：[`ExecParams`]（命令 + cwd + 环境 + 沙箱许可 + 超时/取消 + 捕获策略）、
+//!     [`ExecExpiration`]（超时 / 取消 / 二者取先到）、[`ExecCapturePolicy`]（输出是否封顶）、
+//!     [`StdoutStream`]（把 stdout/stderr 增量实时发成事件）。
+//!   - 执行流水线：[`process_exec_tool_call`]（对外主入口）→ [`build_exec_request`]
+//!     （把可移植 `ExecParams` 经 `SandboxManager` 变换成带沙箱包裹的具体 argv/env）→
+//!     `crate::sandboxing::execute_env` → [`execute_exec_request`] → [`exec`]（真正 spawn）→
+//!     [`consume_output`]（并发读 stdout/stderr、按超时/取消/Ctrl-C 终止进程组）。
+//!
+//! 【架构位置】工具执行栈的最底层：上游 `runtimes/shell.rs` 的 `ShellRuntime` 负责拼好
+//!   `ExecParams`（含 shell 包裹）并调用 [`process_exec_tool_call`]；沙箱细节由
+//!   `crate::sandboxing` 横切注入。再往上才是 orchestrator 的审批/重试编排。
+//!
+//! 【关键设计】(1) [`exec`] 本身不做任何沙箱——调用方必须把沙箱包裹参数提前塞进
+//!   `command`；沙箱是在 [`build_exec_request`] 阶段由 `SandboxManager::transform` 注入的。
+//!   (2) 输出有硬上限 [`EXEC_OUTPUT_MAX_BYTES`]，防单条命令狂吐 stdout 把 agent 撑爆内存；
+//!   `FullBuffer` 策略（受信内部 helper）才不封顶。(3) 超时/取消都落到杀「进程组」而非单进程，
+//!   因为子进程可能 fork 出孙进程并继承管道 fd，只杀直接子进程会让读管道任务永久阻塞。
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -89,21 +102,25 @@ pub(crate) const MAX_EXEC_OUTPUT_DELTAS_PER_CALL: usize = 10_000;
 // indefinitely, effectively hanging the whole agent.
 pub const IO_DRAIN_TIMEOUT_MS: u64 = 2_000; // 2 s should be plenty for local pipes
 
-/// 一次命令执行的「可移植描述」：命令 argv、工作目录、超时、输出采集策略、环境变量、
-/// 网络代理、沙箱权限与 Windows 沙箱档位等。它与具体平台 / 沙箱实现无关，后续由
-/// build_exec_request 翻译成真正要 spawn 的 argv/env。
+/// 一条命令的可移植执行描述：跨平台、与具体沙箱后端无关。它既是 [`process_exec_tool_call`]
+/// 的入参，也是 [`execute_exec_request`] 把 `ExecRequest` 拆回来后再喂给 [`exec`] 的载体。
 #[derive(Debug)]
 pub struct ExecParams {
+    /// 完整 argv：`command[0]` 是程序，其余是参数。注意若需沙箱，包裹参数须已拼在这里。
     pub command: Vec<String>,
     pub cwd: AbsolutePathBuf,
+    /// 何时强制结束：纯超时 / 默认超时 / 仅取消 / 超时与取消取先到。
     pub expiration: ExecExpiration,
+    /// 输出捕获策略：`ShellTool` 封顶 + 走超时；`FullBuffer` 不封顶、不超时（受信 helper）。
     pub capture_policy: ExecCapturePolicy,
     pub env: HashMap<String, String>,
     pub network: Option<NetworkProxy>,
     pub sandbox_permissions: SandboxPermissions,
     pub windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel,
     pub windows_sandbox_private_desktop: bool,
+    /// 申请提权运行时给用户看的理由（审批用）；执行阶段忽略。
     pub justification: Option<String>,
+    /// 覆写子进程的 argv[0]（如让程序「自认为」叫别的名字）；不影响实际可执行文件。
     pub arg0: Option<String>,
 }
 
@@ -135,6 +152,9 @@ fn windows_sandbox_uses_elevated_backend(
     proxy_enforced || matches!(sandbox_level, WindowsSandboxLevel::Elevated)
 }
 
+/// 输出捕获策略：决定是否给 stdout/stderr 封顶、是否启用超时。模型驱动的 shell 命令
+/// 用默认的 `ShellTool`（既怕狂吐撑爆内存、又怕卡死，所以两道闸都开）；受信内部 helper
+/// 跑确定性命令时用 `FullBuffer`（要拿全量输出、且不该被超时打断）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExecCapturePolicy {
     /// Shell-like execs keep the historical output cap and timeout behavior.
@@ -161,6 +181,9 @@ fn select_process_exec_tool_sandbox_type(
 }
 
 /// Mechanism to terminate an exec invocation before it finishes naturally.
+/// 在命令自然结束前强制终止它的几种方式。`wait_with_outcome` 会按变体决定等什么：
+/// 纯超时、默认超时（[`DEFAULT_EXEC_COMMAND_TIMEOUT_MS`]）、仅等取消令牌、或二者取先到
+/// （`biased` 优先判取消）。`with_cancellation` 用于把一个取消令牌叠加进已有策略。
 #[derive(Clone, Debug)]
 pub enum ExecExpiration {
     Timeout(Duration),
@@ -296,6 +319,9 @@ impl ExecCapturePolicy {
     }
 }
 
+/// 实时输出通道：把子进程的 stdout/stderr 增量边读边发成 `ExecCommandOutputDelta` 事件，
+/// 让上层 UI 能流式看到命令输出。`sub_id`/`call_id` 用于让事件对账回这次具体调用；
+/// 不传它（`None`）则只在结束时返回聚合结果、不发增量。
 #[derive(Clone)]
 pub struct StdoutStream {
     pub sub_id: String,
@@ -303,8 +329,9 @@ pub struct StdoutStream {
     pub tx_event: Sender<Event>,
 }
 
-/// 命令执行的公开入口：先 build_exec_request 把可移植参数转成受沙箱约束的具体请求，
-/// 再统一交给 sandboxing::execute_env 执行（保证全局只有一条命令执行路径）。
+/// 执行一次工具命令的对外主入口。两步：先 [`build_exec_request`] 把可移植 `params` 变换成
+/// 带沙箱包裹的具体请求，再交给 `crate::sandboxing::execute_env` 走「统一执行路径」。
+/// 把变换与执行拆开是为了让所有 exec（不论来自哪个工具）都汇聚到同一条沙箱执行链上。
 #[allow(clippy::too_many_arguments)]
 pub async fn process_exec_tool_call(
     params: ExecParams,
@@ -328,10 +355,11 @@ pub async fn process_exec_tool_call(
 
 /// Transform a portable exec request into the concrete argv/env that should be
 /// spawned under the requested sandbox policy.
-///
-/// 把可移植的 ExecParams 翻译成「在选定沙箱策略下真正要 spawn 的 argv/env」：据权限
-/// profile 推导文件系统 / 网络沙箱策略 → 选定 sandbox_type → 应用网络代理环境变量 →
-/// 交 SandboxManager.transform 包裹成最终命令（如 macOS 下会用 sandbox-exec 再包一层）。
+/// 把可移植的 exec 请求变换成「在指定沙箱策略下该真正 spawn 的」具体 argv/env。
+/// 关键步骤：① 由 `permission_profile` 推出文件系统/网络沙箱策略并选定 `SandboxType`；
+/// ② 若启用网络代理则把代理变量注入 env；③ `SandboxManager::transform` 注入沙箱包裹参数，
+/// 得到 `ExecRequest`；④ 据 Windows 后端（提权 / 受限令牌）解析对应的文件系统覆写。
+/// 注意：审批相关字段（justification / sandbox_permissions）和 arg0 在这一步被刻意忽略。
 pub fn build_exec_request(
     params: ExecParams,
     permission_profile: &PermissionProfile,
@@ -436,6 +464,10 @@ pub fn build_exec_request(
     Ok(exec_req)
 }
 
+/// 执行一个已变换好的 `ExecRequest`：把它拆回 `ExecParams`，计时跑
+/// `get_raw_output_result`（Windows 受限令牌沙箱走专门分支，其余走 [`exec`]），
+/// 再 `finalize_exec_result` 把原始输出 + 沙箱类型 + 耗时归一成 `ExecToolCallOutput`。
+/// `after_spawn` 回调在子进程 spawn 之后、开始收集输出之前触发（如登记 PID）。
 pub(crate) async fn execute_exec_request(
     exec_request: ExecRequest,
     stdout_stream: Option<StdoutStream>,
@@ -926,10 +958,10 @@ fn aggregate_output(
 /// Note this command does not apply any sandboxing logic. The caller is
 /// responsible for constructing [ExecParams::command] to include any sandboxing
 /// wrapper args, as appropriate.
-/// 真正拉起子进程并采集输出。spawn_child_async 按网络沙箱策略与 stdio 策略创建子进程；
-/// after_spawn 回调用于「进程已起来」后的副作用（如登记 pid）；随后 consume_output
-/// 按超时 / 取消采集 stdout/stderr。注意：env 里的代理变量已在上游按 attempt 注入，
-/// 这里把 network 置 None 以免重复 apply（见内部注释）。
+/// 用 [`ExecParams`] 描述跑一条命令的通用底层函数：注入网络代理变量 → `spawn_child_async`
+/// 拉起子进程 → 触发 `after_spawn` 回调 → 交给 [`consume_output`] 收集输出。
+/// 【关键】本函数不做任何沙箱——沙箱包裹参数必须由调用方提前拼进 `command`（见
+/// [`build_exec_request`]）；这里只负责「裸 spawn + 收集」。
 async fn exec(
     params: ExecParams,
     network_sandbox_policy: NetworkSandboxPolicy,
@@ -1331,10 +1363,11 @@ fn has_reopened_writable_descendant(
 
 /// Consumes the output of a child process according to the configured capture
 /// policy.
-/// 采集子进程输出并管理生命周期：为 stdout / stderr 各起一个读取任务（带保留字节上限，
-/// 防止超大输出撑爆内存），再用 `select!` 在「进程自然退出」与「到期（超时 / 取消）」
-/// 之间竞争——超时则杀掉整个进程组并合成 124 退出码，取消则给 TERM 感知进程留出短暂
-/// 清理窗口后再强杀。
+/// 按捕获策略收集子进程输出。设计：先 spawn 两个 [`read_output`] 任务并发读 stdout/stderr，
+/// 再用 `tokio::select!` 同时等三件事——子进程自然退出 / 到期（超时或取消）/ 收到 Ctrl-C。
+/// 到期或 Ctrl-C 时先杀「进程组」再 `start_kill` 直接子进程：因为子进程可能 fork 出孙进程
+/// 并继承了管道 fd，只杀直接子进程会让读管道任务永久阻塞，进而卡死整个 agent。取消还会给
+/// TERM-aware 进程一段宽限期（[`CANCELLATION_TERMINATION_GRACE_PERIOD`]）做清理后再强杀。
 async fn consume_output(
     mut child: Child,
     expiration: ExecExpiration,
@@ -1474,6 +1507,10 @@ async fn consume_output(
     })
 }
 
+/// 持续读一个流（stdout 或 stderr）直到 EOF：每读到一块，若配了实时通道且未超发
+/// 上限（[`MAX_EXEC_OUTPUT_DELTAS_PER_CALL`]）就发一个增量事件；同时把数据按
+/// `max_bytes` 上限追加进聚合缓冲（`None` 表示不封顶）。【关键】即便增量事件已停发、
+/// 聚合也已封顶，仍要读到 EOF——否则管道写满会反压、卡住子进程。
 async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
     mut reader: R,
     stream: Option<StdoutStream>,

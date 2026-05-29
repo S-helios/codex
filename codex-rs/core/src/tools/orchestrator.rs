@@ -6,11 +6,20 @@ simple sequence for any ToolRuntime: approval → select sandbox → attempt →
 retry with an escalated sandbox strategy on denial (no re‑approval thanks to
 caching).
 */
-//! 【文件职责】工具执行的「审批 + 沙箱选择 + 重试」编排器。对任意 ToolRuntime 驱动
-//! 一条固定流程：请求审批 → 选定初始沙箱 → 首次尝试 → 若因沙箱拒绝失败，则升级沙箱
-//! 策略重试（靠审批缓存，重试时不再二次打扰用户）。
-//! 【为何独立一层】把「要不要批准、在多严的沙箱里跑、失败如何降级重试」这些横切策略
-//!   从具体工具（shell / apply_patch 等）里抽出集中处理，工具自身只管「怎么执行」。
+//! 工具执行编排器：把「审批 + 沙箱选择 + 失败重试」这套横切逻辑统一在一处。
+//!
+//! 【文件职责】[`ToolOrchestrator`] 为任意 `ToolRuntime` 驱动一条固定序列：
+//!   申请审批 → 选定沙箱 → 尝试执行 → 若因沙箱拒绝而失败，则**升级沙箱策略**重试
+//!   （得益于审批缓存，重试无需再次征求用户）。还内置 guardian 自动审查、网络访问审批
+//!   （即时 / 延迟两种模式）与 OTel 决策埋点。
+//!
+//! 【架构位置】夹在 `router.rs`（分派到具体工具）与具体工具运行时（`runtimes/`）之间的
+//!   「安全闸 + 重试外壳」。审批走 `Session::request_command_approval`（fail-closed 回程），
+//!   沙箱走 `codex_sandboxing::SandboxManager`。
+//!
+//! 【关键设计】「先在更严沙箱里试、被拒再升级」而非「一上来就放宽」——最小权限优先；
+//!   且升级重试复用首次审批结果，避免反复打断用户。
+
 use crate::guardian::guardian_rejection_message;
 use crate::guardian::guardian_timeout_message;
 use crate::guardian::new_guardian_review_id;
@@ -44,11 +53,14 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxType;
 
-/// 工具编排器，持有一个 SandboxManager，用于按平台挑选并施加沙箱。
+/// 编排器本体：只持有一个 `SandboxManager`（按平台选 seatbelt / bwrap+seccomp / 无沙箱）。
+/// 无状态可重用——每次 `run` 自带本次调用的上下文。
 pub(crate) struct ToolOrchestrator {
     sandbox: SandboxManager,
 }
 
+/// 一次编排执行的结果：工具产出 `output` + 可选的「延迟网络审批」句柄
+/// （`Deferred` 模式下成功执行后才最终确认网络规则，失败则在 `run` 内回滚）。
 pub(crate) struct OrchestratorRunResult<Out> {
     pub output: Out,
     pub deferred_network_approval: Option<DeferredNetworkApproval>,
@@ -61,9 +73,6 @@ impl ToolOrchestrator {
         }
     }
 
-    /// 在「一个具体沙箱配置」下跑一次工具，并处理网络审批的两种模式：Immediate
-    /// （当场结算）/ Deferred（成功才延迟结算，失败则立即收尾）。把网络拒绝用的取消
-    /// 令牌注入本次 SandboxAttempt，使网络违规能即时中断执行。
     async fn run_attempt<Rq, Out, T>(
         tool: &mut T,
         req: &Rq,
@@ -134,10 +143,11 @@ impl ToolOrchestrator {
         }
     }
 
-    /// 编排单个工具调用的完整执行：① 按审批要求决定是否征求用户 / guardian 批准
-    /// （Forbidden 直接拒、Skip 多数免批、NeedsApproval 走 request_approval）；② 在
-    /// 选定的初始沙箱下首次尝试；③ 若失败且属沙箱拒绝，升级沙箱策略重试。返回里带
-    /// deferred_network_approval：延迟型网络审批留待上层最终结算。
+    /// 编排器主入口：对一个工具运行时跑完整的「审批 → 沙箱 → 尝试 → 升级重试」序列。
+    /// 步骤标号见函数内注释：(1) 审批——按工具的 `exec_approval_requirement` 或默认策略决定
+    /// 是否需要征求用户 / guardian（`strict_auto_review` 下即便可跳过也强制送审）；
+    /// (2) 选首次沙箱并尝试；(3) 若因沙箱拒绝失败则升级策略重试，复用已有审批不再打断。
+    /// 全程打 OTel 决策埋点。泛型 `T: ToolRuntime<Rq, Out>` 让任意工具复用这套外壳。
     pub async fn run<Rq, Out, T>(
         &mut self,
         tool: &mut T,

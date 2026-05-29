@@ -1,13 +1,18 @@
-//! 「线程级」对外门面 `CodexThread`——把底层 `Codex`（提交/事件队列对）包成一个
-//! 面向 app-server / 嵌入方的高层 API。
+//! Thread 层：在 `Codex`（SQ/EQ 句柄）之上再包一层「线程」语义的门面。
 //!
-//! 这里几乎所有方法都是「薄转发」：`submit`/`next_event`/`steer_input` 直接委托
-//! 给内部 `codex`。它存在的价值在于「收口与语义化」：
-//! ① 把零散的 `Op` 提交封装成有名字的操作（设置变更、注入历史、读 MCP 资源……）；
-//! ② 持有 thread 级的小状态（rollout 路径、带外 elicitation 计数）；
-//! ③ 暴露持久化读写（load_history/read_thread/update_thread_metadata），把
-//!    「活线程」转交给 thread-store 层落盘。
-//! 一句话：`Codex` 是机制，`CodexThread` 是面向使用者的策略门面。
+//! 【文件职责】定义 [`CodexThread`]——一个线程（旧称 conversation）的双向消息管道，
+//!   把底层 `Codex` 的 `submit` / 事件流再包装出线程级 API（提交、steer 追加输入、
+//!   读下一事件、goal 运行时联动、rollout 落盘、内存模式等）。另含两个配置载体：
+//!   [`ThreadConfigSnapshot`]（线程当前配置只读快照，可一键派生沙箱策略）与
+//!   [`CodexThreadSettingsOverrides`]（app-server 在起回合前校验的「逐回合覆盖项」）。
+//!
+//! 【架构位置】会话生命周期的「线程外壳」：上承 `thread_manager.rs`（管理多个线程），
+//!   下持一个 `Codex`（即一个 `Session` 的把手）。线程 = 一次可持久化 / 可恢复 / 可 fork
+//!   的对话单元；会话 = 该线程当前活着的运行实例。
+//!
+//! 【阅读建议】先看 `CodexThread` 字段与 `submit` / `steer_input` / `next_event`，
+//!   理解「提交进、事件出」如何透传给内层 `Codex`；配置覆盖与 goal 联动可按需再看。
+
 use crate::agent::AgentStatus;
 use crate::config::ConstraintResult;
 use crate::goals::ExternalGoalSet;
@@ -61,6 +66,9 @@ use tokio::sync::watch;
 
 use codex_rollout::state_db::StateDbHandle;
 
+/// 线程当前配置的只读快照：模型、provider、审批 / 权限 profile、cwd、工作区根、推理
+/// 强度等一次性打包。供查询与展示用，并可经 `sandbox_policy()` 一键派生兼容沙箱策略。
+/// 与 `SessionConfiguration` 的区别：这是「线程对外暴露」的精简视图，后者是会话内部全量配置。
 #[derive(Clone, Debug)]
 pub struct ThreadConfigSnapshot {
     pub model: String,
@@ -95,6 +103,10 @@ impl ThreadConfigSnapshot {
 }
 
 /// Thread settings overrides that app-server validates before starting a turn.
+/// 「逐回合覆盖项」：app-server 在起一个回合前校验并应用的临时设置。每个字段都是
+/// `Option`——`None` 表示沿用线程现有配置，`Some` 表示本回合临时改写（如换模型、改 cwd、
+/// 调审批策略）。这是「会话基线 + 回合偏移」分层在 API 边界上的入参形态。注意 `effort` /
+/// `service_tier` 用 `Option<Option<_>>`：外层区分「是否覆盖」，内层区分「显式设为 None」。
 #[derive(Clone, Default)]
 pub struct CodexThreadSettingsOverrides {
     pub cwd: Option<PathBuf>,
@@ -114,6 +126,10 @@ pub struct CodexThreadSettingsOverrides {
     pub personality: Option<Personality>,
 }
 
+/// 一个线程的运行实例外壳：持有底层 `Codex` 句柄（即一个活着的 `Session`），并缓存
+/// 建会话时的 `SessionConfiguredEvent`、rollout 落盘路径、带外 elicitation 计数。
+/// 线程级 API 基本都是「转调内层 `codex`」的薄包装，额外叠加线程语义（goal 联动、
+/// rollout 物化、内存模式持久化等）。
 pub struct CodexThread {
     pub(crate) codex: Codex,
     pub(crate) session_source: SessionSource,
@@ -124,9 +140,7 @@ pub struct CodexThread {
 
 /// Conduit for the bidirectional stream of messages that compose a thread
 /// (formerly called a conversation) in Codex.
-///
-/// 「thread」是 codex 里一次完整对话的单位（旧称 conversation）。这个 impl 块
-/// 就是它的双向消息管道：一头收 `Op`（submit），一头出 `Event`（next_event）。
+/// 组成一个线程（旧称 conversation）的双向消息流管道。提交从这里进、事件从这里出。
 impl CodexThread {
     pub(crate) fn new(
         codex: Codex,
@@ -248,6 +262,10 @@ impl CodexThread {
         self.codex.set_thread_memory_mode(mode).await
     }
 
+    /// 「steer」= 在回合进行中追加用户输入（而非另起一个回合）。把新输入并入当前正在跑
+    /// 的回合，让模型在下一次采样请求时看到它——实现「不打断、边跑边补充」的交互。
+    /// `expected_turn_id` 做乐观校验：调用方以为还在某回合，若该回合已结束则返回
+    /// `SteerInputError`（避免把输入误塞进错误的回合）。透传给内层 `codex.steer_input`。
     pub async fn steer_input(
         &self,
         input: Vec<UserInput>,
@@ -397,11 +415,6 @@ impl CodexThread {
     }
 
     /// Append raw Responses API items to the thread's model-visible history.
-    ///
-    /// 把外部准备好的 Responses API 条目「塞进」thread 历史（不开新轮）。三步：
-    /// 造一个默认 turn context → 若还没有参照上下文项就先补记一条（保证后续设置
-    /// diff 有基准）→ 注入条目并立即 flush rollout 落盘。供 fork/resume 等场景
-    /// 重建历史时使用。
     pub async fn inject_response_items(&self, items: Vec<ResponseItem>) -> CodexResult<()> {
         if items.is_empty() {
             return Err(CodexErr::InvalidRequest(
@@ -544,10 +557,6 @@ impl CodexThread {
         self.codex.enabled(feature)
     }
 
-    /// 「带外 elicitation」计数 +1，并在「0→1」的那一刻把会话置为暂停态。
-    /// 带外 elicitation 指 turn 之外发起的交互式询问（如 MCP 工具弹出的确认）；
-    /// 只要还有未结清的此类询问，会话就该暂停，避免与正常 turn 抢执行。用「计数器
-    /// + 仅边沿触发暂停/恢复」而非布尔，是为了支持多个询问并发嵌套。
     pub async fn increment_out_of_band_elicitation_count(&self) -> CodexResult<u64> {
         let mut guard = self.out_of_band_elicitation_count.lock().await;
         let was_zero = *guard == 0;
