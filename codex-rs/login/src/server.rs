@@ -11,6 +11,31 @@
 //! This module therefore keeps the user-facing error path and the structured-log path separate.
 //! Returned `io::Error` values still carry the detail needed by CLI/browser callers, while
 //! structured logs only emit explicitly reviewed fields plus redacted URL/error values.
+//!
+//! 【文件职责】实现 CLI 交互式登录用的本地 localhost OAuth 回调服务器（短生命周期）。
+//! 浏览器完成授权后会跳回 `http://localhost:<port>/auth/callback`，本模块在此处接收
+//! 授权码、用 PKCE 换取令牌、落盘凭证，并把浏览器重定向到成功/失败页面。
+//!
+//! 【架构位置】
+//!   层级：登录/认证层（`codex-login` crate）
+//!   上游：CLI 登录命令（调用 `run_login_server` 拿到 `auth_url` 并打开浏览器）；
+//!         `device_code_auth.rs` 复用本模块的令牌交换/落盘函数。
+//!   下游：`auth.rs`（凭证读写与吊销）、`pkce.rs`（PKCE 生成）、
+//!         `token_data.rs`（JWT 解析）、OpenAI OAuth 端点（HTTP）。
+//!
+//! 【数据流】
+//!   生成 PKCE+state → 绑定本地端口 → 拼 authorize URL → 打开浏览器 →
+//!   回调携带 code → `exchange_code_for_tokens` 换令牌 → `persist_tokens_async` 落盘 →
+//!   302 跳转到 `/success`（命中后 server 退出）。
+//!
+//! 【设计要点 · 双轨日志】这是本文件最重要的安全约束：错误「面向用户/CLI」与
+//!   「面向结构化日志」分两条路径。返回给调用方的 `io::Error` 保留后端原始细节（便于排障），
+//!   而 `tracing` 日志只输出显式审查过的字段，URL/错误中的敏感参数（token/code/state 等）
+//!   一律打码。修改任何日志语句时务必维持这条边界。
+//!
+//! 【阅读建议】主入口 `run_login_server`；核心回调分发在 `process_request`；
+//!   令牌交换看 `exchange_code_for_tokens`；脱敏逻辑看 `redact_sensitive_url_parts`
+//!   一族函数。底部 `html_escape` / 模板渲染是工具函数，可后看。
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
@@ -52,8 +77,12 @@ use tracing::info;
 use tracing::warn;
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
+// 默认回调端口：必须与 OAuth 服务端登记的 redirect URI 白名单一致，
+// 不能随意改动，否则授权服务器会拒绝回调。
 const DEFAULT_PORT: u16 = 1455;
 // Keep in sync with the Codex CLI Hydra redirect URI allow-list.
+// 备用端口：当 1455 被占用且无法腾出时回退到此端口。
+// 同样在服务端白名单内，改这里需同步更新服务端 allow-list（见 `bind_server`）。
 const FALLBACK_PORT: u16 = 1457;
 static LOGIN_ERROR_PAGE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     Template::parse(include_str!("assets/error.html"))
@@ -61,6 +90,9 @@ static LOGIN_ERROR_PAGE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
 });
 
 /// Options for launching the local login callback server.
+/// 启动本地登录回调服务器的配置项。
+/// `force_state` / `forced_chatgpt_workspace_id` 主要服务于测试与企业版工作区限制：
+/// 前者固定 state 便于断言，后者把登录限制在指定 ChatGPT 工作区。
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
     pub codex_home: PathBuf,
@@ -97,6 +129,9 @@ impl ServerOptions {
 }
 
 /// Handle for a running login callback server.
+/// 一个正在运行的回调服务器的句柄。
+/// 调用方拿到它后：把 `auth_url` 交给浏览器打开，用 `block_until_done` 等待登录结果，
+/// 或用 `cancel` 提前中止。`actual_port` 可能因端口占用而不同于请求的端口。
 pub struct LoginServer {
     pub auth_url: String,
     pub actual_port: u16,
@@ -137,7 +172,16 @@ impl ShutdownHandle {
 }
 
 /// Starts a local callback server and returns the browser auth URL.
+/// 启动本地回调服务器并返回应在浏览器打开的授权 URL。
+///
+/// 本函数不阻塞：它绑定端口、构造 authorize URL、（可选）打开浏览器，然后立即返回
+/// `LoginServer` 句柄；真正的回调处理在后台异步任务里进行。
+///
+/// 副作用：绑定 TCP 端口、可能启动系统浏览器、spawn 一个 OS 线程 + 一个 tokio 任务。
+/// @returns - `LoginServer`，含 `auth_url` 与用于等待/取消的句柄。
 pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
+    // 每次登录都新生成 PKCE 与 state：PKCE 防授权码被截获后冒用，
+    // state 用于校验回调确实来自本次请求（防 CSRF / 串号）。
     let pkce = generate_pkce();
     let state = opts.force_state.clone().unwrap_or_else(generate_state);
 
@@ -168,6 +212,9 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
     }
 
     // Map blocking reads from server.recv() to an async channel.
+    // 把 `tiny_http` 的阻塞式 `server.recv()` 转接到 async 通道：tiny_http 是同步库，
+    // 这里用一个专用 OS 线程做阻塞读，再 `blocking_send` 进 channel，
+    // 让下方的 tokio 任务能用 `select!` 同时监听「新请求」和「取消信号」。
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Request>(16);
     let _server_handle = {
         let server = server.clone();
@@ -190,6 +237,9 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
         let shutdown_notify = shutdown_notify.clone();
         let server = server;
         tokio::spawn(async move {
+            // 回调主循环：在「收到取消通知」与「收到新 HTTP 请求」之间二选一。
+            // 命中 `/auth/callback` 成功跳转或 `/success`/`/cancel` 时通过 `break` 携带
+            // 最终结果退出；其余路径（如 404、state 不符）只回响应、继续循环等下一个请求。
             let result = loop {
                 tokio::select! {
                     _ = shutdown_notify.notified() => {
@@ -250,6 +300,10 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
 }
 
 /// Internal callback handling outcome.
+/// 单次回调处理的内部结果，决定主循环如何应答以及是否退出：
+///   - `Response`：普通应答，连接保持，循环继续等下一个请求。
+///   - `RedirectWithHeader`：302 跳转（授权成功后跳 `/success`），循环继续。
+///   - `ResponseAndExit`：应答后结束登录流程，`result` 即整个登录的成败。
 enum HandledRequest {
     Response(Response<Cursor<Vec<u8>>>),
     RedirectWithHeader(Header),
@@ -259,6 +313,18 @@ enum HandledRequest {
         result: io::Result<()>,
     },
 }
+
+/// 处理一次到达本地回调服务器的 HTTP 请求，按路径分发。
+///
+/// 这是回调流程的核心分发器。仅 `/auth/callback`（授权成功路径）会触发
+/// 「换令牌 → 落盘 → 跳转 `/success`」的完整链路；其它路径只做应答或结束。
+///
+/// @param url_raw      - 原始请求行里的 URL（形如 `/auth/callback?code=...`）。
+/// @param state        - 本次登录生成的 state，用于校验回调防 CSRF。
+/// @returns            - `HandledRequest`，指示主循环如何应答 / 是否退出。
+///
+/// 副作用：成功路径会发起网络请求换令牌并把凭证写入磁盘。
+/// 安全：state 不匹配直接 400 拒绝；错误信息分「用户可见」与「日志」两路（见文件头）。
 
 async fn process_request(
     url_raw: &str,
@@ -295,6 +361,7 @@ async fn process_request(
                 state_valid,
                 "received login callback"
             );
+            // state 不匹配：很可能是过期标签页、串号或 CSRF，立即拒绝且不泄露任何细节。
             if !state_valid {
                 warn!(
                     path = %path,
@@ -335,10 +402,13 @@ async fn process_request(
                 }
             };
 
+            // 授权码换令牌成功后的串行链路：工作区校验 → 换 API Key → 落盘 → 跳转。
+            // 任一步失败都改走错误页（`login_error_response`），但已成功的步骤不回滚。
             match exchange_code_for_tokens(&opts.issuer, &opts.client_id, redirect_uri, pkce, &code)
                 .await
             {
                 Ok(tokens) => {
+                    // 企业版工作区限制：若配置了 allowed workspace，token 必须命中其一。
                     if let Err(message) = ensure_workspace_allowed(
                         opts.forced_chatgpt_workspace_id.as_deref(),
                         &tokens.id_token,
@@ -403,6 +473,7 @@ async fn process_request(
                 }
             }
         }
+        // `/success`：浏览器被 302 引导到这里展示成功页，并以此为信号结束登录。
         "/success" => {
             let use_streamlined_success = parsed_url
                 .query_pairs()
@@ -424,6 +495,8 @@ async fn process_request(
                 result: Ok(()),
             }
         }
+        // `/cancel`：由 `send_cancel_request` 触发，用于让占用端口的旧实例自行退出，
+        // 以便新一次登录能绑定同一端口（见 `bind_server`）。
         "/cancel" => HandledRequest::ResponseAndExit {
             headers: Vec::new(),
             body: b"Login cancelled".to_vec(),
@@ -445,6 +518,11 @@ async fn process_request(
 /// and always appends `Connection: close`, ensuring the socket is closed from
 /// the server side. Ideally, tiny_http would provide an API to control
 /// server-side connection persistence, but it does not.
+///
+/// 绕开 `tiny_http` 的应答机制手写 HTTP 响应，强制加 `Connection: close`。
+/// 背景：tiny_http 会过滤掉 `Connection` 头，用 `req.respond` 无法告知客户端关闭
+/// keep-alive 连接，导致该连接的 worker 一直挂着等后续请求，使下一次登录卡在旧连接上。
+/// 这是 tiny_http 缺少「服务端控制连接保持」API 的无奈变通。
 fn send_response_with_disconnect(
     req: Request,
     mut headers: Vec<Header>,
@@ -480,6 +558,10 @@ fn send_response_with_disconnect(
     writer.flush()
 }
 
+// 构造 OAuth `/oauth/authorize` 授权 URL（浏览器首跳目标）。
+// 关键参数：PKCE 的 `code_challenge`（S256）、`state`、以及 Codex 专属的
+// `codex_cli_simplified_flow` / `id_token_add_organizations` 等开关；
+// 配了工作区限制时追加 `allowed_workspace_id`。
 fn build_authorize_url(
     issuer: &str,
     client_id: &str,
@@ -524,6 +606,8 @@ fn generate_state() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+// 向疑似仍在运行的旧登录服务器发一个 `GET /cancel`，请它退出以腾出端口。
+// 手写最小 HTTP 报文 + 短超时，避免引入完整 HTTP 客户端，且不阻塞过久。
 fn send_cancel_request(port: u16) -> io::Result<()> {
     let addr: SocketAddr = format!("127.0.0.1:{port}")
         .parse()
@@ -541,6 +625,10 @@ fn send_cancel_request(port: u16) -> io::Result<()> {
     Ok(())
 }
 
+// 绑定本地端口，处理「端口被占用」的常见场景。
+// 策略：优先用请求端口；若 AddrInUse，先尝试 `/cancel` 掉旧实例并带退避重试，
+// 重试 `MAX_ATTEMPTS` 次仍失败时，默认端口会回退到 `FALLBACK_PORT` 再试一轮。
+// 仅 `is_addr_in_use` 才重试，其它绑定错误直接返回。
 fn bind_server(port: u16) -> io::Result<Server> {
     let preferred_bind_address = format!("127.0.0.1:{port}");
     let fallback_bind_address = format!("127.0.0.1:{FALLBACK_PORT}");
@@ -602,6 +690,8 @@ fn bind_server(port: u16) -> io::Result<Server> {
 }
 
 /// Tokens returned by the OAuth authorization-code exchange.
+/// 授权码交换后拿到的三件套令牌：`id_token`（含账户/工作区声明）、
+/// `access_token`（调用后端）、`refresh_token`（续期）。
 pub(crate) struct ExchangedTokens {
     pub id_token: String,
     pub access_token: String,
@@ -622,6 +712,9 @@ impl std::fmt::Display for TokenEndpointErrorDetail {
 }
 
 const REDACTED_URL_VALUE: &str = "<redacted>";
+// [引用范围] 仅供本文件 `redact_sensitive_query_value` 使用。
+// 出现在 URL query 中的敏感参数名清单：凡命中（大小写不敏感）即在日志里替换为
+// `<redacted>`。新增任何会携带密钥/令牌的查询参数时，务必同步加入此表。
 const SENSITIVE_URL_QUERY_KEYS: &[&str] = &[
     "access_token",
     "api_key",
@@ -652,6 +745,10 @@ fn redact_sensitive_query_value(key: &str, value: &str) -> String {
 ///
 /// This keeps developer-facing logs useful for debugging transport failures without persisting
 /// tokens, callback codes, fragments, or embedded credentials.
+///
+/// 对 URL 中常见的密钥载体做打码，同时保留 host/path 结构以便排障。
+/// 处理项：清空内嵌的 user/password、丢弃 fragment（`#...`，可能含 token）、
+/// 按 `SENSITIVE_URL_QUERY_KEYS` 逐项打码 query。就地修改传入的 `url`。
 fn redact_sensitive_url_parts(url: &mut url::Url) {
     let _ = url.set_username("");
     let _ = url.set_password(None);
@@ -685,6 +782,7 @@ fn redact_sensitive_url_parts(url: &mut url::Url) {
 }
 
 /// Redacts any URL attached to a reqwest transport error before it is logged or returned.
+/// 在记录或返回 reqwest 传输错误前，对其携带的 URL 做脱敏（错误里常含完整请求 URL）。
 fn redact_sensitive_error_url(mut err: reqwest::Error) -> reqwest::Error {
     if let Some(url) = err.url_mut() {
         redact_sensitive_url_parts(url);
@@ -696,6 +794,9 @@ fn redact_sensitive_error_url(mut err: reqwest::Error) -> reqwest::Error {
 ///
 /// This is used for caller-supplied issuer values, which may contain credentials or query
 /// parameters on non-default deployments.
+///
+/// 把任意 URL 字符串脱敏成可安全写日志的形式；解析失败时返回 `<invalid-url>`。
+/// 主要用于调用方传入的 issuer——非默认部署下它可能带有凭证或查询参数。
 fn sanitize_url_for_logging(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(mut url) => {
@@ -711,6 +812,13 @@ fn sanitize_url_for_logging(url: &str) -> String {
 /// non-JSON error text is preserved there. Structured logging stays narrower: it logs reviewed
 /// fields from parsed token responses and redacted transport errors, but does not log the final
 /// callback-layer `%err` string.
+///
+/// 用授权码向 `/oauth/token` 换取令牌（authorization_code 授权类型，带 PKCE verifier）。
+/// 同时被浏览器回调与设备码流程复用。
+///
+/// 错误分两路（呼应文件头的双轨日志原则）：返回给调用方的 `io::Error` 保留后端原始文本
+/// （含非 JSON 报文）以便 CLI/浏览器展示；而 `tracing` 只记审查过的字段和「打码后的」
+/// 传输错误，不打印最终错误字符串。传输错误经 `redact_sensitive_error_url` 脱敏后才记录。
 pub(crate) async fn exchange_code_for_tokens(
     issuer: &str,
     client_id: &str,
@@ -786,6 +894,13 @@ pub(crate) async fn exchange_code_for_tokens(
 
 /// Persists exchanged credentials using the configured local auth store, then
 /// best-effort revokes any superseded managed ChatGPT tokens.
+///
+/// 把换来的凭证写入本地 auth 存储（文件或 keyring，由 store mode 决定），随后
+/// 尽力（best-effort）吊销被本次登录取代的旧 ChatGPT 令牌。
+///
+/// @param api_key - 可选，token-exchange 得到的 API Key（设备码流程不带）。
+/// 副作用：读旧 auth、解析 JWT 声明、落盘新凭证、可能发起一次吊销网络请求。
+/// 异常处理：读旧 auth 或吊销失败只 `warn!` 不影响登录成功（凭证已落盘）。
 pub(crate) async fn persist_tokens_async(
     codex_home: &Path,
     api_key: Option<String>,
@@ -829,6 +944,8 @@ pub(crate) async fn persist_tokens_async(
     .await
     .map_err(|e| io::Error::other(format!("persist task failed: {e}")))??;
 
+    // 仅当旧令牌确实被「取代」时才吊销：若新旧 refresh token 相同（同账户复用），
+    // 吊销会连带废掉刚保存的新令牌，故 `should_revoke_auth_tokens` 会先排除这种情况。
     if should_revoke_auth_tokens(previous_auth.as_ref(), &auth)
         && let Err(err) = revoke_auth_tokens(previous_auth.as_ref()).await
     {
@@ -838,6 +955,9 @@ pub(crate) async fn persist_tokens_async(
     Ok(())
 }
 
+// 根据 JWT 声明拼出本地 `/success` 重定向 URL。
+// 从 id_token/access_token 中提取 org/project/plan 等信息并作为 query 透传，
+// 供成功页据此渲染（如是否需要 onboarding `needs_setup`）。
 fn compose_success_url(
     port: u16,
     issuer: &str,
@@ -895,6 +1015,9 @@ fn compose_success_url(
     format!("http://localhost:{port}/success?{qs}")
 }
 
+// 解析 JWT，仅取出自定义命名空间 `https://api.openai.com/auth` 下的声明对象。
+// 不校验签名（仅本地读 payload）；任何格式/解码错误都打印到 stderr 并返回空 Map，
+// 让调用方按「无声明」降级处理而非崩溃。
 fn jwt_auth_claims(jwt: &str) -> serde_json::Map<String, serde_json::Value> {
     let mut parts = jwt.split('.');
     let (_h, payload_b64, _s) = match (parts.next(), parts.next(), parts.next()) {
@@ -927,6 +1050,9 @@ fn jwt_auth_claims(jwt: &str) -> serde_json::Map<String, serde_json::Value> {
 }
 
 /// Validates the ID token against an optional workspace restriction.
+/// 校验 id_token 是否落在允许的工作区内。
+/// `expected` 为 `None` 时直接放行；否则要求 token 的 `chatgpt_account_id` 声明
+/// 命中列表之一，缺失声明或不匹配都返回带说明的 `Err`（用作面向用户的错误文案）。
 pub(crate) fn ensure_workspace_allowed(
     expected: Option<&[String]>,
     id_token: &str,
@@ -951,6 +1077,8 @@ pub(crate) fn ensure_workspace_allowed(
 }
 
 /// Builds a terminal callback response for login failures.
+/// 为登录失败构造「终止型」回调响应：渲染品牌错误页作为 body，
+/// 并把 `kind`+`message` 包成 `io::Error` 作为整个登录的失败结果（主循环据此退出）。
 fn login_error_response(
     message: &str,
     kind: io::ErrorKind,
@@ -970,6 +1098,8 @@ fn login_error_response(
 }
 
 /// Returns true when the OAuth callback represents a missing Codex entitlement.
+/// 判断回调错误是否为「该工作区未开通 Codex 权限」这一特例
+/// （`access_denied` + 描述含 `missing_codex_entitlement`），以便给出专门的引导文案。
 fn is_missing_codex_entitlement_error(error_code: &str, error_description: Option<&str>) -> bool {
     error_code == "access_denied"
         && error_description.is_some_and(|description| {
@@ -980,6 +1110,8 @@ fn is_missing_codex_entitlement_error(error_code: &str, error_description: Optio
 }
 
 /// Converts OAuth callback errors into a user-facing message.
+/// 把回调的 `error`/`error_description` 转成面向用户的提示文案：
+/// 未开通 Codex 走专门引导；否则优先用 description，再退化到 error code。
 fn oauth_callback_error_message(error_code: &str, error_description: Option<&str>) -> String {
     if is_missing_codex_entitlement_error(error_code, error_description) {
         return "Codex is not enabled for your workspace. Contact your workspace administrator to request access to Codex.".to_string();
@@ -999,6 +1131,11 @@ fn oauth_callback_error_message(error_code: &str, error_description: Option<&str
 /// Parsed JSON fields are safe to log individually. If the response is not JSON, the raw body is
 /// preserved only for the returned error path so the CLI/browser can still surface the backend
 /// detail, while the structured log path continues to use the explicitly parsed safe fields above.
+///
+/// 解析 token 端点的错误响应，兼容多种后端格式：
+///   `{error, error_description}` / `{error:{code, message}}` / 仅 `{error}` / 纯文本。
+/// 拆出的 JSON 字段可安全单独入日志；非 JSON 原文只放进返回的 `display_message`
+/// （供 CLI/浏览器展示后端细节），结构化日志侧仍只用上面显式解析的安全字段。
 fn parse_token_endpoint_error(body: &str) -> TokenEndpointErrorDetail {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -1064,6 +1201,9 @@ fn parse_token_endpoint_error(body: &str) -> TokenEndpointErrorDetail {
 }
 
 /// Renders the branded error page used by callback failures.
+/// 渲染回调失败时展示的品牌错误页。
+/// 对「未开通 Codex」特例使用专门的标题/说明/引导文案，其余情况用通用文案；
+/// 所有动态字段都先经 `html_escape` 转义后再填入模板，防止 HTML 注入。
 fn render_login_error_page(
     message: &str,
     error_code: Option<&str>,
@@ -1118,6 +1258,8 @@ fn html_escape(input: &str) -> String {
 }
 
 /// Exchanges an authenticated ID token for an API-key style access token.
+/// 用已认证的 id_token 通过 OAuth token-exchange 换取「API Key 形态」的 access token。
+/// 即把 ChatGPT 登录态换成可像 API Key 一样使用的凭证，落盘后供后端调用。
 pub(crate) async fn obtain_api_key(
     issuer: &str,
     client_id: &str,

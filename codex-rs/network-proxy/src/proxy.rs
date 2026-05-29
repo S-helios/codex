@@ -1,3 +1,29 @@
+//! 代理主体：进程内本地代理的构建、启动/停止，以及把代理「注入」子进程环境。
+//!
+//! 【文件职责】定义 `NetworkProxy` 与其 `NetworkProxyBuilder`：在 loopback 上
+//!   预占 HTTP/SOCKS5 监听端口、`run()` 起协程开始转发、`apply_to_env()` 把代理
+//!   地址写进一大批 `*_PROXY` 环境变量逼迫子进程（curl/npm/git…）全部走代理。
+//!   它是「让网络管控生效」的接线层，真正的放行判定在 network_policy/runtime。
+//!
+//! 【架构位置】
+//!   层级：网络代理 · 代理实例与生命周期层
+//!   上游：core 侧会话接线（构建 proxy、随权限切换重建、把 env 注入 exec）
+//!   下游：`http_proxy.rs` / `socks5.rs`（实际监听与转发）、
+//!         `runtime.rs::NetworkProxyState`（共享的策略活视图）
+//!
+//! 【数据流】
+//!   builder.state(...).build() → 预占 loopback 端口 → run() spawn 监听协程
+//!     → NetworkProxyHandle（wait/shutdown 控制生命周期）
+//!   apply_to_env(env) → 写入 HTTP_PROXY/ALL_PROXY/NO_PROXY 等 → 注入子进程
+//!
+//! 【设计要点】代理只绑回环地址（即便受管 Windows 端口也强制 clamp 到 127.0.0.1），
+//!   所以端口即使泄露也无法被外网利用；`apply_to_env` 故意「覆写」已有代理变量，
+//!   不让命令级环境绕过受管端点。
+//!
+//! 【阅读建议】先看 `NetworkProxyBuilder::build()`（端口预占与 clamp）与
+//!   `NetworkProxy::run()`（起监听），再看 `apply_proxy_env_overrides()`（env 注入
+//!   的全部细节）；大段 `PROXY_*_ENV_KEYS` 常量是各工具链的代理变量清单，可速览。
+
 use crate::config;
 use crate::http_proxy;
 use crate::network_policy::NetworkPolicyDecider;
@@ -22,6 +48,10 @@ use tracing::warn;
 #[command(name = "codex-network-proxy", about = "Codex network sandbox proxy")]
 pub struct Args {}
 
+/// 在 build 阶段就预先绑定好的监听 socket，留待 run() 时取走交给监听协程。
+/// 「先占端口、后启动」是为了让 `http_addr()`/`socks_addr()` 在真正 run 之前
+/// 就能拿到确定的端口号（注入子进程 env 需要它），同时避免 build→run 之间端口被抢。
+/// 用 `Mutex<Option<..>>` + `take()`：listener 只能被取走一次。
 #[derive(Debug)]
 struct ReservedListeners {
     http: Mutex<Option<StdTcpListener>>,
@@ -90,6 +120,9 @@ impl ReservedListenerSet {
     }
 }
 
+/// `NetworkProxy` 的构建器。`state` 必填（策略活视图），其余可选。
+/// `managed_by_codex`（默认 true）决定端口来源：受管时自动预占 loopback 临时端口，
+/// 非受管时用配置/调用方指定的地址（供外部托管场景）。
 #[derive(Clone)]
 pub struct NetworkProxyBuilder {
     state: Option<Arc<NetworkProxyState>>,
@@ -163,6 +196,9 @@ impl NetworkProxyBuilder {
         self
     }
 
+    /// 组装 `NetworkProxy`：挂上阻断观察者、按 `managed_by_codex` 解析监听地址、
+    /// 受管时预占 loopback 端口，最后再统一做一次回环 clamp。返回的 proxy 尚未监听，
+    /// 需调用 `run()` 才真正起协程。
     pub async fn build(self) -> Result<NetworkProxy> {
         let state = self.state.ok_or_else(|| {
             anyhow::anyhow!(
@@ -173,6 +209,8 @@ impl NetworkProxyBuilder {
             .set_blocked_request_observer(self.blocked_request_observer.clone())
             .await;
         let current_cfg = state.current_cfg().await?;
+        // 受管 vs 非受管两条路径：受管时由我们预占 loopback 端口（Windows 走固定
+        // 端口+忙则回退临时口，其余平台直接占临时口）；非受管时沿用配置/调用方地址。
         let (requested_http_addr, requested_socks_addr, reserved_listeners) = if self
             .managed_by_codex
         {
@@ -311,6 +349,9 @@ impl NetworkProxyRuntimeSettings {
     }
 }
 
+/// 一个已配置好的代理实例（可 `Clone`，共享内部状态）。持有策略活视图 `state`、
+/// 确定的监听地址、预占的 listener，以及可选的运行时审批 `policy_decider`。
+/// 由 `run()` 启动监听协程；`apply_to_env()` 负责把它注入子进程环境。
 #[derive(Clone)]
 pub struct NetworkProxy {
     state: Arc<NetworkProxyState>,
@@ -343,6 +384,15 @@ impl PartialEq for NetworkProxy {
 
 impl Eq for NetworkProxy {}
 
+// ═══════════════════════════════════════════════════════════════
+// Proxy env keys  ·  各工具链的代理相关环境变量清单
+// 不同生态（npm/yarn/bundler/pip/docker/electron/node…）认不同的代理变量名，
+// 这里穷举它们，注入时一次性覆写，确保没有工具能绕过受管代理。
+// PROXY_ENV_KEYS 是「我们会写入的全集」（含 NO_PROXY、激活标记等），测试据此
+// 校验「不多写无关变量」。
+// ═══════════════════════════════════════════════════════════════
+
+// 用于「探测子进程环境是否已带代理 URL」的键集（读，不写）。
 pub const PROXY_URL_ENV_KEYS: &[&str] = &[
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -422,6 +472,9 @@ pub const NO_PROXY_ENV_KEYS: &[&str] = &[
     "BUNDLE_NO_PROXY",
 ];
 
+// NO_PROXY 默认值：让回环与私网网段「直连、不走代理」，便于本地 IPC/局域网访问。
+// 故意只列 IP/网段、不列任何主机名后缀：列主机名会迫使客户端在本地解析内网名，
+// 反而削弱代理对域名解析的统一管控（也是 SSRF 防护的一环）。
 pub const DEFAULT_NO_PROXY_VALUE: &str = concat!(
     "localhost,127.0.0.1,::1,",
     "10.0.0.0/8,",
@@ -448,6 +501,8 @@ pub fn proxy_url_env_value<'a>(
     env.get(lower_key.as_str()).map(String::as_str)
 }
 
+// 探测给定环境里是否已设置了任一非空代理 URL 变量（大小写别名都查）。
+// 供上游判断「是否已有代理在生效」，避免与受管代理冲突。
 pub fn has_proxy_url_env_vars(env: &HashMap<String, String>) -> bool {
     PROXY_URL_ENV_KEYS
         .iter()
@@ -471,6 +526,10 @@ fn is_codex_proxy_git_ssh_command(command: &str) -> bool {
         && command.ends_with(CODEX_PROXY_GIT_SSH_COMMAND_SUFFIX)
 }
 
+/// 把受管代理地址写进一大批工具链的代理环境变量（就地修改 `env`）。
+/// 这是「逼子进程走代理」的核心：HTTP(S)/WS/npm/yarn/bundler/pip/docker 全指向
+/// HTTP 代理；NO_PROXY 放行回环/私网；socks 开启时 ALL_PROXY/FTP 走 socks5h。
+/// 副作用：覆写已有同名变量（有意为之，防绕过）。socks5h 的 `h` 表示由代理做 DNS。
 fn apply_proxy_env_overrides(
     env: &mut HashMap<String, String>,
     http_addr: SocketAddr,
@@ -595,10 +654,13 @@ impl NetworkProxy {
         self.runtime_settings().dangerously_allow_all_unix_sockets
     }
 
+    /// 把本代理注入一份子进程环境变量（就地修改）。core 在 spawn 受沙箱命令前调用，
+    /// 是「网络管控落到子进程」的接线点。
     pub fn apply_to_env(&self, env: &mut HashMap<String, String>) {
         let allow_local_binding = self.allow_local_binding();
         // Enforce proxying for child processes. We intentionally override existing values so
         // command-level environment cannot bypass the managed proxy endpoint.
+        // 强制子进程走代理：有意覆写已有值，使命令级环境无法绕过受管端点。
         apply_proxy_env_overrides(
             env,
             self.http_addr,
@@ -608,6 +670,9 @@ impl NetworkProxy {
         );
     }
 
+    /// 热替换策略状态，但禁止改动「监听形态」类字段：enabled、proxy_url、
+    /// socks_url、enable_socks5(_udp)。这些一旦运行就固定（端口已绑、env 已注入），
+    /// 改它们需重建代理。可热改的是域名白/黑名单、mode、unix socket 等运行期设置。
     pub async fn replace_config_state(&self, new_state: ConfigState) -> Result<()> {
         let current_cfg = self.state.current_cfg().await?;
         anyhow::ensure!(
@@ -648,6 +713,9 @@ impl NetworkProxy {
             .clone()
     }
 
+    /// 启动监听：分别为 HTTP（必开）与 SOCKS5（按配置）spawn 转发协程，
+    /// 返回 `NetworkProxyHandle` 控制其生命周期。优先用 build 时预占的 listener，
+    /// 没有则现绑地址。`network.enabled=false` 时返回 noop 句柄、不真正监听。
     pub async fn run(&self) -> Result<NetworkProxyHandle> {
         let current_cfg = self.state.current_cfg().await?;
         if !current_cfg.network.enabled {
@@ -717,6 +785,8 @@ impl NetworkProxy {
     }
 }
 
+/// 运行中代理的句柄：持有 HTTP/SOCKS 两个监听协程。`wait()` 阻塞到协程结束、
+/// `shutdown()` 主动终止。`completed` 标记是否已正常收尾，供 `Drop` 判断是否需兜底中止。
 pub struct NetworkProxyHandle {
     http_task: Option<JoinHandle<Result<()>>>,
     socks_task: Option<JoinHandle<Result<()>>>,
@@ -724,6 +794,7 @@ pub struct NetworkProxyHandle {
 }
 
 impl NetworkProxyHandle {
+    // 空操作句柄：network.enabled=false 时返回，假装在跑实则什么都不监听。
     fn noop() -> Self {
         Self {
             http_task: Some(tokio::spawn(async { Ok(()) })),
@@ -771,6 +842,8 @@ async fn abort_tasks(
 }
 
 impl Drop for NetworkProxyHandle {
+    // 兜底中止：句柄被丢弃且未正常收尾时，spawn 一个协程去 abort 监听任务，
+    // 防止代理协程在持有者消失后变成泄漏的孤儿（仍占着端口转发）。
     fn drop(&mut self) {
         if self.completed {
             return;

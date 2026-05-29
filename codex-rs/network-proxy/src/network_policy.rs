@@ -1,3 +1,27 @@
+//! 网络策略判定层：把「基线域名策略」和「运行时审批回调」串成一次最终裁决。
+//!
+//! 【文件职责】定义出网请求的判定契约，核心入口是 `evaluate_host_policy()`：
+//!   它先问基线策略（白/黑名单 + 本地网络防护），再在「未命中白名单」
+//!   这一灰色地带把决定权交给可选的 `NetworkPolicyDecider`（运行时审批），
+//!   最后把裁决结果以 OTel 审计事件落盘。
+//!
+//! 【架构位置】
+//!   层级：网络代理 · 策略判定层
+//!   上游：`http_proxy.rs` / `socks5.rs`（每条连接拿到目标 host:port 后调用本层）
+//!   下游：`runtime.rs::NetworkProxyState::host_blocked()`（基线域名/IP 判定）、
+//!         调用方注入的 `NetworkPolicyDecider`（如把 exec 审批映射到网络放行）
+//!
+//! 【数据流】
+//!   NetworkPolicyRequest → host_blocked()（基线）→ [NotAllowed 时] decider.decide()
+//!     → NetworkDecision（Allow / Deny{reason,source,decision}）→ 审计事件
+//!
+//! 【三道闸门中的定位】本层负责「域名白名单」这道闸门，并衔接「运行时审批」；
+//!   「协议方法」闸门（Limited/Full）在 http_proxy/socks5 调用前另行判定。
+//!
+//! 【阅读建议】先看 `NetworkDecision` 与 `NetworkDecisionSource` 两个枚举理解
+//!   裁决形态，再读 `evaluate_host_policy()` 的判定顺序；底部 `test_support`
+//!   是测试用的 tracing 采集器，可跳过。
+
 use crate::reasons::REASON_POLICY_DENIED;
 use crate::runtime::HostBlockDecision;
 use crate::runtime::HostBlockReason;
@@ -19,6 +43,8 @@ const POLICY_REASON_ALLOW: &str = "allow";
 const DEFAULT_METHOD: &str = "none";
 const DEFAULT_CLIENT_ADDRESS: &str = "unknown";
 
+/// 触发判定的传输协议种类，用于审计字段与判定上下文区分。
+/// 同一套域名策略对四种协议一视同仁，此枚举只影响日志归类与下游转发方式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkProtocol {
     Http,
@@ -38,6 +64,10 @@ impl NetworkProtocol {
     }
 }
 
+/// 「拒绝」的两种子形态，决定被拦后的后续动作。
+/// `Deny` 是硬拒（直接断流）；`Ask` 表示需要弹出审批让用户决定，
+/// 代理侧仍先按拒绝处理，由上层审批 UI 决定是否最终放行。
+/// 注意：本枚举只在 `NetworkDecision::Deny` 内部出现，`Allow` 不带它。
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum NetworkPolicyDecision {
@@ -54,6 +84,11 @@ impl NetworkPolicyDecision {
     }
 }
 
+/// 裁决「出自哪一道闸门」，仅用于审计/可观测，便于排查一次拦截的根因。
+/// - `BaselinePolicy`：基线域名/IP 策略（白名单未命中、命中黑名单、本地网络拦截）
+/// - `ModeGuard`：协议方法闸门（Limited 模式下非 GET/HEAD/OPTIONS 被拦）
+/// - `ProxyState`：代理运行时状态层做出的判定
+/// - `Decider`：运行时审批回调（`NetworkPolicyDecider`）覆写或确认的结果
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkDecisionSource {
@@ -74,6 +109,10 @@ impl NetworkDecisionSource {
     }
 }
 
+/// 一次出网请求的判定输入：目标 host:port + 触发上下文。
+/// `command` / `exec_policy_hint` 是给 `NetworkPolicyDecider` 的线索——
+/// 调用方可据此把「已批准的 exec 命令前缀（如 `curl *`）」映射为网络放行，
+/// 实现「批了命令就别再二次拦它发出的网络请求」的体验。
 #[derive(Clone, Debug)]
 pub struct NetworkPolicyRequest {
     pub protocol: NetworkProtocol,
@@ -118,6 +157,8 @@ impl NetworkPolicyRequest {
     }
 }
 
+/// 一次判定的最终结果。`Allow` 放行；`Deny` 携带拒绝原因、来源闸门与子形态
+/// （硬拒 `Deny` 还是待审批 `Ask`），三者共同支撑审计与上层审批 UI。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetworkDecision {
     Allow,
@@ -129,6 +170,8 @@ pub enum NetworkDecision {
 }
 
 impl NetworkDecision {
+    // 下面 `deny` / `ask` 两个便捷构造默认把来源标为 `Decider`：
+    // 它们是给运行时审批回调用的快捷方式。基线策略走 `*_with_source` 显式指定来源。
     pub fn deny(reason: impl Into<String>) -> Self {
         Self::deny_with_source(reason, NetworkDecisionSource::Decider)
     }
@@ -139,6 +182,8 @@ impl NetworkDecision {
 
     pub fn deny_with_source(reason: impl Into<String>, source: NetworkDecisionSource) -> Self {
         let reason = reason.into();
+        // 空 reason 兜底为通用文案：审计与 UI 都假设 reason 非空，避免出现
+        // 「被拒但说不出为什么」的空白记录。
         let reason = if reason.is_empty() {
             REASON_POLICY_DENIED.to_string()
         } else {
@@ -165,6 +210,12 @@ impl NetworkDecision {
         }
     }
 }
+
+// ───────────────────────────────────────────────────────────────
+// Audit events  ·  判定结果的 OTel 审计事件
+// 供 mode_guard 等「非域名维度」的拦点直接上报；域名维度的判定由
+// evaluate_host_policy() 内部统一上报。
+// ───────────────────────────────────────────────────────────────
 
 pub(crate) struct BlockDecisionAuditEventArgs<'a> {
     pub source: NetworkDecisionSource,
@@ -225,6 +276,9 @@ struct PolicyAuditEventArgs<'a> {
     policy_override: bool,
 }
 
+// 统一发射一条策略判定审计事件：合并会话级元数据（conversation_id、
+// user_email 等）与本次判定字段，打到固定 OTel target `AUDIT_TARGET`。
+// 所有放行/拒绝最终都汇聚到这唯一出口，保证审计字段口径一致。
 fn emit_policy_audit_event(state: &NetworkProxyState, args: PolicyAuditEventArgs<'_>) {
     let metadata = state.audit_metadata();
     tracing::event!(
@@ -263,6 +317,11 @@ fn audit_timestamp() -> String {
 /// If `command` or `exec_policy_hint` is provided, callers can map exec-policy
 /// approvals to network access (e.g., allow all requests for commands matching
 /// approved prefixes like `curl *`).
+///
+/// 运行时审批回调：第三道闸门。仅当基线策略判为「未命中白名单(NotAllowed)」
+/// 这一灰色地带时才被询问——它可以把请求 Allow（覆写放行）、Deny（确认拒绝）
+/// 或 Ask（升级为人工审批）。`Deny`(黑名单)与本地网络拦截不经此回调，
+/// 是不可被覆写的硬约束。由 core 侧注入，典型实现把 exec 审批映射为网络放行。
 #[async_trait]
 pub trait NetworkPolicyDecider: Send + Sync + 'static {
     async fn decide(&self, req: NetworkPolicyRequest) -> NetworkDecision;
@@ -286,17 +345,30 @@ where
     }
 }
 
+/// 本 crate 的判定主入口：把基线策略与运行时审批合成一次最终裁决并落审计。
+///
+/// 判定顺序（安全优先级由高到低）：
+///   1. `host_blocked()` 给出基线结论（黑名单 / 本地网络拦截 / 未命中白名单 / 放行）
+///   2. 唯独「未命中白名单(NotAllowed)」才咨询 `decider`，允许其覆写为放行；
+///      黑名单与本地网络拦截属硬约束，不交给 decider。
+///   3. 无论结果如何都发射一条审计事件，`policy_override` 标记是否被审批覆写。
+///
+/// @returns 最终 `NetworkDecision`；DNS 查询等 I/O 失败时返回 `Err` 向上抛出。
 pub(crate) async fn evaluate_host_policy(
     state: &NetworkProxyState,
     decider: Option<&Arc<dyn NetworkPolicyDecider>>,
     request: &NetworkPolicyRequest,
 ) -> Result<NetworkDecision> {
+    // ── Step 1：取基线结论，并仅对灰色地带咨询运行时审批 ──────────────
     let host_decision = state.host_blocked(&request.host, request.port).await?;
     let (decision, policy_override) = match host_decision {
         HostBlockDecision::Allowed => (NetworkDecision::Allow, false),
         HostBlockDecision::Blocked(HostBlockReason::NotAllowed) => {
+            // 未命中白名单 = 唯一可被审批覆写的灰色地带。
+            // 有 decider 就问它（可放行/拒绝/升级 Ask）；没有则按基线拒绝。
             if let Some(decider) = decider {
                 let decider_decision = map_decider_decision(decider.decide(request.clone()).await);
+                // policy_override 仅在审批把「本应拒绝」翻成 Allow 时为真，供审计标记。
                 let policy_override = matches!(decider_decision, NetworkDecision::Allow);
                 (decider_decision, policy_override)
             } else {
@@ -309,6 +381,7 @@ pub(crate) async fn evaluate_host_policy(
                 )
             }
         }
+        // 黑名单命中 / 本地网络拦截：硬约束，直接拒绝，不经 decider。
         HostBlockDecision::Blocked(reason) => (
             NetworkDecision::deny_with_source(
                 reason.as_str(),
@@ -318,6 +391,9 @@ pub(crate) async fn evaluate_host_policy(
         ),
     };
 
+    // ── Step 2：从裁决推导审计三元组（决策/来源/原因）并上报 ──────────
+    // 被审批覆写的放行要如实归因到 `Decider`、原因记为「本应 NotAllowed」，
+    // 以区别于「白名单本就放行」，方便事后审计追溯谁松了口。
     let (policy_decision, source, reason) = match &decision {
         NetworkDecision::Allow => (
             POLICY_DECISION_ALLOW,
@@ -358,6 +434,8 @@ pub(crate) async fn evaluate_host_policy(
     Ok(decision)
 }
 
+// 把审批回调返回的拒绝统一改记来源为 `Decider`：无论回调自报什么 source，
+// 既然结论出自它，审计就该归因到它，避免回调伪装成基线策略。
 fn map_decider_decision(decision: NetworkDecision) -> NetworkDecision {
     match decision {
         NetworkDecision::Allow => NetworkDecision::Allow,

@@ -1,3 +1,22 @@
+//! 【文件职责】定义认证凭据的持久化抽象与四种存储后端，统一 `auth.json` 的读 / 写 / 删。
+//!
+//! 【核心抽象】`AuthStorageBackend` trait（`load` / `save` / `delete`）+ 四个实现：
+//!   - `FileAuthStorage`：明文落盘到 `$CODEX_HOME/auth.json`（Unix 下 0600 权限）。
+//!   - `KeyringAuthStorage`：写系统钥匙串（macOS Keychain / Windows Credential 等），更安全。
+//!   - `AutoAuthStorage`：优先钥匙串、失败回退文件，兼顾安全与可用性（默认推荐）。
+//!   - `EphemeralAuthStorage`：进程内全局内存表，仅本次运行有效，用于外部注入的临时令牌。
+//!
+//! 【架构位置】
+//!   层级：认证子系统 · 持久化层
+//!   上游：`auth/manager.rs`（`load_auth` / `save_auth` / `persist_tokens` 经 `create_auth_storage` 取后端）
+//!   下游：`codex_keyring_store`（钥匙串）、`std::fs`（文件）、进程内 `EPHEMERAL_AUTH_STORE`
+//!
+//! 【数据载体】`AuthDotJson` 即 `auth.json` 的结构映射；本文件只管「存在哪、怎么存」，
+//!   令牌字段的语义（access/refresh/id_token、计划类型等）见 `token_data` 与 `manager.rs`。
+//!
+//! 【阅读建议】先看 `AuthDotJson` 字段、再看 `AuthStorageBackend` 契约，
+//!   最后按需对照各后端实现；`create_auth_storage` 是统一工厂入口。
+
 use chrono::DateTime;
 use chrono::Utc;
 use serde::Deserialize;
@@ -29,20 +48,29 @@ use codex_protocol::account::PlanType as AccountPlanType;
 use once_cell::sync::Lazy;
 
 /// Expected structure for $CODEX_HOME/auth.json.
+/// `auth.json` 文件的结构映射，是认证子系统所有读写的统一数据载体。
+/// 字段大多 `Option` 且 `skip_serializing_if`：不同认证模式只填其相关字段，
+/// 序列化时省略空值以保持文件简洁、向后兼容。
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct AuthDotJson {
+    // 认证模式标识（apikey/chatgpt/...）。缺省时由 `manager.rs::resolved_mode()`
+    // 依据其它字段推断，以兼容早期未写该字段的旧文件。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<AuthMode>,
 
+    // 注意：磁盘上的字段名是大写 `OPENAI_API_KEY`（历史约定），与 Rust 字段名映射。
     #[serde(rename = "OPENAI_API_KEY")]
     pub openai_api_key: Option<String>,
 
+    // ChatGPT OAuth 令牌组（access/refresh/id_token 等），仅 ChatGPT 系模式存在。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenData>,
 
+    // 上次刷新时间，用于 `manager.rs` 判断是否到了主动刷新窗口。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refresh: Option<DateTime<Utc>>,
 
+    // Agent Identity 模式专用：直接保存原始 JWT 字符串，校验/解码在加载时进行。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_identity: Option<String>,
 }
@@ -85,6 +113,8 @@ pub(super) fn get_auth_file(codex_home: &Path) -> PathBuf {
     codex_home.join("auth.json")
 }
 
+// 删除 auth.json：文件不存在视为「未删任何东西」返回 `Ok(false)`，而非报错。
+// 返回值约定：`Ok(true)`=确实删了一个文件，`Ok(false)`=本就不存在。
 pub(super) fn delete_file_if_exists(codex_home: &Path) -> std::io::Result<bool> {
     let auth_file = get_auth_file(codex_home);
     match std::fs::remove_file(&auth_file) {
@@ -94,12 +124,18 @@ pub(super) fn delete_file_if_exists(codex_home: &Path) -> std::io::Result<bool> 
     }
 }
 
+/// 认证存储后端统一契约：屏蔽「文件 / 钥匙串 / 内存」的差异，对上只暴露读写删三操作。
+/// 约定：`load` 在「无凭据」时返回 `Ok(None)`（非错误）；`delete` 返回是否真的删除了内容。
+/// 需 `Send + Sync`：会被 `Arc<dyn AuthStorageBackend>` 跨线程共享（见 `manager.rs`）。
 pub(super) trait AuthStorageBackend: Debug + Send + Sync {
     fn load(&self) -> std::io::Result<Option<AuthDotJson>>;
     fn save(&self, auth: &AuthDotJson) -> std::io::Result<()>;
     fn delete(&self) -> std::io::Result<bool>;
 }
 
+/// 后端一：明文文件存储，凭据直接落到 `$CODEX_HOME/auth.json`。
+/// 简单可移植，但凭据以明文存在磁盘上——靠文件权限（Unix 0600）做基本保护，
+/// 安全性弱于钥匙串，故默认推荐 `Auto`（钥匙串优先）。
 #[derive(Clone, Debug)]
 pub(super) struct FileAuthStorage {
     codex_home: PathBuf,
@@ -144,6 +180,8 @@ impl AuthStorageBackend for FileAuthStorage {
         options.truncate(true).write(true).create(true);
         #[cfg(unix)]
         {
+            // 关键安全点：Unix 下以 0600（仅属主可读写）创建文件，
+            // 防止同机其它用户读取明文令牌。Windows 无此机制故不设置。
             options.mode(0o600);
         }
         let mut file = options.open(auth_file)?;
@@ -160,6 +198,9 @@ impl AuthStorageBackend for FileAuthStorage {
 const KEYRING_SERVICE: &str = "Codex Auth";
 
 // turns codex_home path into a stable, short key string
+// 把 codex_home 路径转为稳定且短的键：先规范化路径（失败则用原值），
+// 再取其 SHA-256 十六进制前 16 位，前缀 `cli|`。用作钥匙串条目名与内存表的 key，
+// 保证同一 home 始终映射到同一条目，且不把完整路径明文写进键名。
 fn compute_store_key(codex_home: &Path) -> std::io::Result<String> {
     let canonical = codex_home
         .canonicalize()
@@ -173,6 +214,8 @@ fn compute_store_key(codex_home: &Path) -> std::io::Result<String> {
     Ok(format!("cli|{truncated}"))
 }
 
+/// 后端二：系统钥匙串存储，凭据交给 OS 安全存储（macOS Keychain / Linux Secret Service 等）。
+/// 比明文文件安全；`save`/`delete` 会顺带清理可能残留的回退文件，避免明文副本泄露。
 #[derive(Clone, Debug)]
 struct KeyringAuthStorage {
     codex_home: PathBuf,
@@ -228,6 +271,8 @@ impl AuthStorageBackend for KeyringAuthStorage {
         // Simpler error mapping per style: prefer method reference over closure
         let serialized = serde_json::to_string(auth).map_err(std::io::Error::other)?;
         self.save_to_keyring(&key, &serialized)?;
+        // 写钥匙串成功后清掉旧的明文回退文件：防止磁盘上残留过期的明文凭据副本。
+        // 删除失败仅告警不报错——钥匙串才是权威来源，残留文件不影响正确性。
         if let Err(err) = delete_file_if_exists(&self.codex_home) {
             warn!("failed to remove CLI auth fallback file: {err}");
         }
@@ -247,6 +292,9 @@ impl AuthStorageBackend for KeyringAuthStorage {
     }
 }
 
+/// 后端三：自动模式（默认推荐），组合钥匙串与文件两种后端。
+/// 策略：读 / 写 一律先试钥匙串，钥匙串不可用（无凭据或出错）时回退到文件。
+/// 这样在支持钥匙串的环境里更安全，在不支持的环境里仍能工作。
 #[derive(Clone, Debug)]
 struct AutoAuthStorage {
     keyring_storage: Arc<KeyringAuthStorage>,
@@ -264,6 +312,8 @@ impl AutoAuthStorage {
 
 impl AuthStorageBackend for AutoAuthStorage {
     fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
+        // 钥匙串命中即用；命中空（`Ok(None)`，如尚未迁移到钥匙串）或读取出错（`Err`）
+        // 都回退到文件存储读取。区别仅在于出错时多打一条告警。
         match self.keyring_storage.load() {
             Ok(Some(auth)) => Ok(Some(auth)),
             Ok(None) => self.file_storage.load(),
@@ -291,9 +341,14 @@ impl AuthStorageBackend for AutoAuthStorage {
 }
 
 // A global in-memory store for mapping codex_home -> AuthDotJson.
+// [引用范围 · 进程级全局单例] 由所有 `EphemeralAuthStorage` 实例共享的内存表，
+// 键为 `compute_store_key(codex_home)`。进程退出即丢失，不落盘——这正是它存在的意义：
+// 承载外部宿主 App 注入的临时 ChatGPT 令牌（不应写入磁盘）。
 static EPHEMERAL_AUTH_STORE: Lazy<Mutex<HashMap<String, AuthDotJson>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// 后端四：内存（临时）存储，凭据只活在本进程内存里，从不落盘。
+/// 用途：外部注入的 ChatGPT 令牌、以及测试场景。多实例共享同一张全局表 `EPHEMERAL_AUTH_STORE`。
 #[derive(Clone, Debug)]
 struct EphemeralAuthStorage {
     codex_home: PathBuf,
@@ -333,6 +388,8 @@ impl AuthStorageBackend for EphemeralAuthStorage {
     }
 }
 
+/// 统一工厂：按存储模式选出对应的后端实现，是 `manager.rs` 获取存储后端的唯一入口。
+/// 默认注入系统钥匙串实现 `DefaultKeyringStore`；测试可走下面的 `_with_keyring_store` 注入桩。
 pub(super) fn create_auth_storage(
     codex_home: PathBuf,
     mode: AuthCredentialsStoreMode,

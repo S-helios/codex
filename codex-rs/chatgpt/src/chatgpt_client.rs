@@ -1,3 +1,8 @@
+//! 【文件职责】向 ChatGPT 后端 API 发起带认证的 GET 请求的底层客户端（crate 私有）。
+//! 统一处理：取用 ChatGPT 登录态、注入认证头与产品标识头、拼 URL、解析 JSON、错误归一。
+//!
+//! 【架构位置】被本 crate 的 `get_task` / `connectors` / `workspace_settings` 复用，
+//! 是它们访问 ChatGPT 后端的唯一出口。
 use codex_core::config::Config;
 use codex_login::AuthManager;
 use codex_login::default_client::create_client;
@@ -6,10 +11,12 @@ use anyhow::Context;
 use serde::de::DeserializeOwned;
 use std::time::Duration;
 
+// 产品标识请求头：后端据此识别请求来自 Codex（用于配额/路由/统计等）。
 const OAI_PRODUCT_SKU_HEADER: &str = "OAI-Product-Sku";
 const CODEX_PRODUCT_SKU: &str = "codex";
 
 /// Make a GET request to the ChatGPT backend API.
+/// 向 ChatGPT 后端发 GET 请求（不带超时），是下方带超时版本的便捷包装。
 pub(crate) async fn chatgpt_get_request<T: DeserializeOwned>(
     config: &Config,
     path: String,
@@ -17,6 +24,11 @@ pub(crate) async fn chatgpt_get_request<T: DeserializeOwned>(
     chatgpt_get_request_with_timeout(config, path, /*timeout*/ None).await
 }
 
+/// 向 ChatGPT 后端发 GET 请求并把响应反序列化为 `T`，可选超时。
+///
+/// 前置校验（任一不满足直接 `Err`）：必须有 ChatGPT 登录态、且使用 Codex 后端认证、
+/// 且带有 account id（否则提示重新 `codex login`）。
+/// 非 2xx 响应会带上状态码与响应体文本作为错误返回。
 pub(crate) async fn chatgpt_get_request_with_timeout<T: DeserializeOwned>(
     config: &Config,
     path: String,

@@ -1,3 +1,30 @@
+//! 【文件职责】认证子系统的核心：把「用什么身份访问 OpenAI/ChatGPT 后端」收敛为
+//!   一个 `CodexAuth` 枚举 + 一个进程内唯一的 `AuthManager`，统一处理四种认证模式
+//!   （API Key / 托管 ChatGPT OAuth / 外部 ChatGPT 令牌 / Agent Identity）的
+//!   加载、缓存、主动刷新、401 恢复与注销。
+//!
+//! 【核心矛盾与取舍】令牌会过期、会被撤销、会被多进程并发改写，而程序各处又需看到
+//!   「一致」的认证快照。Codex 的做法：不让各处自己读 `auth.json`，统一经 `AuthManager`——
+//!   它持有内存缓存（`RwLock<CachedAuth>`），仅在显式 `reload()` 时才重新读盘。
+//!
+//! 【架构位置】
+//!   层级：认证子系统 · 主控层
+//!   上游：core/client 等业务模块（调 `auth()` 取当前认证、订阅 `auth_change_receiver`）
+//!   下游：`storage.rs`（凭据持久化）、`default_client.rs`（HTTP 客户端）、
+//!         `external_bearer.rs` / `agent_identity.rs`（外部认证、Agent Identity）
+//!
+//! 【三个并发原语】（见 `AuthManager` 字段）
+//!   - `RwLock<CachedAuth>`：内存唯一真相，存当前 auth + 已缓存的永久刷新失败。
+//!   - `watch::Sender<u64>`：认证变更广播，让订阅方（如请求循环）感知并重试。
+//!   - `Semaphore(1)`：刷新闸，保证同一时刻只有一个 token 刷新在进行，避免并发风暴。
+//!
+//! 【阅读建议】
+//!   1. 先看 `CodexAuth` 枚举与其 getter（`get_token` / `get_account_id` …）理解四种模式。
+//!   2. 再看 `AuthManager::auth()`（主入口：含主动刷新）与 `reload()` / `refresh_token()`。
+//!   3. `UnauthorizedRecovery` 是 401 恢复状态机，是 401 重试的核心，重点看 `next()`。
+//!   4. `load_auth()`（自由函数）是凭据来源的优先级决策中心，值得细读。
+//!   底部 `request_chatgpt_token_refresh` / `classify_refresh_token_failure` 是刷新细节。
+
 use async_trait::async_trait;
 use chrono::Utc;
 use reqwest::StatusCode;
@@ -47,6 +74,11 @@ use serde_json::Value;
 use thiserror::Error;
 
 /// Authentication mechanism used by the current user.
+/// 当前用户使用的认证机制，认证逻辑的「顶层和」。四种变体：
+///   - `ApiKey`：用户提供的 OpenAI API Key，无需刷新。
+///   - `Chatgpt`：Codex 托管的 ChatGPT OAuth 令牌，**由 Codex 自己负责刷新**（持有 storage）。
+///   - `ChatgptAuthTokens`：外部宿主 App 注入的 ChatGPT 令牌，仅在内存、刷新责任在宿主。
+///   - `AgentIdentity`：注册过的 Agent Identity JWT，由 Agent Identity 体系处理。
 #[derive(Debug, Clone)]
 pub enum CodexAuth {
     ApiKey(ApiKeyAuth),
@@ -56,6 +88,9 @@ pub enum CodexAuth {
 }
 
 impl PartialEq for CodexAuth {
+    // 相等性仅比较「认证模式」，不比较具体令牌内容——
+    // 这是有意的粗粒度比较，用于判断认证「种类」是否变化的场景。
+    // 注意：判断令牌是否真的变了用的是 `auths_equal_for_refresh`（见下文）。
     fn eq(&self, other: &Self) -> bool {
         self.api_auth_mode() == other.api_auth_mode()
     }
@@ -77,13 +112,19 @@ pub struct ChatgptAuthTokens {
     state: ChatgptAuthState,
 }
 
+/// ChatGPT 两种认证模式（托管 / 外部）共享的内部状态。
+/// `auth_dot_json` 用 `Arc<Mutex<...>>` 包裹：刷新时就地替换令牌，让持有同一 `Arc` 的克隆都看到新值。
 #[derive(Debug, Clone)]
 struct ChatgptAuthState {
     auth_dot_json: Arc<Mutex<Option<AuthDotJson>>>,
     client: CodexHttpClient,
 }
 
+// 主动刷新的时间阈值（天）：距上次刷新超过 8 天就主动刷新令牌。
+// 取值偏保守——远小于 refresh_token 的实际有效期，留足缓冲避免令牌临期才发现失效。
 const TOKEN_REFRESH_INTERVAL: i64 = 8;
+// access_token 临期窗口（分钟）：解析出 JWT 过期时间后，距到期不足 5 分钟就提前刷新，
+// 防止「检查时还有效、发请求时已过期」的竞态。
 const CHATGPT_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES: i64 = 5;
 
 const REFRESH_TOKEN_EXPIRED_MESSAGE: &str = "Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again.";
@@ -99,6 +140,10 @@ pub const REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OV
 pub const REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REVOKE_TOKEN_URL_OVERRIDE";
 static NEXT_DUMMY_AUTH_ID: AtomicU64 = AtomicU64::new(1);
 
+/// 刷新令牌的错误分类——区分「永久」与「暂时」是整个刷新/恢复逻辑的关键。
+///   - `Permanent`：refresh_token 已过期/被复用/被撤销等，重试无意义，应提示用户重新登录；
+///     会被缓存进 `CachedAuth.permanent_refresh_failure` 以便后续快速失败、不再发网络请求。
+///   - `Transient`：网络抖动、5xx 等暂时性错误，可重试。
 #[derive(Debug, Error)]
 pub enum RefreshTokenError {
     #[error("{0}")]
@@ -162,6 +207,11 @@ pub struct ExternalAuthRefreshContext {
 ///
 /// Implementations may either resolve auth eagerly via `resolve()` or provide refreshed
 /// credentials on demand via `refresh()`.
+///
+/// 可插拔的「外部认证」提供者，供 `AuthManager` 接入由外部托管的认证流。
+/// 两类典型实现：宿主 App 注入的 ChatGPT 令牌；自定义 model provider 的 bearer 令牌
+/// （见 `external_bearer.rs`）。实现方二选一或兼具：`resolve()` 主动给出当前令牌，
+/// 或 `refresh()` 在 401 等场景被动刷新。
 pub trait ExternalAuth: Send + Sync {
     /// Indicates which top-level auth mode this external provider supplies.
     fn auth_mode(&self) -> AuthMode;
@@ -198,6 +248,9 @@ impl From<RefreshTokenError> for std::io::Error {
 }
 
 impl CodexAuth {
+    // 由 `auth.json` 结构构造对应的 `CodexAuth` 变体：先 `resolved_mode()` 定模式，再分派。
+    // API Key / Agent Identity 直接构造并返回；ChatGPT 系则附带选择存储后端
+    // （外部令牌强制走 Ephemeral 内存存储，见 `storage_mode`）。
     async fn from_auth_dot_json(
         codex_home: &Path,
         auth_dot_json: AuthDotJson,
@@ -324,6 +377,8 @@ impl CodexAuth {
     }
 
     /// Returns the token string used for bearer authentication.
+    /// 返回用于 Bearer 鉴权的令牌字符串：API Key 模式返回 key 本身，
+    /// ChatGPT 系返回 access_token，Agent Identity 不暴露 bearer 令牌（返回错误）。
     pub fn get_token(&self) -> Result<String, std::io::Error> {
         match self {
             Self::ApiKey(auth) => Ok(auth.api_key.clone()),
@@ -504,6 +559,8 @@ async fn verified_agent_identity_record(
 
 /// Delete the auth.json file inside `codex_home` if it exists. Returns `Ok(true)`
 /// if a file was removed, `Ok(false)` if no auth file was present.
+/// 删除指定存储后端中的凭据（注销）。`Ok(true)`=删了，`Ok(false)`=本就不存在。
+/// 这是「仅删凭据」的轻量版；需要同时向后端撤销令牌请用 `logout_with_revoke`。
 pub fn logout(
     codex_home: &Path,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
@@ -607,6 +664,9 @@ pub fn load_auth_dot_json(
     storage.load()
 }
 
+/// 登录约束配置：企业/受管环境可强制登录方式与可用工作区。
+///   - `forced_login_method`：强制只能用 API Key 或只能用 ChatGPT，违反则注销。
+///   - `forced_chatgpt_workspace_id`：限定 ChatGPT 账户必须属于某些工作区（account id），违反则注销。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthConfig {
     pub codex_home: PathBuf,
@@ -616,6 +676,9 @@ pub struct AuthConfig {
     pub forced_chatgpt_workspace_id: Option<Vec<String>>,
 }
 
+/// 强制执行登录约束：当前凭据若违反 `forced_login_method` 或 `forced_chatgpt_workspace_id`，
+/// 则直接注销并以 `Err` 返回违规原因。无凭据时直接放行（`Ok(())`）。
+/// 设计意图：受管部署里防止用户用未授权的登录方式或越权工作区访问后端。
 pub async fn enforce_login_restrictions(config: &AuthConfig) -> std::io::Result<()> {
     let Some(auth) = load_auth(
         &config.codex_home,
@@ -730,6 +793,13 @@ fn logout_all_stores(
     Ok(removed_ephemeral || removed_managed)
 }
 
+// 凭据来源的优先级决策中心。按以下顺序选取第一个命中的来源：
+//   1. （若 `enable_codex_api_key_env`）`CODEX_API_KEY` 环境变量 —— 最高优先级。
+//   2. Ephemeral 内存存储 —— 外部注入的 ChatGPT 令牌优先于任何落盘凭据。
+//   3. 若调用方明确只要 Ephemeral，则到此为止（无落盘回退）。
+//   4. `CODEX_ACCESS_TOKEN` 环境变量 —— Agent Identity JWT。
+//   5. 配置的持久化存储（file/keyring/auto）。
+// 这个顺序保证「临时/外部/环境注入」始终压过磁盘上的旧凭据，避免身份串味。
 async fn load_auth(
     codex_home: &Path,
     enable_codex_api_key_env: bool,
@@ -787,6 +857,8 @@ async fn load_auth(
 }
 
 // Persist refreshed tokens into auth storage and update last_refresh.
+// 把刷新得到的新令牌写回存储，并更新 `last_refresh` 时间戳。
+// 仅对调用方传入了 `Some` 的字段做覆盖（id/access/refresh 各自独立），未传的保留原值。
 fn persist_tokens(
     storage: &Arc<dyn AuthStorageBackend>,
     id_token: Option<String>,
@@ -814,6 +886,9 @@ fn persist_tokens(
 
 // Requests refreshed ChatGPT OAuth tokens from the auth service using a refresh token.
 // The caller is responsible for persisting any returned tokens.
+// 用 refresh_token 向 OAuth 端点换取新的 ChatGPT 令牌；本函数只发请求不落盘，由调用方持久化。
+// 错误分类是关键：401 或可识别的失败码（过期/复用/撤销）→ `Permanent`（不可重试）；
+// 其余视为 `Transient`（可重试）。这层分类直接决定上层是否提示用户重新登录。
 async fn request_chatgpt_token_refresh(
     refresh_token: String,
     client: &CodexHttpClient,
@@ -857,6 +932,9 @@ async fn request_chatgpt_token_refresh(
     }
 }
 
+// 把后端返回体里的错误码映射为结构化的失败原因 + 面向用户的提示文案。
+// 已知码：refresh_token_expired→过期、reused→已被使用、invalidated→被撤销；
+// 其余归为 `Other` 并打 warn（便于发现后端新增的未知码）。
 fn classify_refresh_token_failure(body: &str) -> RefreshTokenFailedError {
     let code = extract_refresh_token_error_code(body);
 
@@ -979,6 +1057,8 @@ impl AuthDotJson {
         Self::from_external_tokens(&external)
     }
 
+    // 推断认证模式，兼容缺 `auth_mode` 字段的旧文件：
+    // 显式字段 > 有 API Key 则视为 ApiKey > 否则默认 Chatgpt。
     fn resolved_mode(&self) -> ApiAuthMode {
         if let Some(mode) = self.auth_mode {
             return mode;
@@ -989,6 +1069,8 @@ impl AuthDotJson {
         ApiAuthMode::Chatgpt
     }
 
+    // 决定该用哪个存储后端：外部 ChatGPT 令牌强制走 Ephemeral（绝不落盘），
+    // 其余沿用调用方传入的模式。这是「外部令牌只活在内存」约束的落地点。
     fn storage_mode(
         &self,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
@@ -1002,6 +1084,8 @@ impl AuthDotJson {
 }
 
 /// Internal cached auth state.
+/// `AuthManager` 的内存唯一真相：当前认证快照 + 该快照上已缓存的永久刷新失败。
+/// 后者用于「同一份凭据已确认刷新失败」时快速失败、不再反复打网络。
 #[derive(Clone)]
 struct CachedAuth {
     auth: Option<CodexAuth>,
@@ -1034,6 +1118,8 @@ impl Debug for CachedAuth {
     }
 }
 
+// 401 恢复状态机的「当前步骤」。托管模式走 Reload→RefreshToken→Done，
+// 外部模式走 ExternalRefresh→Done。每遇一次 401 推进一步。
 enum UnauthorizedRecoveryStep {
     Reload,
     RefreshToken,
@@ -1074,6 +1160,13 @@ enum UnauthorizedRecoveryMode {
 //   reloading the cached auth snapshot.
 // - External bearer auth sources for custom model providers rerun the provider
 //   auth command without touching disk.
+//
+// 中文要点：这是处理「请求收到 401」的恢复状态机。客户端每遇一次 401 调一次 `next()`。
+//   - API Key 模式：不恢复，让错误冒泡给用户。
+//   - 托管 ChatGPT：① 先从磁盘 reload（仅当 account id 匹配当前进程身份才 reload，
+//     防止串到别的账户）；② 再走 OAuth refresh。两步后仍 401 则放弃。
+//   - 外部认证（外部 ChatGPT 令牌 / 自定义 provider 的 bearer）：只重试一次，
+//     向外部源要新令牌（前者落 Ephemeral 并 reload，后者重跑 provider 命令、不碰磁盘）。
 pub struct UnauthorizedRecovery {
     manager: Arc<AuthManager>,
     step: UnauthorizedRecoveryStep,
@@ -1183,6 +1276,8 @@ impl UnauthorizedRecovery {
         }
     }
 
+    // 推进状态机一步并执行该步的恢复动作。返回值里的 `auth_state_changed` 告诉调用方
+    // 认证是否发生变化（用于决定要不要带新凭据重发请求）。无可恢复步骤时返回 `Permanent` 错误。
     pub async fn next(&mut self) -> Result<UnauthorizedRecoveryStepResult, RefreshTokenError> {
         if !self.has_next() {
             return Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
@@ -1251,15 +1346,23 @@ impl UnauthorizedRecovery {
 /// External modifications to `auth.json` will NOT be observed until
 /// `reload()` is called explicitly. This matches the design goal of avoiding
 /// different parts of the program seeing inconsistent auth data mid‑run.
+///
+/// 进程内唯一的认证管理器，提供 `auth.json` 派生认证数据的「单一真相」。
+/// 关键设计：磁盘上 `auth.json` 的外部改动在显式 `reload()` 之前不会被观察到——
+/// 以此保证程序各部分在一次运行中看到一致的认证快照，避免中途身份漂移。
 pub struct AuthManager {
     codex_home: PathBuf,
+    // 内存唯一真相：当前认证快照 + 永久刷新失败缓存（见 `CachedAuth`）。
     inner: RwLock<CachedAuth>,
+    // 认证变更广播：每次缓存认证发生「会影响刷新」的变化时递增计数，唤醒订阅方重试。
     auth_change_tx: watch::Sender<u64>,
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     forced_chatgpt_workspace_id: RwLock<Option<Vec<String>>>,
     chatgpt_base_url: Option<String>,
+    // 刷新闸（容量 1）：序列化所有令牌刷新，保证同一时刻至多一个刷新在飞，避免并发刷新风暴。
     refresh_lock: Semaphore,
+    // 可插拔的外部认证提供者（外部 ChatGPT 令牌 / 自定义 provider bearer），运行时可设置/清除。
     external_auth: RwLock<Option<Arc<dyn ExternalAuth>>>,
 }
 
@@ -1424,6 +1527,10 @@ impl AuthManager {
     /// Current cached auth (clone). May be `None` if not logged in or load failed.
     /// For managed ChatGPT auth that needs a proactive refresh, first performs
     /// a guarded reload and then refreshes only if the on-disk auth is unchanged.
+    ///
+    /// 取当前认证的「主入口」（业务侧通常调它，而非 `auth_cached`）。
+    /// 流程：① 先看外部 API Key 源；② 取缓存；③ 若是临期的托管 ChatGPT 则先主动刷新
+    /// （`should_refresh_proactively`）；刷新失败也不致命——记日志后返回旧 auth 兜底。
     pub async fn auth(&self) -> Option<CodexAuth> {
         if let Some(auth) = self.resolve_external_api_key_auth().await {
             return Some(auth);
@@ -1447,6 +1554,9 @@ impl AuthManager {
         self.set_cached_auth(new_auth)
     }
 
+    // 「带护栏的 reload」：仅当磁盘上凭据的 account id 与期望一致时才真正切换缓存。
+    // 这是防止「多进程/多账户串味」的关键——比如另一进程登录了别的账户改写了 auth.json，
+    // 本进程不应在 401 恢复时悄悄切到那个账户。account id 缺失或不匹配都返回 `Skipped`。
     async fn reload_if_account_id_matches(
         &self,
         expected_account_id: Option<&str>,
@@ -1482,6 +1592,9 @@ impl AuthManager {
         }
     }
 
+    // 「面向刷新」的细粒度相等比较：不仅比模式，还比令牌内容（ChatGPT 比整个 auth.json、
+    // Agent Identity 比 record、API Key 比 key 串）。与 `PartialEq`（只比模式）刻意不同——
+    // 用于判断「令牌是否真的变了」，决定是否清缓存/广播/复用永久失败结论。
     fn auths_equal_for_refresh(a: Option<&CodexAuth>, b: Option<&CodexAuth>) -> bool {
         match (a, b) {
             (None, None) => true,
@@ -1513,6 +1626,8 @@ impl AuthManager {
 
     /// Records a permanent refresh failure only if the failed refresh was
     /// attempted against the auth snapshot that is still cached.
+    /// 仅当「失败时尝试的那份凭据」仍是当前缓存时，才记录永久失败。
+    /// 防止竞态：若刷新期间认证已被换成别的，旧凭据的失败结论不应误伤新凭据。
     fn record_permanent_refresh_failure_if_unchanged(
         &self,
         attempted_auth: &CodexAuth,
@@ -1542,6 +1657,10 @@ impl AuthManager {
         .flatten()
     }
 
+    // 写入新的缓存认证，并按需广播变更。两种「变化」语义需区分：
+    //   - `changed`（粗粒度，仅模式比较）：作为返回值，告诉调用方认证种类是否变了。
+    //   - `auth_changed_for_refresh`（细粒度，含令牌内容）：令牌真的变了才清空永久失败缓存
+    //     并发广播——避免无意义地唤醒订阅方或丢弃仍有效的失败缓存。
     fn set_cached_auth(&self, new_auth: Option<CodexAuth>) -> bool {
         if let Ok(mut guard) = self.inner.write() {
             let previous = guard.auth.as_ref();
@@ -1680,6 +1799,11 @@ impl AuthManager {
     /// cached account id. If the persisted token differs from the cached token, we
     /// can assume that some other instance already refreshed it. If the persisted
     /// token is the same as the cached, then ask the token authority to refresh.
+    ///
+    /// 刷新令牌，先做「带护栏的 reload」再决定是否真刷。多进程协作的巧思：
+    /// 若磁盘上的令牌已和缓存不同，说明别的实例刚刷过——直接采用即可，省一次刷新；
+    /// 只有磁盘令牌与缓存相同（确实没人刷过）才向令牌授权方发起真正的刷新。
+    /// 全程被 `refresh_lock` 串行化；API Key 无需刷新直接返回 Ok。
     pub async fn refresh_token(&self) -> Result<(), RefreshTokenError> {
         let _refresh_guard = self.refresh_lock.acquire().await.map_err(|_| {
             RefreshTokenError::Permanent(RefreshTokenFailedError::new(
@@ -1730,6 +1854,10 @@ impl AuthManager {
         self.refresh_token_from_authority_impl().await
     }
 
+    // 真正执行刷新的内核（已假定持有 refresh_lock）。按认证模式分派：
+    //   - 外部 ChatGPT 令牌 → 走外部 refresh；托管 ChatGPT → OAuth 刷新并落盘；
+    //   - API Key / Agent Identity → 无需刷新。
+    // 入口先查「该凭据是否已有永久失败缓存」：有则直接快速失败，不再打网络。
     async fn refresh_token_from_authority_impl(&self) -> Result<(), RefreshTokenError> {
         tracing::info!("Refreshing token");
 
@@ -1768,6 +1896,9 @@ impl AuthManager {
     /// if a file was removed, Ok(false) if no auth file existed. On success,
     /// reloads the in‑memory auth cache so callers immediately observe the
     /// unauthenticated state.
+    ///
+    /// 注销：删除所有存储后端中的凭据，并立刻 reload 清空内存缓存，使各处即时看到未登录态。
+    /// 与 `logout_with_revoke` 的区别：本方法不向后端撤销令牌（令牌仍可能在服务端有效直至过期）。
     pub async fn logout(&self) -> std::io::Result<bool> {
         let removed = logout_all_stores(&self.codex_home, self.auth_credentials_store_mode)?;
         // Always reload to clear any cached auth (even if file absent).
@@ -1809,6 +1940,9 @@ impl AuthManager {
         )
     }
 
+    // 判断是否需要「主动刷新」（仅托管 ChatGPT 适用）。两条判据，命中其一即刷新：
+    //   ① access_token JWT 的过期时间已进入临期窗口（不足 5 分钟到期）；
+    //   ② 距上次刷新已超过 8 天（JWT 无过期信息时的兜底）。
     fn should_refresh_proactively(auth: &CodexAuth) -> bool {
         let chatgpt_auth = match auth {
             CodexAuth::Chatgpt(chatgpt_auth) => chatgpt_auth,
@@ -1833,6 +1967,10 @@ impl AuthManager {
         last_refresh < Utc::now() - chrono::Duration::days(TOKEN_REFRESH_INTERVAL)
     }
 
+    // 向外部认证源请求刷新（外部 ChatGPT 令牌或自定义 provider bearer）。
+    // 关键校验：若配置了 `forced_chatgpt_workspace_id`，刷新回来的工作区必须在白名单内，
+    // 否则拒绝——防止外部源把身份悄悄换到未授权的工作区。
+    // ChatGPT 令牌刷新成功后写入 Ephemeral 内存存储并 reload；纯 API Key 外部源则直接返回。
     async fn refresh_external_auth(
         &self,
         reason: ExternalAuthRefreshReason,
@@ -1888,6 +2026,8 @@ impl AuthManager {
 
     // Refreshes ChatGPT OAuth tokens, persists the updated auth state, and
     // reloads the in-memory cache so callers immediately observe new tokens.
+    // 托管 ChatGPT 的标准刷新路径：调 OAuth 端点换新令牌 → 落盘（含更新 last_refresh）
+    // → reload 内存缓存，三步缺一不可，保证刷新后各处立即看到新令牌。
     async fn refresh_and_persist_chatgpt_token(
         &self,
         auth: &ChatgptAuth,

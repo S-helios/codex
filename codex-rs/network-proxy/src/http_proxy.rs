@@ -1,3 +1,34 @@
+//! 【文件职责】实现网络代理的 HTTP/1 入口：处理明文 HTTP 请求与 CONNECT
+//! 隧道，对每个请求做策略评估（allow/deny/MITM 要求），命中阻断时返回
+//! 403/503 并落审计事件；放行时转发到上游（直连或上游代理）。
+//!
+//! 【架构位置】
+//!   层级：网络代理层（codex-rs/network-proxy）
+//!   上游：`runtime.rs` 启动代理时通过 `run_http_proxy*` 把监听器与
+//!         `NetworkProxyState` + 可选 `NetworkPolicyDecider` 接进来；
+//!         代理本身位于 Codex 沙箱与外部网络之间，所有出网流量经此。
+//!   下游：`network_policy::evaluate_host_policy`（域名/协议放行判定）、
+//!         `mitm`（CONNECT 终止 + 内层 HTTPS 检查）、
+//!         `upstream::UpstreamClient`（实际向目标发请求）、
+//!         `state::NetworkProxyState`（读配置/记录被阻断请求/发审计）。
+//!
+//! 【三条出网路径与拦截点】
+//!   - 明文 HTTP：`http_plain_proxy` —— 校验 method、Host 头一致性、域名策略，
+//!     放行后剥 hop-by-hop 头转发；另含 `x-unix-socket` 本地 socket 逃生口
+//!     （仅 macOS + 白名单）。
+//!   - HTTPS CONNECT：`http_connect_accept`（升级握手阶段做域名/MITM 判定）→
+//!     `http_connect_proxy`（隧道阶段：走 MITM 解密或裸 TCP 透传）。
+//!   - SOCKS5：不在本文件，见 `socks5.rs`；本文件只处理 HTTP/CONNECT。
+//!
+//! 【阻断语义】被拒请求统一走 403 Forbidden（域名/方法/MITM 等策略原因）
+//!   或 503 Service Unavailable（代理被整体禁用）；响应体携带
+//!   `x-proxy-error` 头与 JSON/文本说明，便于客户端识别是被策略挡下而非网络故障。
+//!
+//! 【阅读建议】先看 `run_http_proxy_with_listener` 搭起的 Rama service 栈
+//!   （CONNECT 与非 CONNECT 分流），再看 `http_connect_accept` 的 MITM 判定
+//!   与 `http_plain_proxy` 的多重校验；底部 `*_response` / `remove_hop_by_hop_*`
+//!   等是辅助函数，可按需查阅。
+
 use crate::config::NetworkMode;
 use crate::connect_policy::TargetCheckedTcpConnector;
 use crate::mitm;
@@ -80,9 +111,14 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 
+// CONNECT 握手阶段算出的「本次隧道是否需要 MITM 解密」标记，经 Rama 的
+// extensions 透传给隧道阶段 `http_connect_proxy`。放进 extensions 而非函数
+// 参数，是因为 Rama 的 upgrade 回调签名固定，只能借扩展容器跨阶段携带状态。
 #[derive(Clone, Copy, Debug)]
 struct ConnectMitmEnabled(bool);
 
+/// 在指定地址绑定 TCP 监听器并启动 HTTP/1 代理。
+/// 失败时把 Rama 的 `BoxError` 包成 `OpaqueError` 再转 `anyhow`，以便错误链路完整。
 pub async fn run_http_proxy(
     state: Arc<NetworkProxyState>,
     addr: SocketAddr,
@@ -102,6 +138,8 @@ pub async fn run_http_proxy(
     run_http_proxy_with_listener(state, listener, policy_decider).await
 }
 
+/// 复用调用方已创建的 `std` 监听器启动代理（用于已 bind 好端口的场景，
+/// 例如测试或需要 fd 继承的部署）。
 pub async fn run_http_proxy_with_std_listener(
     state: Arc<NetworkProxyState>,
     listener: StdTcpListener,
@@ -112,11 +150,24 @@ pub async fn run_http_proxy_with_std_listener(
     run_http_proxy_with_listener(state, listener, policy_decider).await
 }
 
+/// 组装并运行 HTTP/1 代理的 Rama service 栈，是本文件的总装入口。
+///
+/// 栈的结构（自外向内）：
+///   1. `AddInputExtensionLayer(state)`：把 `NetworkProxyState` 注入每个连接的
+///      extensions，后续各阶段从中读配置/记录阻断。
+///   2. `UpgradeLayer(CONNECT)`：方法为 CONNECT 时走 `http_connect_accept`
+///      （握手判定）+ `http_connect_proxy`（隧道转发）；否则落到内层。
+///   3. `RemoveResponseHeaderLayer::hop_by_hop()`：剥响应侧逐跳头。
+///   4. 内层 fallback：`http_plain_proxy` 处理普通 HTTP 请求。
+///
+/// `policy_decider` 是可选的外部决策器（如向用户发起 ask 审批），多处闭包各持一份克隆。
 async fn run_http_proxy_with_listener(
     state: Arc<NetworkProxyState>,
     listener: TcpListener,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
 ) -> Result<()> {
+    // 安装 rustls 默认加密 provider（进程级、幂等）。MITM 终止与上游 TLS
+    // 握手都依赖它，必须在建立任何 TLS 连接前完成。
     ensure_rustls_crypto_provider();
 
     let addr = listener
@@ -153,6 +204,14 @@ async fn run_http_proxy_with_listener(
     Ok(())
 }
 
+/// CONNECT 握手阶段的准入判定：在 TCP 隧道真正建立前完成域名策略与 MITM 决策。
+///
+/// 返回 `Ok((200 响应, req))` 表示放行，让上层升级为隧道；`Err(响应)` 表示
+/// 拒绝（403/4xx/5xx），直接回给客户端。判定结果（目标 authority、是否需要
+/// MITM、网络模式、MITM 状态）通过 `req` 的 extensions 透传给隧道阶段。
+///
+/// 判定顺序：取目标 host → 代理是否启用 → 域名策略(allow/deny/ask) →
+/// 是否需要 MITM 且 MITM 是否就绪。任一不通过即在此处阻断并落审计。
 async fn http_connect_accept(
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     mut req: Request,
@@ -163,6 +222,8 @@ async fn http_connect_accept(
         .cloned()
         .ok_or_else(|| text_response(StatusCode::INTERNAL_SERVER_ERROR, "missing state"))?;
 
+    // CONNECT 的目标写在请求行的 authority（host:port）里，而非 URL；
+    // 取不到 authority 说明请求格式非法，直接 400。
     let authority = match RequestContext::try_from(&req).map(|ctx| ctx.host_with_port()) {
         Ok(authority) => authority,
         Err(err) => {
@@ -177,6 +238,7 @@ async fn http_connect_accept(
     }
 
     let client = client_addr(&req);
+    // 第一道闸：代理被整体禁用时一律拒绝（503），不再做后续域名判定。
     let enabled = app_state
         .enabled()
         .await
@@ -196,6 +258,9 @@ async fn http_connect_accept(
         .await);
     }
 
+    // 第二道闸：域名策略判定。把目标包装成 `NetworkPolicyRequest` 交给
+    // `evaluate_host_policy`，由它综合 allowlist/denylist、本地地址规则、
+    // 以及可选 decider 给出 Allow / Deny（含 ask 也归为 Deny 分支）。
     let request = NetworkPolicyRequest::new(NetworkPolicyRequestArgs {
         protocol: NetworkProtocol::HttpsConnect,
         host: host.clone(),
@@ -247,6 +312,8 @@ async fn http_connect_accept(
         }
     }
 
+    // 走到这里说明域名已放行。接下来判定本次 CONNECT 是否「必须」做 MITM：
+    // 取网络模式、MITM 运行态、以及该 host 是否配置了 MITM 钩子。
     let mode = app_state
         .network_mode()
         .await
@@ -266,11 +333,16 @@ async fn http_connect_accept(
             return Err(text_response(StatusCode::INTERNAL_SERVER_ERROR, "error"));
         }
     };
+    // 需要 MITM 的两种情形：limited 模式下要解密以强制方法白名单；或该 host
+    // 配了 MITM 钩子需检查/改写内层请求。否则裸隧道透传即可。
     let connect_needs_mitm = mode == NetworkMode::Limited || host_has_mitm_hooks;
 
     if connect_needs_mitm && mitm_state.is_none() {
         // CONNECT needs MITM whenever HTTPS policy depends on inner-request inspection, either for
         // limited-mode method enforcement or for host-specific MITM hooks.
+        // 安全闸：策略要求看内层请求，但 MITM 运行态缺失（如无 CA），此时
+        // 无法解密就无法落实策略。「fail-closed」——直接以 mitm_required 阻断，
+        // 绝不退化成裸透传，避免在 limited 模式下放过本该受限的 HTTPS 流量。
         emit_http_block_decision_audit_event(
             &app_state,
             BlockDecisionAuditEventArgs {
@@ -311,6 +383,8 @@ async fn http_connect_accept(
         return Err(blocked_text_with_details(REASON_MITM_REQUIRED, &details));
     }
 
+    // 放行：把隧道阶段所需的判定结果塞进 extensions 透传（目标 authority、
+    // 是否 MITM、网络模式；需 MITM 时附带 MITM 运行态），随后回 200 让上层升级。
     req.extensions_mut().insert(ProxyTarget(authority));
     req.extensions_mut()
         .insert(ConnectMitmEnabled(connect_needs_mitm));
@@ -328,6 +402,10 @@ async fn http_connect_accept(
     ))
 }
 
+/// CONNECT 隧道阶段：连接已升级为双向字节流后被调用。依据握手阶段写入的
+/// 标记二选一——需 MITM 则交给 `mitm::mitm_tunnel` 终止 TLS 并检查内层请求；
+/// 否则裸 TCP 透传（可选经上游代理）。返回 `Infallible`：隧道错误只记日志，
+/// 不向上传播（连接已脱离正常请求/响应模型）。
 async fn http_connect_proxy(upgraded: Upgraded) -> Result<(), Infallible> {
     let mode = upgraded
         .extensions()
@@ -344,6 +422,8 @@ async fn http_connect_proxy(upgraded: Upgraded) -> Result<(), Infallible> {
         return Ok(());
     };
 
+    // 分支一：握手阶段判定需 MITM 且 MITM 运行态已就绪 → 走解密隧道。
+    // 两个条件都满足才进入，避免标记与状态不一致时误入。
     if upgraded
         .extensions()
         .get::<ConnectMitmEnabled>()
@@ -374,6 +454,9 @@ async fn http_connect_proxy(upgraded: Upgraded) -> Result<(), Infallible> {
         }
     };
 
+    // 分支二：裸 TCP 透传。先看是否允许走上游代理（如企业出口代理）；
+    // 允许则从环境变量解析上游代理地址，否则直连目标。读失败时保守按
+    // 不允许（false）处理，宁可直连也不误用代理。
     let allow_upstream_proxy = match app_state.allow_upstream_proxy().await {
         Ok(allowed) => allowed,
         Err(err) => {
@@ -404,6 +487,11 @@ async fn http_connect_proxy(upgraded: Upgraded) -> Result<(), Infallible> {
     Ok(())
 }
 
+/// 裸 TCP 透传隧道：对放行的 CONNECT，向目标（或经上游代理）建立 TLS 隧道，
+/// 然后用 `StreamForwardService` 在客户端与目标之间双向搬运字节，不解密内容。
+///
+/// 注意：连接器仍用 `TargetCheckedTcpConnector` 包裹，确保即便经上游代理，
+/// 最终目标地址也再过一遍策略校验，杜绝绕过。
 async fn forward_connect_tunnel(
     upgraded: Upgraded,
     proxy: Option<ProxyAddress>,
@@ -476,6 +564,12 @@ async fn forward_connect_tunnel(
         })
 }
 
+/// 明文 HTTP 请求处理器（非 CONNECT 的 fallback）。完整校验链：
+///   方法白名单 → `x-unix-socket` 逃生口（若有）→ Host 头与请求目标一致性 →
+///   代理是否启用 → 域名策略 → 方法策略 → 放行后剥逐跳头并转发到上游。
+///
+/// 返回 `Infallible`：所有失败都转成对应状态码的 `Response`（4xx/5xx）回客户端，
+/// 不向 Rama 框架抛错，保证单个坏请求不影响代理本身存活。
 async fn http_plain_proxy(
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     mut req: Request,
@@ -500,6 +594,10 @@ async fn http_plain_proxy(
     // `x-unix-socket` is an escape hatch for talking to local daemons. We keep it tightly scoped:
     // macOS-only + explicit allowlist by default, to avoid turning the proxy into a general local
     // capability escalation mechanism.
+    // 自定义头 `x-unix-socket` 是与本机守护进程（如 Docker、本地服务）通信的
+    // 逃生口：把 HTTP 请求转投到指定 Unix domain socket。刻意收紧——仅 macOS、
+    // 默认需显式白名单——以防代理沦为通用的本地权限提升通道。校验顺序：
+    // 启用态 → 方法策略 → 平台支持 → socket 路径白名单，逐层 fail-closed。
     if let Some(unix_socket_header) = req.headers().get("x-unix-socket") {
         let socket_path = match unix_socket_header.to_str() {
             Ok(value) => value.to_string(),
@@ -643,6 +741,8 @@ async fn http_plain_proxy(
     let authority = request_ctx.host_with_port();
     let host = normalize_host(&authority.host.to_string());
     let port = authority.port;
+    // 防绕过：absolute-form 请求（URI 带 scheme+host）若 Host 头与请求目标不
+    // 一致，可能是想骗过基于 Host 的策略匹配。不一致即 400 拒绝。
     if let Err(reason) = validate_absolute_form_host_header(&req, &request_ctx) {
         let client = client.as_deref().unwrap_or_default();
         let host_header = req
@@ -785,6 +885,8 @@ async fn http_plain_proxy(
         Ok(allow) => allow,
         Err(resp) => return Ok(resp),
     };
+    // 选择上游客户端：允许上游代理则从环境变量取代理，否则直连。两者都用
+    // 同一 `app_state`，确保上游连接仍受目标地址策略校验。
     let client = if allow_upstream_proxy {
         UpstreamClient::from_env_proxy(app_state.clone())
     } else {
@@ -792,6 +894,8 @@ async fn http_plain_proxy(
     };
 
     // Strip hop-by-hop headers only after extracting metadata used for policy correlation.
+    // 在抽取完用于策略关联的元数据之后，才剥除逐跳（hop-by-hop）头：这些头
+    // 仅在单段连接内有意义，转发给上游前必须删掉（如 Connection、Proxy-* 等）。
     remove_hop_by_hop_request_headers(req.headers_mut());
     match client.serve(req).await {
         Ok(resp) => Ok(resp),
@@ -837,6 +941,13 @@ fn client_addr<T: ExtensionsRef>(input: &T) -> Option<String> {
         .map(|info| info.peer_addr().to_string())
 }
 
+/// 校验 absolute-form 请求中 Host 头与请求行目标是否一致，防策略绕过。
+///
+/// 仅当 URI 含 scheme（即 absolute-form，代理常见形态）时才校验：
+///   - 无 scheme（origin-form）→ 直接 Ok，Host 头本身即目标，无从不一致；
+///   - host 不匹配 → 拒绝；
+///   - 端口：Host 头显式带端口须与目标端口相同；Host 头不带端口则要求目标
+///     使用该 scheme 的默认端口，否则视为不一致。
 fn validate_absolute_form_host_header(
     req: &Request,
     request_ctx: &RequestContext,
@@ -870,7 +981,12 @@ fn validate_absolute_form_host_header(
 
     Ok(())
 }
+/// 剥除请求中的逐跳头，避免把仅对单段连接有意义的头透传给上游。
+/// 两类：①`Connection` 头里列出的头名（动态，须解析其值逐个删除）；
+/// ②固定的逐跳头（Keep-Alive、Proxy-*、Transfer-Encoding、Upgrade、TE 等）。
 fn remove_hop_by_hop_request_headers(headers: &mut HeaderMap) {
+    // 循环删：`Connection` 可能出现多次，且其值列举了其它待删头名；先删它，
+    // 再按列举的 token 删除对应头，直到不再有 Connection 头。
     while let Some(raw_connection) = headers.get(header::CONNECTION).cloned() {
         headers.remove(header::CONNECTION);
         if let Ok(raw_connection) = raw_connection.to_str() {
@@ -905,6 +1021,9 @@ fn remove_hop_by_hop_request_headers(headers: &mut HeaderMap) {
     }
 }
 
+/// 构造 HTTP 阻断响应：403 Forbidden + JSON 体（含 host/reason/decision/source
+/// 等策略元数据）+ `x-proxy-error` 头。客户端凭此区分「被策略挡下」与网络故障。
+/// `details` 为 None 时只给最小信息（如 Unix socket 阻断无完整策略上下文）。
 fn json_blocked(host: &str, reason: &str, details: Option<&PolicyDecisionDetails<'_>>) -> Response {
     let (message, decision, source, protocol, port) = details
         .map(|details| {
@@ -940,6 +1059,10 @@ fn blocked_text_with_details(reason: &str, details: &PolicyDecisionDetails<'_>) 
     blocked_text_response_with_policy(reason, details)
 }
 
+/// 构造「代理整体禁用」的阻断响应：503 Service Unavailable。与 `json_blocked`
+/// 的 403 区分——403 表示请求被策略拒绝，503 表示代理当前不提供服务。
+/// 同时落审计事件并记录被阻断请求；`audit_endpoint_override` 用于无真实
+/// host:port 的场景（如 Unix socket，传入占位端点）。
 async fn proxy_disabled_response(
     app_state: &NetworkProxyState,
     host: String,
@@ -1020,6 +1143,8 @@ fn emit_http_allow_decision_audit_event(
     emit_allow_decision_audit_event(app_state, args);
 }
 
+/// 阻断响应的 JSON 序列化结构。`status` 恒为 "blocked"；其余策略字段在缺失
+/// 时跳过序列化（`skip_serializing_if`），让最小阻断也能输出干净的 JSON。
 #[derive(Serialize)]
 struct BlockedResponse<'a> {
     status: &'static str,

@@ -1,3 +1,17 @@
+//! 【文件职责】把操作系统的「密钥环 / 凭证管理器」（macOS Keychain、Windows
+//! Credential Manager、Linux Secret Service 等）抽象成统一的 `KeyringStore` trait，
+//! 作为 Codex 登录令牌的安全存储后端之一（相对「明文 auth.json」更安全）。
+//!
+//! 【架构位置】
+//!   层级：基础设施 / 凭证存储层（独立 crate `codex-keyring-store`）。
+//!   上游：`codex-login` 的 auth 存取逻辑（按 store mode 选择 keyring 或文件）。
+//!   下游：第三方 `keyring` crate，最终落到各平台原生凭证 API。
+//!
+//! 【阅读建议】核心是 `KeyringStore` 三方法（load/save/delete）与生产实现
+//! `DefaultKeyringStore`；底部 `pub mod tests` 是供其它 crate 复用的内存 Mock。
+//!
+//! 设计要点：`load`/`delete` 把「条目不存在」(`NoEntry`) 当作正常结果
+//! （`Ok(None)`/`Ok(false)`）而非错误，让上层逻辑更直观。
 use keyring::Entry;
 use keyring::Error as KeyringError;
 use std::error::Error;
@@ -5,6 +19,8 @@ use std::fmt;
 use std::fmt::Debug;
 use tracing::trace;
 
+/// 凭证存储操作的错误类型。当前仅包一层底层 `keyring::Error`，
+/// 设计成枚举是为后续可细分错误（如权限/锁定）预留扩展位。
 #[derive(Debug)]
 pub enum CredentialStoreError {
     Other(KeyringError),
@@ -39,12 +55,20 @@ impl fmt::Display for CredentialStoreError {
 impl Error for CredentialStoreError {}
 
 /// Shared credential store abstraction for keyring-backed implementations.
+/// keyring 类凭证存储的共享抽象，以 `(service, account)` 为键存取一段字符串值。
+/// 要求 `Send + Sync`：可被多线程共享（通常以 `Arc<dyn KeyringStore>` 注入）。
 pub trait KeyringStore: Debug + Send + Sync {
+    /// 读取凭证；条目不存在返回 `Ok(None)`（不视为错误）。
     fn load(&self, service: &str, account: &str) -> Result<Option<String>, CredentialStoreError>;
+    /// 写入/覆盖凭证。
     fn save(&self, service: &str, account: &str, value: &str) -> Result<(), CredentialStoreError>;
+    /// 删除凭证；返回是否真的删除了已存在的条目（不存在返回 `Ok(false)`）。
     fn delete(&self, service: &str, account: &str) -> Result<bool, CredentialStoreError>;
 }
 
+/// 生产实现：直接委托给 `keyring` crate 操作各平台原生凭证存储。
+/// 无状态空结构体；各方法通过 `keyring::Entry::new(service, account)` 定位条目，
+/// 并以 `trace!` 记录起止（不打印 value 本身，只记长度，避免泄密）。
 #[derive(Debug)]
 pub struct DefaultKeyringStore;
 

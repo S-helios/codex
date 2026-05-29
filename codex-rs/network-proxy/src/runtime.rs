@@ -1,3 +1,27 @@
+//! 代理运行时状态：策略的「活视图」+ 按需热重载 + 基线域名/IP 判定。
+//!
+//! 【文件职责】定义 `NetworkProxyState`——把磁盘上的 `config.toml` 编译成的
+//!   可查询状态（白/黑名单 globset、MITM、受管约束、阻断记录），并在每次查询
+//!   前按需重载，使配置改动（含 Codex 自身写入）无需重启即可生效。核心安全逻辑
+//!   是 `host_blocked()`：判定某个 host:port 是否放行。
+//!
+//! 【架构位置】
+//!   层级：网络代理 · 运行时状态层（被 lib.rs 与 state.rs 双重再导出）
+//!   上游：`network_policy.rs::evaluate_host_policy()`、`proxy.rs`（构建/替换状态）
+//!   下游：`policy.rs`（host 解析、本地 IP 分类、globset 编译）、
+//!         `state.rs`（受管约束校验 `validate_policy_against_constraints`）
+//!
+//! 【数据流】
+//!   ConfigReloader 重载 → ConfigState（编译后的策略）→ host_blocked() 查询
+//!     → HostBlockDecision；被拦请求 → record_blocked() → 环形缓冲 + 观察者
+//!
+//! 【并发模型】内部 `Arc<RwLock<ConfigState>>`，读多写少；热重载/改名单时持写锁
+//!   并用「比较前置快照」做乐观重试，避免覆盖并发写入（见 update_domain_list）。
+//!
+//! 【阅读建议】先看 `ConfigState`（状态全貌）与 `NetworkProxyState` 字段，
+//!   再重点读 `host_blocked()`（三步判定顺序：deny→本地网络→白名单）；
+//!   `reload_if_needed()` 是所有公共方法的统一前置；底部 `#[cfg(test)]` 可跳过。
+
 use crate::config::NetworkDomainPermission;
 use crate::config::NetworkMode;
 use crate::config::NetworkProxyConfig;
@@ -40,8 +64,13 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+// 阻断事件环形缓冲的上限：保留最近 200 条供 UI/审计拉取，超出从头丢弃。
+// 纯内存遥测，封顶以防长会话无限增长占内存。
 const MAX_BLOCKED_EVENTS: usize = 200;
+// 本地网络防护时 DNS 解析的超时：2s。超时即按「无法证明目标是公网」拒绝（见
+// host_resolves_to_non_public_ip），宁可误拦也不放过可能指向内网的域名。
 const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+// 违规日志行的固定前缀，便于日志系统按字符串抓取网络策略违规事件。
 const NETWORK_POLICY_VIOLATION_PREFIX: &str = "CODEX_NETWORK_POLICY_VIOLATION";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -57,6 +86,10 @@ pub struct NetworkProxyAuditMetadata {
     pub slug: Option<String>,
 }
 
+/// 基线策略拦截一个 host 的三种原因，安全语义各不相同：
+/// - `Denied`：命中黑名单——硬拒，不可被运行时审批覆写。
+/// - `NotAllowed`：未命中白名单——灰色地带，`evaluate_host_policy` 会问审批。
+/// - `NotAllowedLocal`：目标解析到本地/内网 IP 且未显式放行——防 SSRF/DNS 重绑定。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostBlockReason {
     Denied,
@@ -80,12 +113,16 @@ impl std::fmt::Display for HostBlockReason {
     }
 }
 
+/// `host_blocked()` 的基线判定结果：放行，或带原因拦截。
+/// 注意这只是「基线」结论，`NotAllowed` 之后还可能被运行时审批翻盘。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostBlockDecision {
     Allowed,
     Blocked(HostBlockReason),
 }
 
+/// 一条被拦请求的遥测记录（可 `Serialize` 落日志/上报）。进入环形缓冲供 UI
+/// 与审计拉取，也用于拼出 `CODEX_NETWORK_POLICY_VIOLATION` 违规日志行。
 #[derive(Clone, Debug, Serialize)]
 pub struct BlockedRequest {
     pub host: String,
@@ -156,6 +193,10 @@ fn blocked_request_violation_log_line(entry: &BlockedRequest) -> String {
     }
 }
 
+/// 一份编译好的策略快照：原始配置 + 预编译的白/黑名单 globset + MITM 状态 +
+/// 受管约束 + 阻断遥测。`NetworkProxyState` 持有它的 `RwLock`，热重载即整体替换。
+/// 把域名 pattern 预编译成 `GlobSet` 是为了让每次 `host_blocked()` 走 O(1) 匹配，
+/// 而非每次请求都重新解析字符串规则。
 #[derive(Clone)]
 pub struct ConfigState {
     pub config: NetworkProxyConfig,
@@ -164,22 +205,32 @@ pub struct ConfigState {
     pub mitm: Option<Arc<MitmState>>,
     pub mitm_hooks: MitmHooksByHost,
     pub constraints: NetworkProxyConstraints,
+    // blocked / blocked_total：阻断遥测。环形缓冲只留最近 MAX_BLOCKED_EVENTS 条，
+    // blocked_total 是不封顶的累计计数；重载/替换状态时这两者会被继承而非清零。
     pub blocked: VecDeque<BlockedRequest>,
     pub blocked_total: u64,
 }
 
+/// 配置来源的抽象：把「从哪里、何时重新加载策略」与状态层解耦。
+/// 生产实现读 `config.toml`（带 mtime 检测）；测试用 NoopReloader/StaticReloader。
 #[async_trait]
 pub trait ConfigReloader: Send + Sync {
     /// Human-readable description of where config is loaded from, for logs.
+    /// 配置来源的人类可读描述，仅用于日志（如文件路径）。
     fn source_label(&self) -> String;
 
     /// Return a freshly loaded state if a reload is needed; otherwise, return `None`.
+    /// 检测到变化才返回新状态；无变化返回 `None`。这是「按需重载」的关键：
+    /// 大多数查询命中 `None`，零成本；仅在配置确实改动时承担一次重编译。
     async fn maybe_reload(&self) -> Result<Option<ConfigState>>;
 
     /// Force a reload, regardless of whether a change was detected.
+    /// 强制重载，无视是否检测到变化（用于显式刷新场景）。
     async fn reload_now(&self) -> Result<ConfigState>;
 }
 
+/// 阻断事件观察者：每当有请求被拦，回调通知（如推送到 UI/遥测管道）。
+/// 下面为 `Arc<O>` 和闭包都提供了 blanket impl，方便直接传函数。
 #[async_trait]
 pub trait BlockedRequestObserver: Send + Sync + 'static {
     async fn on_blocked_request(&self, request: BlockedRequest);
@@ -203,6 +254,10 @@ where
     }
 }
 
+/// 策略的「活视图」：本 crate 对外的状态句柄，可 `Clone` 共享同一份内部锁。
+/// 所有查询/改写方法都先 `reload_if_needed()` 再读写 `state`，从而提供
+/// 「无需重启、改 config.toml 即刻生效」的语义。
+/// 字段全部私有：内部状态（含敏感路径）不外泄，外部只能经方法访问。
 pub struct NetworkProxyState {
     state: Arc<RwLock<ConfigState>>,
     reloader: Arc<dyn ConfigReloader>,
@@ -323,9 +378,12 @@ impl NetworkProxyState {
             Ok(mut new_state) => {
                 // Policy changes are operationally sensitive; logging diffs makes changes traceable
                 // without needing to dump full config blobs (which can include unrelated settings).
+                // 策略变更属敏感操作：只记差异（增删了哪些域名）而非整份配置，
+                // 既可追溯又不泄露无关设置。
                 log_policy_changes(&previous_cfg, &new_state.config);
                 {
                     let mut guard = self.state.write().await;
+                    // 把已积累的阻断记录搬到新状态：重载只换策略，不该丢掉遥测历史。
                     new_state.blocked = guard.blocked.clone();
                     *guard = new_state;
                 }
@@ -352,10 +410,18 @@ impl NetworkProxyState {
         Ok(())
     }
 
+    /// 基线域名/IP 判定：本 crate 最核心的安全裁决，决定一个 host:port 是否放行。
+    ///
+    /// @param host - 目标主机（域名或 IP 字面量，可能带 IPv6 scope，如 `fe80::1%lo0`）
+    /// @param port - 目标端口（仅用于本地网络检查时的 DNS 解析，不参与白名单匹配）
+    /// @returns 基线结论；`NotAllowed` 还可能被上层运行时审批翻盘
+    ///
+    /// 副作用：可能触发一次 DNS 解析（本地网络防护），故为 async 且可返回 Err。
     pub async fn host_blocked(&self, host: &str, port: u16) -> Result<HostBlockDecision> {
         self.reload_if_needed().await?;
         let host = match Host::parse(host) {
             Ok(host) => host,
+            // host 无法解析直接当未命中白名单拒绝：宁可错杀畸形输入也不放行。
             Err(_) => return Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowed)),
         };
         let (deny_set, allow_set, allow_local_binding, allowed_domains) = {
@@ -377,6 +443,10 @@ impl NetworkProxyState {
         //  1) explicit deny always wins
         //  2) local/private networking is opt-in (defense-in-depth)
         //  3) allowlist is enforced when configured
+        // 判定顺序至关重要（越靠前优先级越高、越无法被绕过）：
+        //  1) 黑名单永远优先——显式 deny 不可被任何放行覆盖；
+        //  2) 访问本地/内网默认关闭（纵深防御），需显式开关或显式放行；
+        //  3) 最后才看白名单。顺序错了会留出绕过缺口。
         if globset_matches_host_or_unscoped(&deny_set, host_str) {
             return Ok(HostBlockDecision::Blocked(HostBlockReason::Denied));
         }
@@ -391,6 +461,13 @@ impl NetworkProxyState {
             // request. Explicit local/loopback literals are allowed only when explicitly
             // allowlisted; hostnames that resolve to local/private IPs are blocked even if
             // allowlisted.
+            //
+            // 防本地/内网访问不能只靠字符串匹配 `localhost`/`127.0.0.1`：攻击者可用
+            // DNS 重绑定或把域名解析到私网 IP 的公共后缀服务绕过。故此处做
+            // 「DNS 解析 + IP 分类」：
+            //   · 显式本地/回环字面量：只有被「精确」白名单放行才允许（见
+            //     is_explicit_local_allowlisted，通配符如 `*` 不算数）；
+            //   · 解析后落到本地/私网 IP 的域名：即便在白名单里也一律拦截。
             let local_literal = {
                 let host_no_scope = unscoped_ip_literal(host_str).unwrap_or(host_str);
                 if is_loopback_host(&host) {
@@ -422,6 +499,8 @@ impl NetworkProxyState {
             }
         }
 
+        // 第 3 步白名单闸门：白名单为空（默认拒绝一切）或未命中 → NotAllowed。
+        // 这是默认安全姿态：不显式放行就不放行。
         if allowed_domains_empty || !is_allowlisted {
             Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowed))
         } else {
@@ -429,6 +508,8 @@ impl NetworkProxyState {
         }
     }
 
+    /// 记录一条被拦请求：推入环形缓冲、累加计数、写违规日志，并通知观察者。
+    /// 副作用：修改内部 `blocked` 缓冲（超出 MAX_BLOCKED_EVENTS 从头丢弃）。
     pub async fn record_blocked(&self, entry: BlockedRequest) -> Result<()> {
         self.reload_if_needed().await?;
         let blocked_for_observer = entry.clone();
@@ -558,6 +639,12 @@ impl NetworkProxyState {
         Ok(guard.config.network.mode)
     }
 
+    /// 切换网络模式（Limited/Full）。受管约束可禁止放宽（如管理员锁死 Limited
+    /// 时不允许切到 Full），校验失败返回 Err。
+    ///
+    /// 用「读快照→校验→写时复核」的乐观重试，而非全程持锁：先在读锁下取候选，
+    /// 释放锁做校验，再拿写锁；若期间约束被并发改动（快照失效）则 `continue`
+    /// 重来。这样把耗时的校验挪出写锁，缩短临界区。
     pub async fn set_network_mode(&self, mode: NetworkMode) -> Result<()> {
         loop {
             self.reload_if_needed().await?;
@@ -568,11 +655,13 @@ impl NetworkProxyState {
                 (candidate, guard.constraints.clone())
             };
 
+            // 受管约束校验：不能把策略放宽到超过管理员设定的上限。
             validate_policy_against_constraints(&candidate, &constraints)
                 .map_err(NetworkProxyConstraintError::into_anyhow)
                 .context("network.mode constrained by managed config")?;
 
             let mut guard = self.state.write().await;
+            // 写时复核：约束在校验后被并发改动则放弃本次、重新来过。
             if guard.constraints != constraints {
                 drop(guard);
                 continue;
@@ -613,6 +702,13 @@ impl NetworkProxyState {
         self.update_domain_list(host, DomainListKind::Deny).await
     }
 
+    /// `add_allowed_domain` / `add_denied_domain` 的共用实现：把一个 host 加入
+    /// 白名单或黑名单，并保证它不同时停留在对侧名单（加白即从黑名单移除，反之亦然）。
+    ///
+    /// 与 `set_network_mode` 同样的乐观重试：读快照 → 算候选 → 受管约束校验
+    /// → 重编译 globset → 写时复核 config 与 constraints 均未被并发改动才提交。
+    /// 比 mode 多一步 `build_config_state`（重编译名单为 globset），因为加域名要
+    /// 同步更新预编译匹配集，否则查询用的还是旧 globset。
     async fn update_domain_list(&self, host: &str, target: DomainListKind) -> Result<()> {
         let host = Host::parse(host).context("invalid network host")?;
         let normalized_host = host.as_str().to_string();
@@ -621,6 +717,7 @@ impl NetworkProxyState {
 
         loop {
             self.reload_if_needed().await?;
+            // 连同 blocked/blocked_total 一起取快照：重建状态时要原样搬回遥测。
             let (previous_cfg, constraints, blocked, blocked_total) = {
                 let guard = self.state.read().await;
                 (
@@ -640,10 +737,12 @@ impl NetworkProxyState {
             let opposite_contains = opposite_entries
                 .iter()
                 .any(|entry| normalize_host(entry) == normalized_host);
+            // 幂等短路：已在目标名单且不在对侧名单，无需改动直接返回。
             if target_contains && !opposite_contains {
                 return Ok(());
             }
 
+            // upsert：插入到目标名单，同时把它从对侧名单清掉（白/黑互斥）。
             candidate.network.upsert_domain_permission(
                 normalized_host.clone(),
                 target.permission(),
@@ -654,12 +753,14 @@ impl NetworkProxyState {
                 .map_err(NetworkProxyConstraintError::into_anyhow)
                 .with_context(|| format!("{constraint_field} constrained by managed config"))?;
 
+            // 重编译候选配置为带 globset 的完整状态，并搬回阻断遥测。
             let mut new_state = build_config_state(candidate.clone(), constraints.clone())
                 .with_context(|| format!("failed to compile updated network {list_name}"))?;
             new_state.blocked = blocked;
             new_state.blocked_total = blocked_total;
 
             let mut guard = self.state.write().await;
+            // 写时复核：约束或基线配置在校验/编译期间被并发改动则重来。
             if guard.constraints != constraints || guard.config != previous_cfg {
                 drop(guard);
                 continue;
@@ -672,6 +773,9 @@ impl NetworkProxyState {
         }
     }
 
+    /// 所有公共查询/改写方法的统一前置：按需热重载。
+    /// `maybe_reload()` 返回 `None`（无变化）时零成本直接放行；返回新状态时
+    /// 搬回阻断遥测、记差异日志并整体替换。这就是「改 config.toml 即刻生效」的实现点。
     async fn reload_if_needed(&self) -> Result<()> {
         match self.reloader.maybe_reload().await? {
             None => Ok(()),
@@ -699,6 +803,8 @@ impl NetworkProxyState {
     }
 }
 
+/// 把「白名单 vs 黑名单」参数化，让 `update_domain_list` 一套代码同时服务
+/// 加白/加黑：各方法分别给出名单名、约束字段名、权限值、本侧/对侧条目。
 #[derive(Clone, Copy)]
 enum DomainListKind {
     Allow,
@@ -742,10 +848,15 @@ impl DomainListKind {
     }
 }
 
+// unix socket 放行能力仅 macOS 支持；其他平台 allowUnixSockets 一律按拒绝处理。
 pub(crate) fn unix_socket_permissions_supported() -> bool {
     cfg!(target_os = "macos")
 }
 
+/// 判断 host 是否解析到非公网 IP（本地/私网/链路本地等）——本地网络防护的判定核心。
+/// `lookup` 以闭包注入便于测试（生产传 `tokio::net::lookup_host`）。
+/// 返回 `true` 即「应拦截」：注意此处采取「fail-closed（失败即拦）」策略——
+/// DNS 失败/超时都返回 `true`，宁可误拦也不放过可能指向内网的目标。
 async fn host_resolves_to_non_public_ip<F, Fut>(
     host: &str,
     port: u16,
@@ -762,6 +873,8 @@ where
 
     // Block the request if this DNS lookup fails. We resolve the hostname again when we connect,
     // so a failed check here does not prove the destination is public.
+    // 解析失败就拦：连接时还会再解析一次，这里失败并不能证明目标是公网，
+    // 故按「无法证明安全 → 拦截」处理（fail-closed）。
     let addrs = match timeout(lookup_timeout, lookup(host.to_string(), port)).await {
         Ok(Ok(addrs)) => addrs,
         Ok(Err(err)) => {
@@ -836,10 +949,16 @@ fn log_domain_list_changes(list_name: &str, previous: &[String], next: &[String]
     }
 }
 
+// 用 host 原文及其「去 scope 的 IP 字面量」两种形式去匹配 globset。
+// 兼顾带 scope 的 IPv6（如 `fe80::1%lo0`）：规则里通常只写 `fe80::1`，
+// 需剥掉 `%lo0` 再匹配，否则带 scope 的请求会绕过 deny/allow。
 fn globset_matches_host_or_unscoped(set: &GlobSet, host: &str) -> bool {
     set.is_match(host) || unscoped_ip_literal(host).is_some_and(|ip| set.is_match(ip))
 }
 
+/// 判断本地/内网目标是否被「显式精确」放行（而非通配命中）。
+/// 关键安全约束：含 `*` / `?` 的通配 pattern（包括全局 `*`、`*.x`、`**.x`）
+/// 一律不算放行——放开本地网络必须逐条精确列出，避免一个 `*` 把内网全暴露。
 fn is_explicit_local_allowlisted(allowed_domains: &[String], host: &Host) -> bool {
     let normalized_host = host.as_str();
     let unscoped_host = unscoped_ip_literal(normalized_host);

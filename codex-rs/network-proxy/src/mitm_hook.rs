@@ -1,4 +1,30 @@
 #![cfg_attr(not(test), allow(dead_code))]
+//! 【文件职责】定义 MITM「钩子」的配置模型、编译流程与匹配/求值逻辑。钩子
+//! 让代理在解密某些 host 的 HTTPS 内层请求后，按规则匹配并改写请求头——
+//! 典型用途是向特定 API（如 `api.github.com`）注入鉴权令牌，而令牌不必经过
+//! 模型/沙箱明文持有。
+//!
+//! 【架构位置】
+//!   层级：网络代理层（codex-rs/network-proxy）
+//!   上游：`runtime.rs`/装配阶段调用 `compile_mitm_hooks` 把配置编译为运行态；
+//!         `mitm.rs` 在解密内层 HTTPS 请求后调用 `evaluate_mitm_hooks` 求值。
+//!   下游：依赖 `policy::normalize_host` 归一化 host，`globset` 编译通配匹配器。
+//!
+//! 【两套类型：Config vs 运行态】
+//!   - `*Config`（`MitmHookConfig` 等）：可序列化的 TOML 配置原样，字符串形态。
+//!   - 运行态（`MitmHook`/`MitmHookMatcher`/`ResolvedInjectedHeader` 等）：
+//!     `compile_*` 把字符串编译成已解析的 `HeaderName`/`GlobMatcher`、并把
+//!     注入头的密钥从环境变量/文件解析为最终 `HeaderValue`。编译期一次性
+//!     完成校验与密钥读取，匹配期（每请求）只做纯比较，避免热路径开销。
+//!
+//! 【匹配模型】一条钩子需 host 精确命中（不允许通配），再逐项满足 method /
+//!   path 前缀 / query / header 约束（全部为 AND）。路径与值支持 `literal:` /
+//!   `pattern:` 前缀显式区分「字面量」与「glob 通配」，默认按字面量处理以防
+//!   配置里的元字符被意外当作通配。
+//!
+//! 【阅读建议】先看顶部 Config/运行态类型与 `HookEvaluation`，再看
+//!   `compile_mitm_hooks_with_resolvers`（编译主流程）与 `evaluate_mitm_hooks`
+//!   /`hook_matches`（求值主流程）；底部 `parse_*`/`validate_*` 是校验工具。
 
 use crate::config::NetworkProxyConfig;
 use crate::policy::normalize_host;
@@ -19,9 +45,14 @@ use std::fs;
 use std::path::Path;
 use url::form_urlencoded;
 
+// 匹配字符串的两个保留前缀：`pattern:` 显式声明为 glob 通配，`literal:`
+// 显式声明为字面量。无前缀时默认按字面量处理（见 `parse_matcher_pattern`），
+// 这样配置里出现 `[` `*` 等元字符不会被意外当成通配。
 const PATTERN_PREFIX: &str = "pattern:";
 const LITERAL_PREFIX: &str = "literal:";
 
+/// 单条 MITM 钩子的配置（TOML 形态）：作用于哪个 `host`、匹配条件 `matcher`、
+/// 命中后的动作 `actions`。`#[serde(rename = "match")]` 让 TOML 里写作 `match`。
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct MitmHookConfig {
@@ -42,6 +73,8 @@ pub struct MitmHookMatchConfig {
     pub body: Option<MitmHookBodyConfig>,
 }
 
+/// 命中钩子后对请求执行的动作（配置形态）：先删除 `strip_request_headers`
+/// 列出的头，再注入 `inject_request_headers`。两者配合可实现「替换鉴权头」。
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct MitmHookActionsConfig {
@@ -49,6 +82,9 @@ pub struct MitmHookActionsConfig {
     pub inject_request_headers: Vec<InjectedHeaderConfig>,
 }
 
+/// 待注入头的配置：头名 `name`，值来自密钥源——`secret_env_var`（环境变量）
+/// 或 `secret_file`（绝对路径文件），二者必须恰好提供其一；可选 `prefix`
+/// 拼在密钥前（如 `Bearer `）。密钥在编译期解析，避免运行时反复读取。
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct InjectedHeaderConfig {
@@ -62,6 +98,8 @@ pub struct InjectedHeaderConfig {
 #[serde(transparent)]
 pub struct MitmHookBodyConfig(pub serde_json::Value);
 
+/// 编译后的运行态钩子（对应 `MitmHookConfig`）：字符串均已解析为可直接比较
+/// 的匹配器/已解析头/已读取密钥，匹配期零额外解析开销。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MitmHook {
     pub host: String,
@@ -103,6 +141,8 @@ pub struct ResolvedInjectedHeader {
     pub source: SecretSource,
 }
 
+/// 已注入头的密钥来源标记（仅记录来源，值已解析进 `HeaderValue`）。
+/// 用于审计/诊断时说明该头的密钥取自环境变量还是哪个文件。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecretSource {
     EnvVar(String),
@@ -114,23 +154,32 @@ pub struct MitmHookBodyMatcher {
     pub raw: serde_json::Value,
 }
 
+/// 路径匹配器：字面量按「前缀」匹配（`starts_with`），glob 则整段通配。
+/// 路径 glob 编译时启用 `literal_separator`，使 `*` 不跨越 `/` 段边界。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathMatcher {
     Prefix(String),
     Glob(CompiledGlobMatcher),
 }
 
+/// 值匹配器（用于 query 值与 header 值）：字面量按「全等」匹配，glob 则通配。
+/// 与路径不同，值 glob 不启用 `literal_separator`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueMatcher {
     Exact(String),
     Glob(CompiledGlobMatcher),
 }
 
+// `parse_matcher_pattern` 的中间产物：把带前缀的配置串归类为字面量或 glob，
+// 供 `compile_path_matchers`/`compile_value_matchers` 决定编成哪种匹配器。
 enum MatcherPattern<'a> {
     Literal(&'a str),
     Glob(&'a str),
 }
 
+/// 已编译的 glob 匹配器：保留原始 `pattern` 字符串仅为 Debug/相等比较，
+/// 实际匹配走预编译的 `matcher`。`GlobMatcher` 本身不实现 Debug/PartialEq/Eq，
+/// 故下方手动实现——相等性按 `pattern` 判定（同一字符串编出的匹配器等价）。
 #[derive(Clone)]
 pub struct CompiledGlobMatcher {
     pattern: String,
@@ -159,8 +208,16 @@ impl CompiledGlobMatcher {
     }
 }
 
+/// 编译后的钩子索引：按归一化 host 分组，便于求值时 O(log n) 定位该 host
+/// 的钩子列表，再在列表内按配置顺序逐条尝试匹配。
 pub type MitmHooksByHost = BTreeMap<String, Vec<MitmHook>>;
 
+/// 对单个内层请求求值的三态结果，调用方据此决定后续行为：
+///   - `NoHooksForHost`：该 host 没配钩子（不影响放行，按普通策略走）；
+///   - `Matched`：命中某条钩子，返回要执行的动作（删/注入头）；
+///   - `HookedHostNoMatch`：该 host 配了钩子但本次请求没匹配上。
+/// 区分后两者很关键：「配了但没匹配」可能意味着请求落在受控 host 的非预期
+/// 路径上，调用方可据此做更严格处置（见 `mitm.rs`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookEvaluation {
     NoHooksForHost,
@@ -168,12 +225,19 @@ pub enum HookEvaluation {
     HookedHostNoMatch,
 }
 
+/// 校验 MITM 钩子配置的合法性（不产出运行态，仅做语义检查并给出带路径的
+/// 错误）。在编译前调用，确保后续 `compile_*` 不会遇到非法输入。
+///
+/// 关键约束：钩子存在则必须开启 `network.mitm`（否则无法解密何谈改写）；
+/// host 不可为空且不可含通配；methods/path_prefixes 不可为空；`body` 匹配器
+/// 暂为保留特性直接报错。错误均用 `with_context` 标注是第几条钩子的哪个字段。
 pub(crate) fn validate_mitm_hook_config(config: &NetworkProxyConfig) -> Result<()> {
     let hooks = &config.network.mitm_hooks;
     if hooks.is_empty() {
         return Ok(());
     }
 
+    // 前置约束：要改写内层请求必先能解密，故钩子依赖 `network.mitm` 开启。
     if !config.network.mitm {
         return Err(anyhow!("network.mitm_hooks requires network.mitm = true"));
     }
@@ -228,6 +292,8 @@ pub(crate) fn validate_mitm_hook_config(config: &NetworkProxyConfig) -> Result<(
     Ok(())
 }
 
+/// 把配置编译为运行态钩子索引，使用「真实」密钥解析器（进程环境变量 +
+/// 读文件）。测试走 `compile_mitm_hooks_with_resolvers` 注入桩解析器。
 pub(crate) fn compile_mitm_hooks(config: &NetworkProxyConfig) -> Result<MitmHooksByHost> {
     compile_mitm_hooks_with_resolvers(
         config,
@@ -241,6 +307,9 @@ pub(crate) fn compile_mitm_hooks(config: &NetworkProxyConfig) -> Result<MitmHook
     )
 }
 
+/// 对已解密的内层请求求值：先按归一化 host 定位钩子列表，再按配置顺序返回
+/// 「首个」匹配钩子的动作（短路）。host 无钩子 → `NoHooksForHost`；有钩子但
+/// 全不匹配 → `HookedHostNoMatch`。求值是只读纯比较，无副作用。
 pub(crate) fn evaluate_mitm_hooks(
     hooks_by_host: &MitmHooksByHost,
     host: &str,
@@ -251,6 +320,7 @@ pub(crate) fn evaluate_mitm_hooks(
         return HookEvaluation::NoHooksForHost;
     };
 
+    // 按配置顺序取首个命中者：配置中靠前的钩子优先级更高（见 evaluate 测试）。
     for hook in hooks {
         if hook_matches(hook, req) {
             return HookEvaluation::Matched {
@@ -262,6 +332,13 @@ pub(crate) fn evaluate_mitm_hooks(
     HookEvaluation::HookedHostNoMatch
 }
 
+/// 编译主流程（参数化密钥解析器，便于测试注入）：先 `validate` 兜底校验，
+/// 再把每条钩子的字符串字段逐一编译——host 归一化、methods 大写、path/query/
+/// header 匹配器编译、strip/inject 头解析（注入头在此读取密钥并拼成 HeaderValue）
+/// ——按 host 聚合进 `MitmHooksByHost`。任一字段非法即整体失败。
+///
+/// `resolve_env_var` / `read_secret_file` 是密钥解析钩子：生产用真实环境/文件，
+/// 测试传桩函数以避免触碰真实环境。
 fn compile_mitm_hooks_with_resolvers<EnvFn, FileFn>(
     config: &NetworkProxyConfig,
     resolve_env_var: EnvFn,
@@ -338,6 +415,10 @@ where
     Ok(hooks_by_host)
 }
 
+/// 把一个待注入头配置编译为最终的 `ResolvedInjectedHeader`：解析头名、按
+/// 「环境变量 XOR 文件」二选一读出密钥、拼上可选前缀生成 `HeaderValue`。
+/// 缺失环境变量或两个/零个密钥源都视为配置错误。密钥在此一次性读出，运行期
+/// 不再触碰环境/磁盘。
 fn compile_injected_header<EnvFn, FileFn>(
     header: &InjectedHeaderConfig,
     resolve_env_var: &EnvFn,
@@ -348,6 +429,7 @@ where
     FileFn: Fn(&AbsolutePathBuf) -> Result<String>,
 {
     let name = parse_header_name(&header.name)?;
+    // 恰好提供 env 或 file 其一才合法；(Some,Some)/(None,None) 都落入 `_` 报错。
     let (secret, source) = match (
         header.secret_env_var.as_deref(),
         header.secret_file.as_deref(),
@@ -380,7 +462,10 @@ where
     })
 }
 
+/// 判断单条钩子是否匹配该请求：method / path / query / header 四项约束按 AND
+/// 逐项短路求值，任一不满足即返回 false。各项内部语义见对应 `*_matches`。
 fn hook_matches(hook: &MitmHook, req: &Request) -> bool {
+    // method 大小写不敏感：请求方法统一大写后与（编译期已大写的）允许集比较。
     let method = req.method().as_str().to_ascii_uppercase();
     if !hook
         .matcher
@@ -403,7 +488,10 @@ fn hook_matches(hook: &MitmHook, req: &Request) -> bool {
     headers_match(&hook.matcher.headers, req)
 }
 
+/// query 约束匹配：每个约束要求请求 query 中存在同名参数，且其任一实际值命中
+/// 该约束的任一允许值（约束间 AND、值间 OR）。无约束视为通过。
 fn query_matches(query_constraints: &[QueryConstraint], req: &Request) -> bool {
+    // 无约束 = 不限制 query，直接通过。
     if query_constraints.is_empty() {
         return true;
     }
@@ -429,12 +517,16 @@ fn query_matches(query_constraints: &[QueryConstraint], req: &Request) -> bool {
     })
 }
 
+/// header 约束匹配：每个约束要求请求带有该头；若约束未列允许值，则只校验
+/// 「存在」即可；否则要求某个实际值命中任一允许值。约束间 AND。
 fn headers_match(header_constraints: &[HeaderConstraint], req: &Request) -> bool {
     header_constraints.iter().all(|constraint| {
         let actual = req.headers().get_all(&constraint.name);
+        // 该头缺失即不匹配（约束隐含「必须存在」）。
         if actual.iter().next().is_none() {
             return false;
         }
+        // 未指定允许值 = 只要求头存在，不校验具体值。
         if constraint.allowed_values.is_empty() {
             return true;
         }
@@ -505,6 +597,11 @@ fn compile_value_matchers(values: &[String]) -> Result<Vec<ValueMatcher>> {
         .collect()
 }
 
+/// 解析匹配串的前缀语义，决定按字面量还是 glob 处理：
+///   - `literal:xxx` → 字面量 `xxx`（即使含 `*`/`[` 也当普通字符，用于值里
+///     本就含保留前缀的场景）；
+///   - `pattern:xxx` → glob `xxx`（不可为空）；
+///   - 无前缀 → 默认字面量（安全默认，避免配置里的元字符被误当通配）。
 fn parse_matcher_pattern(pattern: &str) -> Result<MatcherPattern<'_>> {
     if let Some(literal) = pattern.strip_prefix(LITERAL_PREFIX) {
         return Ok(MatcherPattern::Literal(literal));
@@ -518,6 +615,9 @@ fn parse_matcher_pattern(pattern: &str) -> Result<MatcherPattern<'_>> {
     Ok(MatcherPattern::Glob(glob_pattern))
 }
 
+/// 编译一个 glob 为 `CompiledGlobMatcher`。`literal_separator=true` 时 `*` 不跨
+/// `/` 段（路径用，防 `/repos/*/codex` 越段匹配）；`false` 时 `*` 可跨任意字符
+/// （query/header 值用）。开启 `backslash_escape` 以支持 `\` 转义元字符。
 fn compile_glob_matcher(pattern: &str, literal_separator: bool) -> Result<CompiledGlobMatcher> {
     let mut builder = GlobBuilder::new(pattern);
     builder
@@ -532,6 +632,9 @@ fn compile_glob_matcher(pattern: &str, literal_separator: bool) -> Result<Compil
         .map_err(|err| anyhow!("invalid glob pattern {pattern:?}: {err}"))
 }
 
+/// 归一化并校验钩子 host：必须非空且不含通配。钩子会注入密钥到匹配请求，
+/// 故刻意要求 host 精确匹配——通配 host 可能把密钥误注入到非预期目标，是
+/// 安全考量而非功能限制。
 fn normalize_hook_host(host: &str) -> Result<String> {
     let normalized = normalize_host(host);
     if normalized.is_empty() {
@@ -628,6 +731,8 @@ fn parse_header_name(name: &str) -> Result<HeaderName> {
         .map_err(|err| anyhow!("invalid header name {name:?}: {err}"))
 }
 
+/// 校验并包装密钥文件路径。强制绝对路径：密钥文件解析时机/工作目录不确定，
+/// 相对路径含义模糊且易被误解析到错误位置，故一律拒绝。
 fn parse_secret_file(path: &str) -> Result<AbsolutePathBuf> {
     if path.trim().is_empty() {
         return Err(anyhow!("secret_file must not be empty"));
