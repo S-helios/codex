@@ -65,13 +65,13 @@ Codex Rust 实现（`codex-rs/`）采用 **Rust 2024 edition**，涵盖终端 UI
 | **Tokio** | 1.x | 异步运行时，驱动网络 IO、定时器、任务调度 |
 | **Ratatui** | 0.29（社区 fork） | 终端 UI 框架，构建全屏 TUI 界面 |
 | **Crossterm** | 0.28（社区 fork） | 跨平台终端控制，处理键盘/鼠标事件与颜色输出 |
-| **SQLite + SQLx** | 0.8.6 | 会话状态（thread、turn 等）持久化存储 |
+| **SQLite + SQLx** | 0.9.0 | 会话状态（thread、turn 等）持久化存储 |
 | **Serde + serde_json** | 1.x | JSON/TOML 序列化，协议消息、配置文件处理 |
 | **Clap** | 4.x | CLI 参数解析，子命令路由 |
 | **reqwest** | 0.12 | HTTP 客户端，访问 OpenAI Responses API |
 | **tokio-tungstenite** | 0.28（社区 fork） | WebSocket，实时通信（Realtime WebRTC 信令等） |
 | **tracing + tracing-subscriber** | 0.1.x / 0.3.x | 结构化日志与链路追踪，支持 OTEL 导出 |
-| **rmcp** | 0.15.0 | Model Context Protocol（MCP）SDK，工具调用协议 |
+| **rmcp** | 1.7.0 | Model Context Protocol（MCP）SDK，工具调用协议 |
 | **insta** | 1.46.3 | 快照测试（snapshot testing），用于 TUI 渲染回归测试 |
 | **Bazel** | `.bazelversion` 指定 | 企业级构建系统，与 Cargo 并行运行，支持 CI 远端缓存 |
 | **axum** | 0.8 | HTTP/WebSocket 服务框架，app-server 与 exec-server |
@@ -381,11 +381,11 @@ Codex 支持四种认证方式，适应不同的使用场景：
 ║                 ║  ║                 ║  ║                        ║
 ║  ModelClient    ║  ║   ToolRouter    ║  ║  RolloutRecorder       ║
 ║  backend-client ║  ║   tools crate   ║  ║  → JSONL 文件          ║
-║  reqwest HTTP   ║  ║                 ║  ║  ~/.codex/rollouts/    ║
+║  reqwest HTTP   ║  ║                 ║  ║  ~/.codex/sessions/    ║
 ║                 ║  ║  ┌──────────┐  ║  ║                        ║
-║  ┌───────────┐  ║  ║  │  shell   │  ║  ║  SQLite (state.db)     ║
+║  ┌───────────┐  ║  ║  │  shell   │  ║  ║  SQLite state_5.sqlite ║
 ║  │ OpenAI    │  ║  ║  │ 执行命令 │  ║  ║  codex-state crate     ║
-║  │ Responses │  ║  ║  ├──────────┤  ║  ║  ~/.codex/state.db     ║
+║  │ Responses │  ║  ║  ├──────────┤  ║  ║  ~/.codex/state_5.sqlite ║
 ║  │ API       │◄─║──║  │apply_    │  ║  ║                        ║
 ║  │ (SSE 流式)│  ║  ║  │patch     │  ║  ║  thread / turn / goal  ║
 ║  └───────────┘  ║  ║  │ 文件修改 │  ║  ║  等结构化数据          ║
@@ -500,7 +500,7 @@ Agent 解析 delta 事件
 ┌────────────────────────────────────────────────────────────┐
 │  阶段 7：源码精读（core crate 深潜）                         │
 │  📄 09_codex_core_reading_guide.md                         │
-│      → 18.6 万行 core 源码完整阅读路线图                    │
+│      → 15.4 万行 core 源码完整阅读路线图                    │
 │      → 各模块速查表、阅读顺序、关键问题清单、避坑指南        │
 └────────────────────────────────┬───────────────────────────┘
                              │
@@ -514,20 +514,40 @@ Agent 解析 delta 事件
 │  📄 14_multi_agent_system.md → 多 Agent 树形协作            │
 │  📄 15_api_protocol_layer.md → SQ/EQ 双队列与协议契约       │
 │  📄 16_agent_optimization.md → 上下文管理与自动压缩         │
+└────────────────────────────┬───────────────────────────────┘
+                             │
+                             ▼
+┌────────────────────────────────────────────────────────────┐
+│  阶段 9：子系统专题（工具 / 执行 / 集成 / 配置 / 认证）       │
+│  📄 17_apply_patch_editing.md → apply-patch 与 V4A 编辑     │
+│  📄 18_exec_and_safety.md → 命令执行与安全（execpolicy/    │
+│      safety/guardian/沙箱）                                  │
+│  📄 19_mcp_integration.md → MCP 双向集成（client + server）│
+│  📄 20_app_server_layer.md → app-server 集成层与 JSON-RPC  │
+│  📄 21_config_system.md → 配置系统（分层/Profile/优先级）  │
+│  📄 22_auth_and_login.md → 认证与登录（OAuth/API Key/      │
+│      Keyring）                                               │
+│  📄 23_network_proxy.md → 网络代理（沙箱网络出口控制）     │
 └────────────────────────────────────────────────────────────┘
 ```
+
+> **📁 目录结构说明**：本系列文档已按主题归入 7 个子目录——`0_导览/`、`1_架构/`、
+> `2_运行时核心/`、`3_执行与安全/`、`4_工具与多Agent/`、`5_前端_集成_协议/`、`6_数据与配置/`。
+> 上面的"学习路径"是**推荐阅读顺序**（跨目录线性推进，按编号 00→23）；完整的**按目录索引**
+> 见根目录 [`../README.md`](../README.md)。
 
 ### 按角色推荐
 
 | 角色 | 推荐重点 |
 |------|---------|
-| **普通用户** | 00 → 安装使用文档 → 配置文档 |
+| **普通用户** | 00 → 安装使用文档 → 配置文档 → 21（配置系统）|
 | **贡献者（新手）** | 00 → 01 → 02 → 04 → 05 |
 | **TUI 开发** | 00 → 01 → 02 → 06 → 10（追问/打断/进度）|
-| **API/协议开发** | 00 → 02 → 04 → 08 → 15（SQ/EQ 与协议契约）|
-| **平台/安全工程师** | 00 → 08（沙箱架构图）→ 13（沙箱机制深潜）→ 各平台实现 |
-| **AI/Agent 集成** | 00 → 08（MCP 集成图）→ 14（多 Agent）→ 07（Goal 模式）|
-| **core 源码贡献者** | 00 → 02 → 09（精读指南）→ 11（生命周期）→ 12（记忆）→ 逐模块深入 |
+| **API/协议开发** | 00 → 02 → 04 → 08 → 15（SQ/EQ 与协议契约）→ 20（app-server/JSON-RPC）|
+| **平台/安全工程师** | 00 → 08（沙箱架构图）→ 13（沙箱机制深潜）→ 18（执行与安全）→ 23（网络代理）→ 各平台实现 |
+| **AI/Agent 集成** | 00 → 08（MCP 集成图）→ 19（MCP 双向集成）→ 14（多 Agent）→ 07（Goal 模式）|
+| **core 源码贡献者** | 00 → 02 → 09（精读指南）→ 11（生命周期）→ 12（记忆）→ 17（apply-patch 编辑）→ 逐模块深入 |
+| **认证/集成工程师** | 00 → 22（认证与登录）→ 20（app-server）→ 21（配置系统）|
 | **长任务/自治 Agent** | 07（Goal 模式）→ 16（上下文管理与压缩）重点阅读 |
 
 ---

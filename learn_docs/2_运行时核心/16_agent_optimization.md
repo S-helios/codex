@@ -140,8 +140,8 @@ token_limit_reached =
 
 - **采样前**（pre-turn）：`run_pre_sampling_compact` 在每个回合开始、调用模型前检查，
   超限就先压缩腾空间，再开始本回合。注入策略用 `DoNotInject`。
-- **回合中**（mid-turn）：`turn.rs:315` 处，当 `token_limit_reached && needs_follow_up`
-  （还要继续追问模型）时，先压缩再继续循环。
+- **回合中**（mid-turn）：`turn.rs:311` 处，当 `token_limit_reached && needs_follow_up`
+  （还要继续追问模型）时，以 `BeforeLastUserMessage` 注入策略先压缩再继续循环。
 
 > 注释里有一句关键判断："只要压缩能把 token 压到远低于上限，就不必担心死循环。"
 > 即压缩必须"显著"腾空间，否则压完又立刻超限会陷入反复压缩。
@@ -190,13 +190,20 @@ run_compact_task               （用户手动 /compact，或 Op::Compact）
         run_compact_task_inner_impl    （真正干活，5 步）
 ```
 
-`run_compact_task_inner_impl` 的五步：
-1. 取出当前历史；
-2. 按 `InitialContextInjection` 决定是否注入初始上下文
-   （`BeforeLastUserMessage` 用于回合中 / `DoNotInject` 用于回合前或手动）；
-3. 用 `compact_prompt`（默认 `SUMMARIZATION_PROMPT`，来自模板文件）让模型把历史总结成摘要；
-4. 若中途 `ContextWindowExceeded`，丢最旧条目重试（见 §9）；
-5. 用 `build_compacted_history_with_limit` 拼出压缩后的新历史，整体 `replace`。
+`run_compact_task_inner_impl` 的步骤（compact.rs `200`~`328`）：
+1. 取当前历史的副本，把"触发压缩的输入"（`compact_prompt`）`record_items` 进去；
+2. 循环向模型发请求要摘要（`drain_to_completed`）；错误三分支——`Interrupted` 直接上抛、
+   `ContextWindowExceeded` 且历史多于 1 条时丢最旧一条并重置重试计数再来（见 §9）、
+   其它错误指数退避重试至上限；
+3. 用 `compact_prompt`（默认 `SUMMARIZATION_PROMPT`，来自模板文件 `templates/compact/prompt.md`）作为
+   摘要指令；拿到摘要后拼成 `SUMMARY_PREFIX + 摘要正文`；
+4. `build_compacted_history`（薄封装 → `build_compacted_history_with_limit`）拼出新历史；若注入策略是
+   `BeforeLastUserMessage`，再用 `insert_initial_context_before_last_real_user_or_summary` 回插初始上下文
+   （`DoNotInject` 则不注入、`reference_context_item` 置 `None`）；
+5. `replace_compacted_history` 整体替换历史并重算 token 用量。
+
+> 注意：初始上下文注入发生在**摘要生成之后**的组装阶段，而非开头；`BeforeLastUserMessage` 用于回合中
+> 压缩、`DoNotInject` 用于回合前自动压缩与手动 `/compact`。
 
 ---
 
@@ -210,10 +217,11 @@ run_compact_task               （用户手动 /compact，或 Op::Compact）
         │
         ▼
 从最新往最旧反向遍历用户消息（保新弃旧）：
-    累计 token，未超 20000 就保留，超了就停
+    累计 token，未超剩余预算就整条保留；
+    遇到第一条会超预算的，把它按剩余预算截断后纳入，再停
         │
         ▼
-最终历史 = [保留的最近用户消息们] + [模型生成的摘要]
+最终历史 = [初始上下文(可选)] + [保留的最近用户消息们] + [摘要消息]
 ```
 
 "反向遍历 + 预算"这套（注释里叫**保新弃旧**）保证：
@@ -222,8 +230,15 @@ run_compact_task               （用户手动 /compact，或 Op::Compact）
 - 更早的细节被压成一段摘要；
 - 总量受控在预算内。
 
-摘要本身作为 `Compaction` / `ContextCompaction` 类型的 `ResponseItem` 进历史，
-带加密内容，token 估算时按编码长度反推（见 §3）。
+**摘要怎么存进历史**（本地压缩路径）：`build_compacted_history_with_limit` 把保留的用户消息
+和摘要都作为**普通 `ResponseItem::Message`（role = `"user"`、`InputText` 纯文本）**写回（compact.rs
+`542`~`564`）。摘要文本是 `SUMMARY_PREFIX + 模型生成的摘要`。注意：**它不是加密的 `Compaction` /
+`ContextCompaction` 条目**——那两种带 `encrypted_content` 的 `ResponseItem` 属于**远程压缩**路径
+（compact_remote_v2.rs 构造），其 token 估算才走 `estimate_reasoning_length` 按编码长度反推（见 §3）。
+本地摘要是明文 user 消息，按普通条目序列化字节估算。
+
+> [说明] 当前实现里**本地路径直接用 user 文本消息**承载摘要，带 `encrypted_content` 的压缩条目
+> （`Compaction` / `ContextCompaction`）仅见于远程压缩路径。
 
 ---
 
@@ -235,9 +250,16 @@ run_compact_task               （用户手动 /compact，或 Op::Compact）
 
 ```rust
 Err(e @ CodexErr::ContextWindowExceeded) => {
-    // 丢最旧一条，重试压缩
-    context_manager.remove_first_item();
-    // ... 循环重试
+    if turn_input_len > 1 {
+        // 从头部删以保前缀缓存、留住近期消息；重置重试计数再来一轮
+        history.remove_first_item();
+        retries = 0;
+        continue;
+    }
+    // 只剩一条还超 → 标记 token 满、报错放弃
+    sess.set_total_tokens_full(turn_context.as_ref()).await;
+    // ...
+    return Err(e);
 }
 ```
 
@@ -313,5 +335,5 @@ Err(e @ CodexErr::ContextWindowExceeded) => {
 
 ---
 
-> **上一篇**：[15 - API 与协议层详解](./15_api_protocol_layer.md)
+> **上一篇**：[15 - API 与协议层详解](../5_前端_集成_协议/15_api_protocol_layer.md)
 > **下一篇**：（本系列暂止于此；后续可基于新 upstream 快照另起 `feature-learn-vNEXT`）

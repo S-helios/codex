@@ -92,16 +92,15 @@ pub struct Codex {
 （[`core/src/session/handlers.rs`](../codex-rs/core/src/session/handlers.rs)）：
 
 ```
-Codex::spawn
+Codex::spawn → spawn_internal
    ├─ 构造 Session（God-object，持有全部会话状态）
    └─ tokio::spawn(submission_loop):
-         loop {
-             let sub = rx_sub.recv().await;   // 串行取出下一个提交
-             match sub.op {
-                 Op::UserInput { .. }  => steer_or_spawn_turn(..),
-                 Op::ExecApproval { .. } => notify_approval(..),
-                 Op::Interrupt          => abort_current(..),
-                 Op::Shutdown           => return,   // 唯一退出循环的分支
+         while let Ok(sub) = rx_sub.recv().await {   // 串行取出下一个提交
+             match sub.op.clone() {
+                 Op::UserInput { .. }    => user_input_or_turn(..),
+                 Op::ExecApproval { .. } => exec_approval(..),   // 内部调 notify_approval
+                 Op::Interrupt           => interrupt(..),
+                 Op::Shutdown            => shutdown(..),  // 返回 true → 退出循环
                  // ... 其余 Op
              }
          }
@@ -111,7 +110,7 @@ Codex::spawn
 的修改天然串行化——不需要给会话状态加额外的锁就线程安全。这是 codex 并发模型的基石，
 也是为什么 `Session` 这个"上帝对象"能持有大量可变状态而不出数据竞争。
 
-> 详见 [11_thread_session_turn_lifecycle.md](./11_thread_session_turn_lifecycle.md) 对
+> 详见 [11_thread_session_turn_lifecycle.md](../2_运行时核心/11_thread_session_turn_lifecycle.md) 对
 > Thread/Session/Turn 三层生命周期的展开。
 
 ---
@@ -240,21 +239,21 @@ SQ/EQ 是两条独立的流，靠 `id` 把它们"缝"在一起：
 agent 执行到危险命令
    │
    ├─ request_command_approval():
-   │     1. 生成 approval_id
-   │     2. 建一个 oneshot 通道，把 tx 端按 approval_id 存进
-   │        turn_state.pending_approvals
-   │     3. send_event(ExecApprovalRequest{ id, ... })  ← 事件出 (EQ)
-   │     4. rx.await                                     ← 在这里挂起等答案
+   │     1. 取有效审批键 effective_approval_id = approval_id.unwrap_or(call_id)
+   │     2. 建一个 oneshot 通道，用 insert_pending_approval 把 tx 端
+   │        按 effective_approval_id 存进当前回合的 turn_state.pending_approvals
+   │     3. send_event(ExecApprovalRequest{ call_id, approval_id, turn_id, .. })  ← 事件出 (EQ)
+   │     4. rx_approve.await                              ← 在这里挂起等答案
    │
    ▼ （时间流逝，用户在界面上点了"允许"）
    │
-前端把决定包成 Op::ExecApproval{ id, decision } 投回 SQ
+前端把决定包成 Op::ExecApproval{ id, turn_id, decision } 投回 SQ
    │
 submission_loop 取出 → exec_approval handler → notify_approval():
         按 approval_id 找到那个 oneshot 的 tx，把 decision 发进去
    │
    ▼
-第 4 步的 rx.await 被唤醒，拿到 decision，agent 继续
+第 4 步的 rx_approve.await 被唤醒，拿到 decision，agent 继续
 ```
 
 **关键安全细节**：如果 oneshot 通道意外断开（前端崩了、连接断了），`rx.await` 会得到
@@ -361,5 +360,5 @@ pub enum EventMsg { /* ... */ }
 
 ---
 
-> **上一篇**：[14 - 多 Agent 系统](./14_multi_agent_system.md)
-> **下一篇**：[16 - Agent 优化：上下文管理与压缩](./16_agent_optimization.md)
+> **上一篇**：[14 - 多 Agent 系统](../4_工具与多Agent/14_multi_agent_system.md)
+> **下一篇**：[16 - Agent 优化：上下文管理与压缩](../2_运行时核心/16_agent_optimization.md)

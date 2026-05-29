@@ -21,7 +21,7 @@
 ## 1. Crate 依赖全景图
 
 ```
-codex-rs 工作区包含 ~70 个 crate，按职责分为以下层次：
+codex-rs 工作区包含 100+ 个 crate（baseline 快照为 114 个工作区成员），按职责分为以下层次：
 
 ┌──────────────────────── 入口/前端层 ─────────────────────────────────┐
 │ codex-cli        │ 主 CLI 入口，路由到各子命令                        │
@@ -76,6 +76,11 @@ codex-rs 工作区包含 ~70 个 crate，按职责分为以下层次：
 │ codex-model-provider │ 多 AI 提供商支持（OpenAI/LM Studio/Ollama）   │
 └──────────────────────────────────────────────────────────────────────┘
 ```
+
+> 注：上图按职责分层，crate 名多为简称示意。实际工作区中密钥链 crate 名为
+> `codex-keyring-store`（目录 `keyring-store/`）；Memory 拆成 `codex-memories-read`
+> 与 `codex-memories-write` 两个 crate（目录 `memories/{read,write}/`）。完整成员
+> 清单见根 `Cargo.toml` 的 `members`（baseline 共 114 个）。
 
 ---
 
@@ -535,12 +540,12 @@ Thread + Goal 全景图：
 | 功能 | 文件路径 |
 |------|---------|
 | Goal 核心逻辑 | `codex-rs/core/src/goals.rs` |
-| Goal 工具定义 | `codex-rs/tools/src/goal_tool.rs` |
+| Goal 工具规格 | `codex-rs/core/src/tools/handlers/goal_spec.rs` |
 | Goal 工具处理器 | `codex-rs/core/src/tools/handlers/goal.rs` |
 | Goal TUI 操作 | `codex-rs/tui/src/app/thread_goal_actions.rs` |
 | Goal 显示格式化 | `codex-rs/tui/src/goal_display.rs` |
 | Goal 数据库模型 | `codex-rs/state/src/model/thread_goal.rs` |
-| Goal 数据库迁移 | `codex-rs/state/migrations/0029_thread_goals.sql` |
+| Goal 数据库迁移（现行库）| `codex-rs/state/goals_migrations/0001_thread_goals.sql` |
 | Goal Feature 定义 | `codex-rs/features/src/lib.rs` (Feature::Goals) |
 | Goal 续期模板 | `codex-rs/core/templates/goals/continuation.md` |
 | Goal 预算限制模板 | `codex-rs/core/templates/goals/budget_limit.md` |

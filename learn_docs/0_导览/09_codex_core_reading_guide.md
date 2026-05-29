@@ -24,7 +24,7 @@
 
 ## 1. 为什么 core 是最难啃的地方
 
-`codex-rs/core` 是整个 Codex 系统的**中枢神经**，约 **18.6 万行 Rust 代码**，涵盖：
+`codex-rs/core` 是整个 Codex 系统的**中枢神经**，约 **15.4 万行 Rust 代码**，涵盖：
 
 - AI Turn 执行的完整生命周期
 - 工具路由、审批、沙箱执行
@@ -177,30 +177,30 @@ codex-rs/core/src/
 
 | 模块 | 主要职责 | 行数（约） | 优先级 |
 |------|---------|-----------|--------|
-| `lib.rs` | 模块导出索引，公开 API 声明 | 150 | ★★★ 必读 |
-| `thread_manager.rs` | Thread 全局注册、路由 Op/Event | 1484 | ★★★ 必读 |
+| `lib.rs` | 模块导出索引，公开 API 声明 | 196 | ★★★ 必读 |
+| `thread_manager.rs` | Thread 全局注册、路由 Op/Event | 1606 | ★★★ 必读 |
 | `codex_thread.rs` | 单 Thread 生命周期、双向通道 | ~600 | ★★★ 必读 |
-| `session/mod.rs` | Session struct、公共方法集合 | 3331 | ★★★ 必读 |
-| `session/session.rs` | Session 详细字段、构造逻辑 | ~800 | ★★★ 必读 |
-| `session/turn.rs` | `run_turn()` 核心 AI 循环 | 2265 | ★★★ 必读 |
-| `session/handlers.rs` | Op 事件路由（用户消息/审批） | ~600 | ★★ 重要 |
-| `tools/router.rs` | ToolRouter 工具分发 | ~800 | ★★★ 必读 |
-| `tools/registry.rs` | ToolRegistry 工具注册表 | ~700 | ★★ 重要 |
+| `session/mod.rs` | Session struct、公共方法集合 | 3341 | ★★★ 必读 |
+| `session/session.rs` | Session 详细字段、构造逻辑 | ~1286 | ★★★ 必读 |
+| `session/turn.rs` | `run_turn()` 核心 AI 循环 | 2213 | ★★★ 必读 |
+| `session/handlers.rs` | Op 事件路由（用户消息/审批） | ~963 | ★★ 重要 |
+| `tools/router.rs` | ToolRouter 工具分发 | ~266 | ★★★ 必读 |
+| `tools/registry.rs` | ToolRegistry 工具注册表 | ~780 | ★★ 重要 |
 | `tools/orchestrator.rs` | 审批+沙箱+执行编排 | ~500 | ★★ 重要 |
-| `tools/handlers/shell.rs` | shell 工具处理器 | ~400 | ★★ 重要 |
-| `tools/handlers/goal.rs` | goal 工具处理器 | ~300 | ★ 按需 |
-| `exec.rs` | 低层命令执行 | 1491 | ★★ 重要 |
-| `exec_policy.rs` | 沙箱权限规则 | ~800 | ★★ 重要 |
-| `unified_exec/process_manager.rs` | 交互式进程管理 | 1276 | ★ 按需 |
-| `client.rs` | Responses API 通信 | 2151 | ★★ 重要 |
+| `tools/handlers/shell.rs` | shell 工具处理器 | ~244 | ★★ 重要 |
+| `tools/handlers/goal.rs` | goal 工具处理器 | ~158 | ★ 按需 |
+| `exec.rs` | 低层命令执行 | 1597 | ★★ 重要 |
+| `exec_policy.rs` | 沙箱权限规则 | ~1047 | ★★ 重要 |
+| `unified_exec/process_manager.rs` | 交互式进程管理 | 1293 | ★ 按需 |
+| `client.rs` | Responses API 通信 | 2292 | ★★ 重要 |
 | `stream_events_utils.rs` | 流式事件处理 | ~600 | ★★ 重要 |
-| `goals.rs` | Goal 续期/预算/状态 | 1639 | ★★ 重要 |
-| `guardian/review_session.rs` | Guardian AI 审核 | 1567 | ★ 按需 |
-| `config/mod.rs` | Config struct | 3406 | ★★ 重要 |
+| `goals.rs` | Goal 续期/预算/状态 | 1850 | ★★ 重要 |
+| `guardian/review_session.rs` | Guardian AI 审核 | 1661 | ★ 按需 |
+| `config/mod.rs` | Config struct | 3810 | ★★ 重要 |
 | `context_manager/history.rs` | 对话历史管理 | ~800 | ★ 按需 |
-| `compact.rs` | Context Compaction | ~700 | ★ 按需 |
-| `mcp_tool_call.rs` | MCP 工具调用 | 2080 | ★ 按需 |
-| `agent/control.rs` | 子 Agent 控制 | 1233 | ★ 按需 |
+| `compact.rs` | Context Compaction | ~620 | ★ 按需 |
+| `mcp_tool_call.rs` | MCP 工具调用 | 2138 | ★ 按需 |
+| `agent/control.rs` | 子 Agent 控制 | 1318 | ★ 按需 |
 
 ---
 
@@ -244,7 +244,7 @@ goals.rs  │  guardian/  │  mcp_tool_call.rs  │  agent/  │  config/
 
 ## 5. 第一阶段：入口与骨架（2 个文件）
 
-### 5.1 `src/lib.rs`（150 行，必读）
+### 5.1 `src/lib.rs`（196 行，必读）
 
 **目的**：了解 core 对外暴露哪些东西。
 
@@ -268,7 +268,7 @@ goals.rs  │  guardian/  │  mcp_tool_call.rs  │  agent/  │  config/
 
 ## 6. 第二阶段：线程管理（2 个文件）
 
-### 6.1 `src/thread_manager.rs`（1484 行）
+### 6.1 `src/thread_manager.rs`（1606 行）
 
 **目的**：理解"Thread"是什么，多 Thread 如何管理。
 
@@ -328,7 +328,7 @@ CodexThread vs Session：
 
 这是整个 core 最复杂的部分，Session 是**执行 AI Turn 的核心 struct**。
 
-### 7.1 `src/session/session.rs`（~800 行）
+### 7.1 `src/session/session.rs`（~1286 行）
 
 **目的**：了解 Session 有哪些字段，初始化流程。
 
@@ -363,7 +363,7 @@ pub(crate) struct SessionConfiguration {
 
 ---
 
-### 7.2 `src/session/mod.rs`（3331 行，核心！）
+### 7.2 `src/session/mod.rs`（3341 行，核心！）
 
 **目的**：这是 Session 最主要的实现文件，包含所有关键方法。
 
@@ -400,7 +400,7 @@ Block 4：状态更新方法（1500+ 行）
 
 ---
 
-### 7.3 `src/session/turn.rs`（2265 行，最核心！）
+### 7.3 `src/session/turn.rs`（2213 行，最核心！）
 
 **目的**：理解一个完整的 AI Turn 是如何执行的。
 
@@ -450,7 +450,7 @@ Session::run_turn() 主函数：
 
 ---
 
-### 7.4 `src/session/handlers.rs`（~600 行）
+### 7.4 `src/session/handlers.rs`（~963 行）
 
 **目的**：理解 Op 消息如何被处理（用户消息/审批/中断）。
 
@@ -618,7 +618,7 @@ pub enum ToolSpec {
 
 ## 9. 第五阶段：命令执行与沙箱（3 个模块）
 
-### 9.1 `src/exec.rs`（1491 行）
+### 9.1 `src/exec.rs`（1597 行）
 
 **目的**：理解实际的命令执行是怎么发生的。
 
@@ -648,7 +648,7 @@ struct ExecRequest {
 
 ---
 
-### 9.2 `src/exec_policy.rs`（~800 行）
+### 9.2 `src/exec_policy.rs`（~1047 行）
 
 **目的**：理解哪些命令被允许，哪些被拒绝，权限路径如何配置。
 
@@ -697,7 +697,7 @@ unified_exec/process_manager.rs：
 
 ## 10. 第六阶段：AI 通信层（2 个文件）
 
-### 10.1 `src/client.rs`（2151 行）
+### 10.1 `src/client.rs`（2292 行）
 
 **目的**：理解 Codex 如何与 Responses API 通信。
 
@@ -786,7 +786,7 @@ Guardian 核心逻辑：
 
 ---
 
-### 11.3 `src/config/mod.rs`（3406 行）
+### 11.3 `src/config/mod.rs`（3810 行）
 
 **不需要全读，只需理解 Config 的核心字段**：
 
@@ -806,7 +806,7 @@ pub struct Config {
 
 ---
 
-### 11.4 `src/mcp_tool_call.rs`（2080 行）
+### 11.4 `src/mcp_tool_call.rs`（2138 行）
 
 适合场景：理解 MCP 工具调用全流程
 
@@ -822,7 +822,7 @@ pub struct Config {
 
 ---
 
-### 11.5 `src/agent/control.rs`（1233 行）
+### 11.5 `src/agent/control.rs`（1318 行）
 
 适合场景：理解多 Agent 协作机制
 
@@ -961,7 +961,7 @@ Session 的方法实现分布在：
 ---
 
 ### 坑 2：`*_tests.rs` 文件巨大，不要迷失
-`session/tests.rs` 有 **8732 行**，`config/config_tests.rs` 有 **9800 行**。
+`session/tests.rs` 有 **10496 行**，`config/config_tests.rs` 有 **10658 行**。
 **不要从这里入手**，测试文件作为验证手段，在理解实现后再回来参考。
 
 ---
@@ -995,17 +995,24 @@ Session 的方法实现分布在：
 
 ---
 
-## 延伸阅读：专题深潜文档（10 ~ 16）
+## 延伸阅读：专题深潜文档（10 ~ 23）
 
 读完本指南、对 core 的整体地图心中有数之后，下列专题文档按子系统纵向钻取，
 每篇都配套了 `feature-learn` 分支上的中文源码注释，建议对照源码一起读：
 
 | 文档 | 主题 | 对应 core 子系统 / 关键文件 |
 |------|------|------------------------------|
-| [10 - 追问 / 打断 / 进度](./10_followup_interrupt_progress.md) | 运行中追问、打断、进度汇报 | `session/turn.rs`、`codex_thread.rs` |
-| [11 - 三层生命周期](./11_thread_session_turn_lifecycle.md) | Thread / Session / Turn 的创建与流转 | `thread_manager.rs`、`session/`、`state/turn.rs` |
-| [12 - 长期记忆系统](./12_memory_system.md) | 记忆注入、维护与用量统计 | `memory_usage.rs`、SQLite `0016_memory_usage` |
-| [13 - 沙箱机制深度解析](./13_sandbox_mechanism.md) | 三平台沙箱实现 | `sandboxing/`、`linux-sandbox`、Seatbelt |
-| [14 - 多 Agent 系统](./14_multi_agent_system.md) | 子 Agent 树形协作与权限继承 | `agent/`、`tools/handlers/multi_agents_v2/` |
-| [15 - API 与协议层](./15_api_protocol_layer.md) | SQ/EQ 双队列、跨语言协议契约 | `protocol/`、`core/src/client.rs` |
-| [16 - Agent 优化](./16_agent_optimization.md) | 上下文管理与自动压缩 | `context_manager/history.rs`、`compact*.rs` |
+| [10 - 追问 / 打断 / 进度](../2_运行时核心/10_followup_interrupt_progress.md) | 运行中追问、打断、进度汇报 | `session/turn.rs`、`codex_thread.rs` |
+| [11 - 三层生命周期](../2_运行时核心/11_thread_session_turn_lifecycle.md) | Thread / Session / Turn 的创建与流转 | `thread_manager.rs`、`session/`、`state/turn.rs` |
+| [12 - 长期记忆系统](../6_数据与配置/12_memory_system.md) | 记忆注入、维护与用量统计 | `memory_usage.rs`、SQLite `0016_memory_usage` |
+| [13 - 沙箱机制深度解析](../3_执行与安全/13_sandbox_mechanism.md) | 三平台沙箱实现 | `sandboxing/`、`linux-sandbox`、Seatbelt |
+| [14 - 多 Agent 系统](../4_工具与多Agent/14_multi_agent_system.md) | 子 Agent 树形协作与权限继承 | `agent/`、`tools/handlers/multi_agents_v2/` |
+| [15 - API 与协议层](../5_前端_集成_协议/15_api_protocol_layer.md) | SQ/EQ 双队列、跨语言协议契约 | `protocol/`、`core/src/client.rs` |
+| [16 - Agent 优化](../2_运行时核心/16_agent_optimization.md) | 上下文管理与自动压缩 | `context_manager/history.rs`、`compact*.rs` |
+| [17 - apply-patch 与 V4A 编辑](../3_执行与安全/17_apply_patch_editing.md) | 补丁解析、模糊定位、落盘与跨回合追踪 | `apply-patch/src/lib.rs`、`tools/handlers/apply_patch.rs`、`tools/runtimes/apply_patch.rs` |
+| [18 - 命令执行与安全](../3_执行与安全/18_exec_and_safety.md) | execpolicy / safety / 审批 / 沙箱 / Guardian 自动审查 | `exec.rs`、`exec_policy.rs`、`safety.rs`、`guardian/` |
+| [19 - MCP 双向集成](../4_工具与多Agent/19_mcp_integration.md) | 既当 MCP 客户端又当 MCP 服务器，及多层审批链 | `mcp.rs`、`mcp_tool_call.rs`、`codex-mcp`、`mcp-server` |
+| [20 - app-server 集成层](../5_前端_集成_协议/20_app_server_layer.md) | IDE / 远控经 JSON-RPC 落到内核 `Op` | `app-server/`、`app-server-protocol/` |
+| [21 - 配置系统](../6_数据与配置/21_config_system.md) | 分层配置、Profile、优先级与不可覆盖约束 | `core/src/config/`、`codex-config` |
+| [22 - 认证与登录](../5_前端_集成_协议/22_auth_and_login.md) | `CodexAuth` / `AuthManager`：四种认证模式 | `codex-login`、`keyring-store` |
+| [23 - 网络代理](../3_执行与安全/23_network_proxy.md) | 本地 HTTP/SOCKS5 代理 + 域名白名单出网管控 | `network_proxy_loader.rs`、`network-proxy` |

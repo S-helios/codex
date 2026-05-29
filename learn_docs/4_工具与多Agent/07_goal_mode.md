@@ -137,7 +137,7 @@ impl ThreadGoalStatus {
 > ⚠️ **已迁移到独立库**：`thread_goals` 最初建于 `state.db`（migration 0029，
 > 4 状态 + 外键），0033 重建扩到 6 状态，0034 从 state 库 `DROP`，现独占
 > **`goals_1.sqlite`**（`goals_migrations/0001`）。完整四库架构见
-> [`03_database_design.md`](./03_database_design.md) 的目标库一节。
+> [`03_database_design.md`](../6_数据与配置/03_database_design.md) 的目标库一节。
 
 ```sql
 -- goals_migrations/0001_thread_goals.sql（当前 live 版本，位于 goals_1.sqlite）
@@ -481,8 +481,8 @@ Do not call update_goal unless the goal is actually complete.
 ### Token 显示格式
 
 ```rust
-// goal_display.rs
-pub(crate) fn format_tokens_compact(tokens: i64) -> String {
+// status/helpers.rs（goal_display.rs 经 crate::status 调用）
+pub(crate) fn format_tokens_compact(value: i64) -> String {
     // 12500  → "12.5K"
     // 50000  → "50K"
     // 1200000 → "1.2M"

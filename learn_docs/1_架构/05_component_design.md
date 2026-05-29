@@ -30,19 +30,24 @@
 
 ```
 ThreadManager
-└── state: Arc<ThreadManagerState>          ← 所有可共享状态
-     ├── threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>
-     ├── thread_created_tx: broadcast::Sender<ThreadId>
-     ├── auth_manager: Arc<AuthManager>
-     ├── models_manager: SharedModelsManager
-     ├── environment_manager: Arc<EnvironmentManager>
-     ├── skills_manager: Arc<SkillsManager>
-     ├── plugins_manager: Arc<PluginsManager>
-     ├── mcp_manager: Arc<McpManager>
-     ├── skills_watcher: Arc<SkillsWatcher>
-     ├── session_source: SessionSource
-     ├── analytics_events_client: Option<AnalyticsEventsClient>
-     └── ops_log: Option<SharedCapturedOps>  ← 测试模式专用
+├── state: Arc<ThreadManagerState>          ← 所有可共享状态
+│    ├── threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>
+│    ├── thread_created_tx: broadcast::Sender<ThreadId>
+│    ├── auth_manager: Arc<AuthManager>
+│    ├── models_manager: SharedModelsManager
+│    ├── environment_manager: Arc<EnvironmentManager>
+│    ├── skills_manager: Arc<SkillsManager>
+│    ├── plugins_manager: Arc<PluginsManager>
+│    ├── mcp_manager: Arc<McpManager>
+│    ├── extensions: Arc<ExtensionRegistry<Config>>      ← 扩展注册表
+│    ├── thread_store: Arc<dyn ThreadStore>              ← 可插拔持久化后端
+│    ├── attestation_provider: Option<Arc<dyn AttestationProvider>>
+│    ├── session_source: SessionSource
+│    ├── installation_id: String
+│    ├── analytics_events_client: Option<AnalyticsEventsClient>
+│    ├── state_db: Option<StateDbHandle>                 ← SQLite 状态库句柄
+│    └── ops_log: Option<SharedCapturedOps>              ← 测试模式专用
+└── _test_codex_home_guard: Option<TempCodexHomeGuard>   ← 测试临时目录守卫
 ```
 
 ### 关键字段说明
@@ -57,7 +62,8 @@ ThreadManager
 | `skills_manager` | `Arc<SkillsManager>` | 技能（Skill）加载与管理，含 bundled skills |
 | `plugins_manager` | `Arc<PluginsManager>` | MCP 插件生命周期管理 |
 | `mcp_manager` | `Arc<McpManager>` | MCP 服务器连接管理 |
-| `skills_watcher` | `Arc<SkillsWatcher>` | 监听文件系统上 skill 文件的变更 |
+| `thread_store` | `Arc<dyn ThreadStore>` | 线程持久化后端的 trait 对象，可替换实现 |
+| `state_db` | `Option<StateDbHandle>` | 可选的 SQLite 状态库句柄（缺省时退化为纯 JSONL） |
 | `ops_log` | `Option<SharedCapturedOps>` | 测试模式下捕获所有提交的 Op，便于断言 |
 
 ### 关键方法
@@ -124,7 +130,7 @@ ForkSnapshot
 1. **状态内聚**：`ThreadManagerState` 用独立的 `Arc` 包装，可被 `AgentControl` 弱引用降级（`Arc::downgrade`），避免循环引用。
 2. **广播通知**：`thread_created_tx` 采用 `broadcast` 语义，允许多个订阅方（TUI、app-server）同时收到新线程事件。
 3. **测试模式隔离**：`ops_log` 字段仅在测试模式激活，通过 `set_thread_manager_test_mode_for_tests()` 开关，不影响生产代码路径。
-4. **技能热加载**：`skills_watcher` 运行于独立任务，监听文件变更后自动通知 session 重新加载技能，无需重启线程。
+4. **持久化可插拔**：`thread_store: Arc<dyn ThreadStore>` 用 trait 对象抽象线程的存取后端，`state_db` 又是 `Option`——既能挂上 SQLite 做结构化检索，也能在缺省时退化为纯 JSONL rollout，二者解耦。
 
 ---
 
@@ -140,11 +146,11 @@ ForkSnapshot
 
 ```
 pub struct CodexThread {
-    codex: Codex,                                    // 内部双通道包装
-    session_source: SessionSource,                   // 会话来源（cli/tui/mcp/exec/...）
+    pub(crate) codex: Codex,                         // 内部双通道包装
+    pub(crate) session_source: SessionSource,        // 会话来源（cli/tui/mcp/exec/...）
+    session_configured: SessionConfiguredEvent,      // 建会话时的配置快照事件
     rollout_path: Option<PathBuf>,                   // JSONL 持久化文件路径
     out_of_band_elicitation_count: Mutex<u64>,       // OOB elicitation 并发计数
-    _watch_registration: WatchRegistration,          // 文件监听注册（RAII 释放）
 }
 ```
 
@@ -154,9 +160,9 @@ pub struct CodexThread {
 |------|------|------|
 | `codex` | `Codex` | 实际的双通道通信层，持有 Session Arc |
 | `session_source` | `SessionSource` | 标识创建来源，影响日志和权限策略 |
+| `session_configured` | `SessionConfiguredEvent` | 建会话时生成的配置快照事件，供后续查询/上报 |
 | `rollout_path` | `Option<PathBuf>` | 指向 `rollout-*.jsonl` 文件，恢复时加载 |
 | `out_of_band_elicitation_count` | `Mutex<u64>` | 记录当前挂起的 OOB elicitation 请求数量 |
-| `_watch_registration` | `WatchRegistration` | Drop 时自动注销文件监听，防止内存泄漏 |
 
 ### 关键方法
 
@@ -267,7 +273,7 @@ pub struct Codex {
   │  loop {                                                │
   │    sub = rx_sub.recv().await          ← 接收 Submission│
   │    match sub.op {                                      │
-  │      Op::UserTurn { .. } → run_turn() → emit Events ──┤
+  │      Op::UserInput { .. } → run_turn() → emit Events ─┤
   │      Op::Interrupt       → cancel current turn        │
   │      Op::Shutdown        → break                      │
   │      ...                                              │
@@ -306,6 +312,7 @@ pub struct Codex {
 ```
 pub(crate) struct Session {
     conversation_id: ThreadId,                          // 全局唯一的对话 ID
+    installation_id: String,                            // 客户端安装 ID（遥测）
     tx_event: Sender<Event>,                            // 向 Codex 发送事件
     agent_status: watch::Sender<AgentStatus>,           // 广播 agent 状态变更
     out_of_band_elicitation_paused: watch::Sender<bool>,// OOB 暂停信号
@@ -315,9 +322,7 @@ pub(crate) struct Session {
     pending_mcp_server_refresh_config: Mutex<Option<McpServerRefreshConfig>>,
     conversation: Arc<RealtimeConversationManager>,     // 实时对话管理
     active_turn: Mutex<Option<ActiveTurn>>,             // 当前活跃 turn 状态
-    mailbox: Mailbox,                                   // 子 agent 消息邮箱
-    mailbox_rx: Mutex<MailboxReceiver>,
-    idle_pending_input: Mutex<Vec<ResponseInputItem>>,  // 无活跃 turn 时的待处理输入
+    input_queue: InputQueue,                            // 空闲/打断期的输入排队器
     goal_runtime: GoalRuntimeState,                     // Goal 运行时状态
     guardian_review_session: GuardianReviewSessionManager, // Guardian Review 管理器
     services: SessionServices,                          // 外部服务集合
@@ -328,17 +333,20 @@ pub(crate) struct Session {
 ### SessionConfiguration（会话配置）
 
 ```
-SessionConfiguration
+SessionConfiguration（节选；完整字段见 session/session.rs）
 ├── provider: ModelProviderInfo          // "openai" / "openrouter" / "ollama" 等
 ├── collaboration_mode: CollaborationMode // Auto / Code / Ask 等模式
-├── model_reasoning_summary: Option<...> // 推理摘要配置
-├── service_tier: Option<ServiceTier>    // API 服务等级
+├── model_reasoning_summary: Option<ReasoningSummaryConfig> // 推理摘要配置
+├── service_tier: Option<String>         // API 服务等级（如 "flex" / "priority"）
 ├── developer_instructions: Option<String>
 ├── user_instructions: Option<String>
 ├── base_instructions: String            // 系统基础 prompt
 ├── approval_policy: Constrained<AskForApproval>
-├── permission_profile: Constrained<PermissionProfile>
+├── approvals_reviewer: ApprovalsReviewer // 审批走人工还是 Guardian AI
+├── permission_profile_state: PermissionProfileState // 权限档（含活跃档 + 工作区根）
+├── windows_sandbox_level: WindowsSandboxLevel
 ├── cwd: AbsolutePathBuf                 // 工作目录（沙箱基准）
+├── workspace_roots: Vec<AbsolutePathBuf>// 线程级可写工作区根
 ├── codex_home: AbsolutePathBuf          // Codex 状态目录
 ├── environments: Vec<TurnEnvironmentSelection>
 └── dynamic_tools: Vec<DynamicToolSpec>  // 动态注册的工具
@@ -359,7 +367,7 @@ Session 的驱动通过 `Codex::spawn_internal()` 中的 Tokio task 实现：
 │                        │                                         │
 │           ┌────────────┼─────────────────┐                       │
 │           ▼            ▼                 ▼                       │
-│    Op::UserTurn   Op::Interrupt    Op::Shutdown                  │
+│    Op::UserInput  Op::Interrupt    Op::Shutdown                  │
 │         │         取消当前 turn         break                    │
 │         │                                                        │
 │         ▼                                                        │
@@ -422,19 +430,23 @@ Session 的驱动通过 `Codex::spawn_internal()` 中的 Tokio task 实现：
 
 ```
 ModelClient
-└── state: Arc<ModelClientState>
-     ├── conversation_id: ThreadId           // 当前 thread 的唯一 ID
-     ├── window_generation: AtomicU64        // 窗口代数（用于 WebSocket 粘性路由）
-     ├── installation_id: String             // 客户端安装 ID（遥测）
-     ├── provider: SharedModelProvider       // 实际的 API 提供方
-     ├── auth_env_telemetry: AuthEnvTelemetry
-     ├── session_source: SessionSource
-     ├── model_verbosity: Option<VerbosityConfig>
-     ├── enable_request_compression: bool
-     ├── include_timing_metrics: bool
-     ├── beta_features_header: Option<String>
-     ├── disable_websockets: AtomicBool      // WebSocket 降级标志
-     └── cached_websocket_session: StdMutex<WebsocketSession>  // WS 复用缓存
+├── state: Arc<ModelClientState>
+│    ├── session_id: SessionId              // 进程内会话 ID
+│    ├── thread_id: ThreadId                // 当前 thread 的唯一 ID
+│    ├── window_generation: AtomicU64       // 窗口代数（WebSocket 粘性路由）
+│    ├── installation_id: String            // 客户端安装 ID（遥测）
+│    ├── provider: SharedModelProvider      // 实际的 API 提供方
+│    ├── auth_env_telemetry: AuthEnvTelemetry
+│    ├── session_source: SessionSource
+│    ├── model_verbosity: Option<VerbosityConfig>
+│    ├── enable_request_compression: bool
+│    ├── include_timing_metrics: bool
+│    ├── beta_features_header: Option<String>
+│    ├── include_attestation: bool          // 是否附带客户端证明
+│    ├── attestation_provider: Option<Arc<dyn AttestationProvider>>
+│    ├── disable_websockets: AtomicBool      // WebSocket 降级标志
+│    └── cached_websocket_session: StdMutex<WebsocketSession>  // WS 复用缓存
+└── prompt_cache_key_override: Option<String>  // 自定义 prompt cache key
 
 ModelClientSession（每 turn 新建）
 ├── client: ModelClient                      // 共享的 session-scoped 配置
@@ -442,6 +454,7 @@ ModelClientSession（每 turn 新建）
 │    ├── connection: Option<ApiWebSocketConnection>
 │    ├── last_request: Option<ResponsesApiRequest>  // 用于增量请求对比
 │    ├── last_response_rx: Option<oneshot::Receiver<LastResponse>>
+│    ├── last_response_from_untraced_warmup: bool
 │    └── connection_reused: StdMutex<bool>
 └── turn_state: Arc<OnceLock<String>>        // x-codex-turn-state 粘性路由令牌
 ```
@@ -535,18 +548,21 @@ Turn 2: 复用 WS 连接
 
 ### 职责
 
-`ToolRouter` 是工具调用的**路由层**，负责解析 AI 返回的 `ResponseItem`（FunctionCall、LocalShellCall、CustomToolCall 等），将其转换为统一的 `ToolCall` 结构，并通过 `ToolRegistry` 分发到对应的处理器。
+`ToolRouter` 是工具调用的**路由层**，负责解析 AI 返回的 `ResponseItem`（FunctionCall、CustomToolCall、ToolSearchCall 等），将其转换为统一的 `ToolCall` 结构，并通过 `ToolRegistry` 分发到对应的处理器。
 
 ### 结构体定义
 
 ```
 pub struct ToolRouter {
-    registry: ToolRegistry,                    // 工具 handler 的注册表
-    specs: Vec<ConfiguredToolSpec>,            // 所有已注册工具的配置规格
-    model_visible_specs: Vec<ToolSpec>,        // 实际发送给模型的工具列表（已过滤）
-    parallel_mcp_server_names: HashSet<String>,// 支持并行调用的 MCP 服务器名
+    registry: ToolRegistry,             // 「工具名 → 处理器」的实际分派表
+    model_visible_specs: Vec<ToolSpec>, // 实际发送给模型的工具定义列表（已过滤）
 }
 ```
+
+> 构造期的输入（MCP 工具、可发现工具、动态工具、扩展执行器等）通过
+> `ToolRouterParams` 传入，注册进 `registry` 并筛出 `model_visible_specs`；
+> 是否支持并行、是否等待运行时取消等元数据都登记在 `registry` 内，
+> 而非 router 结构体上的独立字段。
 
 ### 工具调用分发流程
 
@@ -554,42 +570,50 @@ pub struct ToolRouter {
 ResponseItem (AI 返回)
        │
        ▼
-ToolRouter::build_tool_call()
+ToolRouter::build_tool_call(item) → Result<Option<ToolCall>>
        │
-       ├── ResponseItem::FunctionCall
-       │      │
-       │      ├─ 查找 MCP tool info？
-       │      │   ├── 是: ToolPayload::Mcp { server, tool, args }
-       │      │   └── 否: ToolPayload::Function { arguments }
-       │      └── → ToolCall { tool_name, call_id, payload }
+       ├── ResponseItem::FunctionCall { name, namespace, arguments, call_id }
+       │      └─ ToolName::new(namespace, name)
+       │         （MCP 工具：namespace 即 server 名，仍走 Function 载荷）
+       │         → ToolCall { tool_name, call_id,
+       │                      ToolPayload::Function { arguments } }
        │
-       ├── ResponseItem::LocalShellCall
-       │      └── → ToolCall { tool_name: "local_shell", payload: LocalShell }
+       ├── ResponseItem::ToolSearchCall（execution == "client"）
+       │      └─ 解析 arguments → SearchToolCallParams
+       │         → ToolCall { ToolName::plain("tool_search"), call_id,
+       │                      ToolPayload::ToolSearch { arguments } }
+       │      （execution != "client" 时返回 Ok(None)，留给服务端执行）
        │
-       ├── ResponseItem::CustomToolCall
-       │      └── → ToolCall { tool_name, payload: Custom { input } }
+       ├── ResponseItem::CustomToolCall { name, input, call_id }
+       │      └─ → ToolCall { ToolName::plain(name), call_id,
+       │                      ToolPayload::Custom { input } }
        │
-       └── ResponseItem::ToolSearchCall (execution == "client")
-              └── → ToolCall { tool_name: "tool_search", payload: ToolSearch }
+       └── 其它 ResponseItem → Ok(None)（非工具调用项，跳过）
                         │
                         ▼
 dispatch_tool_call_with_code_mode_result()
        │
        ▼
-ToolRegistry::dispatch_any(invocation)
+ToolRegistry::dispatch_any_with_terminal_outcome(invocation)
        │
-       ├── 查找对应的 handler
-       └── 调用 handler (通过 ToolOrchestrator)
+       ├── 按 tool_name 查找对应 handler
+       └── 经 ToolOrchestrator 编排执行（审批 → 沙箱 → 重试）
 ```
+
+> 注意：**没有 `LocalShellCall` 分支**——shell 命令以普通 `FunctionCall`
+> （`shell` / `unified_exec` 工具）进入，统一走 `Function` 载荷。`ToolPayload`
+> 实际只有 `Function` / `ToolSearch` / `Custom` 三种，不存在 `Mcp` / `LocalShell` 变体。
 
 ### 工具规格过滤逻辑
 
 ```
-specs（完整工具列表）
+ToolRouterParams（构造期输入：mcp_tools / deferred_mcp_tools /
+                  discoverable_tools / dynamic_tools / 扩展执行器）
    │
-   ├─ filter code_mode_only 工具（code mode 嵌套工具不可见）
-   ├─ filter deferred dynamic tools（延迟加载工具不在初始列表中）
-   └── model_visible_specs（发送给模型的工具定义）
+   ├─ 全部工具注册进 registry（「工具名 → 处理器」分派表）
+   ├─ 过滤 code_mode_only 工具（code mode 嵌套工具对模型不可见）
+   ├─ 过滤 deferred 动态工具（延迟加载，不在初始列表）
+   └── model_visible_specs（最终发送给模型的工具定义列表）
 ```
 
 ### ToolCall 结构
@@ -605,11 +629,9 @@ pub struct ToolCall {
 }
 
 pub enum ToolPayload {
-    Function { arguments: String },          // 普通函数工具（JSON 字符串）
-    Mcp { server, tool, raw_arguments },     // MCP 工具调用
-    LocalShell { params: ShellToolCallParams },
-    Custom { input: serde_json::Value },     // 自定义工具
-    ToolSearch { arguments: SearchToolCallParams },
+    Function { arguments: String },                 // 普通函数工具 + MCP 工具（JSON 字符串）
+    ToolSearch { arguments: SearchToolCallParams }, // tool_search 动态工具检索
+    Custom { input: String },                       // 自定义 / Dynamic 工具（自由文本输入）
 }
 ```
 
@@ -617,8 +639,9 @@ pub enum ToolPayload {
 
 ```
 ToolRouter::tool_supports_parallel(call) 决策：
-  ┌─ ToolPayload::Mcp    → 检查 parallel_mcp_server_names（按 server 配置）
-  └─ 其他类型            → 检查 ConfiguredToolSpec::supports_parallel_tool_calls
+  registry.supports_parallel_tool_calls(&call.tool_name).unwrap_or(false)
+  → 完全由该工具在 registry 中登记的元数据决定；
+    未登记（None）时默认 false，即串行执行。
 ```
 
 ---
@@ -685,7 +708,7 @@ ToolOrchestrator::run(tool, req, tool_ctx, turn_ctx, approval_policy)
 │       tool.sandbox_preference(),
 │       windows_sandbox_level,
 │       managed_network_active
-│   ) → SandboxType（Seatbelt / Landlock / None 等）
+│   ) → SandboxType（MacosSeatbelt / LinuxSeccomp / WindowsRestrictedToken / None）
 │
 ├─ [步骤 5] 执行首次尝试 run_attempt()
 │   │
@@ -710,19 +733,17 @@ ToolOrchestrator::run(tool, req, tool_ctx, turn_ctx, approval_policy)
 ### 审批决策树（精简版）
 
 ```
-AskForApproval 策略
+AskForApproval 策略（#[default] = OnRequest）
        │
-       ├── Auto（全自动）
-       │    └── 只读操作: Skip，写操作: Skip（有沙箱保护）
+       ├── UnlessTrusted     仅「受信任的只读」命令自动放行，其余都要审批
        │
-       ├── Unless-All-Files-Are-Untrusted
-       │    └── 视文件系统策略决定
+       ├── OnFailure         先在沙箱里跑，失败才升级问用户【已废弃 DEPRECATED】
        │
-       ├── OnRequest（仅在工具主动请求时审批）
-       │    └── NeedsApproval when tool.wants_approval()
+       ├── OnRequest         #[default]：默认沙箱执行，工具显式请求时才问用户
        │
-       └── Never（永不自动执行写操作）
-            └── 写操作: NeedsApproval
+       ├── Granular(cfg)     细粒度：由 GranularApprovalConfig 的各 bool 分项决定
+       │
+       └── Never             从不询问；失败直接返回错误，绝不升级到无沙箱
 ```
 
 ### 网络策略（Network Approval）
@@ -748,12 +769,14 @@ Deferred 模式:  先执行，完成后异步处理网络策略
 ```
 pub struct RolloutRecorder {
     tx: Sender<RolloutCmd>,              // 向后台写入任务发送命令
-    writer_task: Arc<RolloutWriterTask>, // 后台写入任务的观察状态
+    writer_task: Arc<RolloutWriterTask>, // 后台写入任务的观察句柄（含终止状态）
     pub(crate) rollout_path: PathBuf,   // JSONL 文件路径
-    state_db: Option<StateDbHandle>,    // SQLite 数据库句柄
-    event_persistence_mode: EventPersistenceMode, // 事件持久化级别
 }
 ```
+
+> `state_db` 句柄、事件持久化级别等都收纳在**后台写手的内部状态**
+> （`RolloutWriterState`，见下方异步写入架构），并不挂在 `RolloutRecorder`
+> 结构体上——结构体只保留「发命令的通道 + 写手观察句柄 + 落盘路径」三件套。
 
 ### 内部命令枚举
 
@@ -819,17 +842,16 @@ rollout-2025-01-15T10:30:45.123Z-{uuid}.jsonl
 
 ```
 RolloutRecorderParams
-├── Create {                           // 新建会话
+├── Create {                           // 新建会话（写一行 SessionMeta 头）
 │    conversation_id: ThreadId,
-│    forked_from_id: Option<ThreadId>, // fork 来源
+│    forked_from_id: Option<ThreadId>,    // fork 来源
 │    source: SessionSource,
+│    thread_source: Option<ThreadSource>, // 分析用来源分类
 │    base_instructions: BaseInstructions,
 │    dynamic_tools: Vec<DynamicToolSpec>,
-│    event_persistence_mode,
 │  }
 └── Resume {                           // 从现有文件恢复
-     path: PathBuf,                   // append 模式打开
-     event_persistence_mode,
+     path: PathBuf,                   // append 模式打开，不再写头
    }
 ```
 
@@ -861,8 +883,10 @@ RolloutRecorderParams
 pub struct StateRuntime {
     codex_home: PathBuf,                      // ~/.codex 或配置的 home 目录
     default_provider: String,                 // 默认模型提供方 ID
-    pool: Arc<SqlitePool>,                    // 主状态 DB 连接池（max 5 连接）
-    logs_pool: Arc<SqlitePool>,               // 独立 logs DB 连接池（减少锁竞争）
+    pool: Arc<sqlx::SqlitePool>,              // 主状态 DB 连接池
+    logs_pool: Arc<sqlx::SqlitePool>,         // 独立 logs DB 连接池（减少锁竞争）
+    thread_goals: GoalStore,                  // Goal（目标）存储
+    memories: MemoryStore,                    // AI 记忆存储
     thread_updated_at_millis: Arc<AtomicI64>, // 最近 updated_at 的毫秒时间戳（内存缓存）
 }
 ```
@@ -979,7 +1003,7 @@ logs.sqlite   ──  结构化日志（每 partition 上限 10MB + 1000 行）
 ║  │  session_source: SessionSource                                          │ ║
 ║  │  rollout_path: Option<PathBuf>                                          │ ║
 ║  │  out_of_band_elicitation_count: Mutex<u64>                              │ ║
-║  │  _watch_registration: WatchRegistration                                 │ ║
+║  │  session_configured: SessionConfiguredEvent                             │ ║
 ║  └────────────────────────────────────────────────────────────────────────┘ ║
 ║                         │ submit / next_event / steer_input                 ║
 ║                         ▼                                                   ║
@@ -987,7 +1011,7 @@ logs.sqlite   ──  结构化日志（每 partition 上限 10MB + 1000 行）
 ║  │                   Codex（双向通道层）                                    │ ║
 ║  │                                                                         │ ║
 ║  │  tx_sub ─────────────────────────────────────→  session loop           │ ║
-║  │  Sender<Submission>           Op::UserTurn                              │ ║
+║  │  Sender<Submission>           Op::UserInput                             │ ║
 ║  │                               Op::Interrupt                             │ ║
 ║  │                               Op::Shutdown                              │ ║
 ║  │                                                                         │ ║
@@ -1023,10 +1047,10 @@ logs.sqlite   ──  结构化日志（每 partition 上限 10MB + 1000 行）
 ╔════════════════╗  ╔══════════════════════════╗  ╔════════════════════════╗
 ║  ModelClient   ║  ║       ToolRouter         ║  ║   RolloutRecorder      ║
 ║                ║  ║  registry: ToolRegistry  ║  ║                        ║
-║  new_session() ║  ║  specs: Vec<ToolSpec>    ║  ║  tx: Sender<RolloutCmd>║
-║      │         ║  ║  model_visible_specs     ║  ║  writer_task (独立)    ║
+║  new_session() ║  ║  model_visible_specs:    ║  ║  tx: Sender<RolloutCmd>║
+║      │         ║  ║    Vec<ToolSpec>         ║  ║  writer_task (独立)    ║
 ║      ▼         ║  ║          │               ║  ║  rollout_path: PathBuf ║
-║ ModelClient    ║  ║          ▼               ║  ║  state_db: Option<..>  ║
+║ ModelClient    ║  ║          ▼               ║  ║  (db→写手内部)         ║
 ║ Session        ║  ║  ToolOrchestrator        ║  ╚══════════╪═════════════╝
 ║   │            ║  ║  ┌──────────────────┐   ║             │
 ║   ├─ WS 路径   ║  ║  │ 1. 审批策略检查  │   ║             │
@@ -1049,7 +1073,7 @@ logs.sqlite   ──  结构化日志（每 partition 上限 10MB + 1000 行）
 用户输入消息
       │
       ▼
-CodexThread::submit(Op::UserTurn { input })
+CodexThread::submit(Op::UserInput { items })
       │
       ▼
 Codex::submit(op)

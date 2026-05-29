@@ -99,23 +99,27 @@ Codex 是一个完全用 Rust 实现的 AI 编码 Agent 系统。整个系统可
 `Op` 定义在 `codex-rs/protocol/src/protocol.rs`，是所有用户操作的枚举：
 
 ```
-Op 枚举（关键变体）
+Op 枚举（关键变体，完整定义见 protocol.rs:529）
 │
-├── UserTurn { items, cwd, approval_policy, sandbox_policy, model, ... }
-│      └── items: Vec<UserInput>（Text / LocalImage）
-│          这是最常用的变体，代表用户向 AI 提交一个新的对话回合
+├── UserInput { items, environments, final_output_json_schema,
+│              thread_settings, ... }
+│      └── items: Vec<UserInput>（Text / LocalImage 等）
+│          最常用的变体：一次性把「输入项 + 本回合环境 + 输出 JSON Schema
+│          约束 + 持久化设置覆盖」打包提交。设置覆盖与回合启动复用同一条
+│          提交队列(SQ)，杜绝「设置还没生效就开始回合」的竞态。
+│          （注：旧版本独立的 UserTurn 变体已并入 UserInput）
 │
-├── UserInput { items, environments, ... }
-│      └── 更简单的变体，不携带 TurnContext 覆盖参数
+├── ThreadSettings { thread_settings }
+│      └── 只更新线程级设置、不启动回合（与 UserInput 共用提交队列）
 │
 ├── Interrupt
-│      └── 中断当前正在运行的 Turn
+│      └── 中断当前 Turn，但「不」杀后台终端进程；内核回以 TurnAborted
 │
-├── Shutdown
-│      └── 关闭整个 Session
+├── CleanBackgroundTerminals
+│      └── 终止本线程所有后台 shell 进程
 │
-├── ExecApproval { id, decision }
-│      └── 用户对工具调用审批请求的回应（Approved / Denied）
+├── ExecApproval { id, turn_id, decision }
+│      └── 用户对 shell 命令审批请求的回应（decision: ReviewDecision）
 │
 ├── PatchApproval { id, decision }
 │      └── 用户对 apply_patch 审批请求的回应
@@ -124,13 +128,27 @@ Op 枚举（关键变体）
 │      └── 用户对 request_user_input 工具的回答
 │
 ├── Compact
-│      └── 手动触发上下文压缩
+│      └── 手动触发上下文压缩（生成对话摘要）
 │
-├── Undo
-│      └── 撤销最近一次 Turn
+├── ThreadRollback { num_turns }
+│      └── 从「内存上下文」丢弃最近 N 个用户轮（不碰磁盘，磁盘改动
+│          由客户端自行撤销）——replay-to-rebuild 回滚入口（详见 ch.16）
+│
+├── Review { review_request }
+│      └── 请求 AI 做一次代码评审
+│
+├── RunUserShellCommand { command }
+│      └── 执行用户手动输入的一次性 shell 命令（"!cmd" 触发）
+│
+├── InterAgentCommunication { communication }
+│      └── 多 Agent 间通信，记入 assistant 历史
 │
 └── Shutdown
-       └── 优雅关闭
+       └── 优雅关闭整个 Session
+
+（其余变体：Realtime* 实时语音流、ResolveElicitation（MCP 询问）、
+  RequestPermissionsResponse、DynamicToolResponse、RefreshMcpServers、
+  ReloadUserConfig、SetThreadMemoryMode、ApproveGuardianDeniedAction 等）
 ```
 
 ### 2.2 Event / EventMsg — 事件枚举（Agent → 用户）
@@ -144,9 +162,9 @@ EventMsg 枚举（关键变体，按流程顺序）
 │
 ├── TurnStarted(...)           ← 新 Turn 开始，携带 turn_id / 时间戳 / 上下文窗口大小
 │
-├── AgentReasoningDelta(...)   ← AI 的推理过程（流式，仅在 reasoning 模型中）
+├── ReasoningContentDelta(...) ← AI 的推理过程（流式，仅在 reasoning 模型中）
 │
-├── AgentMessageDelta(...)     ← AI 文字输出（流式增量）
+├── AgentMessageContentDelta(...) ← AI 文字输出（流式增量）
 │
 ├── AgentMessage(...)          ← AI 完整消息（Turn 结束时）
 │
@@ -264,7 +282,7 @@ ThreadManager
 | `Errored(msg)` | Turn 因错误终止 | 否（可被新 Turn 重置） |
 | `Shutdown` | Session 已关闭 | **是** |
 
-> **注意**：`Completed`、`Interrupted`、`Errored` 并非真正的终态——当用户提交新的 `UserTurn` 时，Session 会重新进入 `Running`。只有 `Shutdown` 是不可恢复的真正终态。
+> **注意**：`Completed`、`Interrupted`、`Errored` 并非真正的终态——当用户提交新的 `UserInput` 时，Session 会重新进入 `Running`。只有 `Shutdown` 是不可恢复的真正终态。
 
 ---
 
@@ -412,7 +430,7 @@ exec 模式（`codex-rs/exec/src/lib.rs`）是最简洁的入口，适合理解 
 ```
 用户/前端          Session(主循环)      run_turn()函数     ModelClientSession    OpenAI API
     │                   │                   │                    │                 │
-    │  Op::UserTurn      │                   │                    │                 │
+    │  Op::UserInput     │                   │                    │                 │
     │──────────────────▶│                   │                    │                 │
     │                   │  spawn async task │                    │                 │
     │                   │──────────────────▶│                    │                 │
@@ -456,7 +474,7 @@ exec 模式（`codex-rs/exec/src/lib.rs`）是最简洁的入口，适合理解 
     │                   │    │  2.1 构建 ToolRouter                             │  │
     │                   │    │      built_tools() → ToolRouter                  │  │
     │                   │    │      注册所有可用工具:                            │  │
-    │                   │    │        shell / apply_patch / list_dir / ...      │  │
+    │                   │    │        shell / apply_patch / view_image / ...    │  │
     │                   │    │        + MCP 工具 + Dynamic 工具                │  │
     │                   │    │                                                  │  │
     │                   │    │  2.2 构建 Prompt                                 │  │
@@ -499,7 +517,7 @@ exec 模式（`codex-rs/exec/src/lib.rs`）是最简洁的入口，适合理解 
     │                   │    │  2.5 工具调用处理（见第6节详细流程）              │   │
     │                   │    │  handle_output_item_done()                      │   │
     │                   │    │  → ToolRouter::build_tool_call()                │   │
-    │                   │    │  → ToolCallRuntime::run_tool()                  │   │
+    │                   │    │  → ToolCallRuntime::handle_tool_call()          │   │
     │                   │    │     (异步，放入 FuturesOrdered in_flight)        │   │
     │                   │    └─────────────────────────────────────────────────┘   │
     │                   │                   │                    │                 │
@@ -557,38 +575,38 @@ AI 返回 OutputItemDone(FunctionCall)
             ▼
 ┌─────────────────────────────────┐
 │  ToolRouter::build_tool_call()  │
-│  解析 ResponseItem 类型：        │
+│  ResponseItem → ToolCall：      │
 │                                 │
-│  FunctionCall → ToolPayload::   │
-│    Function / Mcp / LocalShell  │
+│  FunctionCall  → ToolPayload::  │
+│    Function（含 MCP 命名空间）  │
 │                                 │
-│  CustomToolCall → ToolPayload:: │
-│    Custom (Dynamic Tool)        │
+│  ToolSearchCall→ ToolPayload::  │
+│    ToolSearch                   │
 │                                 │
-│  LocalShellCall → ToolPayload:: │
-│    LocalShell                   │
+│  CustomToolCall→ ToolPayload::  │
+│    Custom（Dynamic 动态工具）   │
 └──────────────┬──────────────────┘
                │
                ▼
-┌─────────────────────────────────┐
-│  ToolCallRuntime::run_tool()    │
-│  (放入 FuturesOrdered 并发执行)  │
-│                                 │
-│  发送给对应的 Handler：           │
-│                                 │
-│  工具名         Handler          │
-│  ──────────    ──────────────   │
-│  shell         ShellTool        │
-│  apply_patch   ApplyPatchTool   │
-│  list_dir      LocalTool        │
-│  read_file     LocalTool        │
-│  grep_files    LocalTool        │
-│  web_search    WebSearchTool    │
-│  request_user  RequestUserInput │
-│  plan          PlanTool         │
-│  <mcp:*>       McpTool          │
-│  <dynamic:*>   DynamicTool      │
-└──────────────┬──────────────────┘
+┌──────────────────────────────────────────────────┐
+│  ToolCallRuntime::handle_tool_call()             │
+│  (放入 FuturesOrdered 并发执行)                  │
+│                                                  │
+│  按 ToolName 分派到对应 Handler / Runtime：      │
+│                                                  │
+│  工具名(ToolName)     处理器                     │
+│  ──────────────────  ───────────────────────     │
+│  shell               ShellRuntime                │
+│  unified_exec        UnifiedExecRuntime          │
+│  apply_patch         ApplyPatchHandler           │
+│  update_plan         PlanHandler                 │
+│  view_image          ViewImageHandler            │
+│  request_user_input  RequestUserInputHandler     │
+│  request_permissions RequestPermissionsHandler   │
+│  tool_search         ToolSearchHandler           │
+│  <mcp__*>            McpHandler                  │
+│  <dynamic>           DynamicToolHandler          │
+└──────────────┬───────────────────────────────────┘
                │
                ▼
 ┌─────────────────────────────────────────────────────────────┐
@@ -606,10 +624,10 @@ AI 返回 OutputItemDone(FunctionCall)
 │                                                             │
 │  Step 3: 选择沙箱类型并执行                                  │
 │  sandbox.select_initial(...) → SandboxType                  │
-│  ├── None         (无沙箱)                                   │
-│  ├── Seatbelt     (macOS sandbox-exec)                       │
-│  ├── Landlock     (Linux Landlock)                           │
-│  └── WindowsSandbox (Windows)                               │
+│  ├── None                   (无沙箱)                        │
+│  ├── MacosSeatbelt          (macOS sandbox-exec)            │
+│  ├── LinuxSeccomp           (Linux seccomp + Landlock)      │
+│  └── WindowsRestrictedToken (Windows 受限令牌)              │
 │                                                             │
 │  Step 4: run_attempt() → 执行工具                           │
 │                                                             │
@@ -635,25 +653,26 @@ AI 返回 OutputItemDone(FunctionCall)
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                    Codex 内置工具                              │
+│                  Codex 内置工具（节选）                      │
 │                                                              │
-│  工具名              分类         描述                         │
-│  ──────────────    ────────    ────────────────────────────  │
-│  shell             执行类      执行 shell 命令（核心工具）      │
-│  apply_patch       文件类      用 unified diff 修改文件        │
-│  list_dir          文件类      列出目录内容                    │
-│  read_file         文件类      读取文件内容                    │
-│  grep_files        文件类      在文件中搜索                    │
-│  web_search        网络类      网络搜索                        │
-│  view_image        媒体类      查看图片文件                    │
-│  request_user_input 交互类    弹出提示，等待用户回答           │
-│  request_permissions 权限类   请求额外权限                    │
-│  plan              规划类      AI 生成多步骤执行计划            │
-│  local_shell       执行类      Responses API 原生 shell 工具   │
-│  tool_search       发现类      搜索可用工具（工具发现）          │
+│  工具名              分类    描述                            │
+│  ──────────────────  ────  ────────────────────────────────  │
+│  shell               执行   执行 shell 命令（核心工具）      │
+│  unified_exec        执行   交互式/长驻 shell 会话           │
+│  apply_patch         文件   用 unified diff 修改文件         │
+│  view_image          媒体   把本地图片加入上下文             │
+│  update_plan         规划   维护多步骤执行计划               │
+│  web_search          网络   联网搜索（Responses 托管工具）   │
+│  request_user_input  交互   向用户提问并等待回答             │
+│  request_permissions 权限   运行时请求额外权限               │
+│  tool_search         发现   按需检索 / 加载工具              │
 │                                                              │
-│  + Dynamic Tools   动态注册    运行时注册的自定义工具           │
-│  + MCP Tools       MCP 协议   通过 MCP 协议连接的外部工具      │
+│  + MCP 工具(mcp__*)         经 MCP 协议连接的服务器工具      │
+│  + Dynamic 工具             运行时注册的自定义工具           │
+│  + 多 Agent / Goal / 插件安装 等扩展类工具                   │
+│                                                              │
+│  注：无独立 read_file/list_dir/grep_files 工具——读文件 /     │
+│      列目录 / 搜索均经 shell（cat / ls / grep 等）完成。     │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -727,32 +746,33 @@ AI 发出工具调用请求
 ### 7.1 策略枚举说明
 
 ```
-AskForApproval 枚举
+AskForApproval 枚举（默认 = OnRequest，见 protocol.rs:829）
 │
-├── Never
-│       完全跳过审批（即 --yolo 模式）。
-│       没有任何审批提示，工具调用全部自动通过。
-│       ⚠️ 危险：AI 可以执行任何命令。
+├── UnlessTrusted
+│       只有"已知安全且仅读文件"的命令(is_safe_command)自动通过，
+│       其余一律询问用户。最保守，wire 名 "untrusted"。
 │
-├── OnFailure
-│       先尝试在沙箱中运行。
-│       沙箱拒绝（SandboxErr::Denied）时，询问用户是否允许无沙箱运行。
-│       适合：信任 AI，但希望沙箱作为第一道防线。
+├── OnFailure（已废弃 DEPRECATED）
+│       先在沙箱中运行；沙箱拒绝（SandboxErr::Denied）时再询问
+│       用户是否允许无沙箱重试。官方建议改用 OnRequest / Never。
 │
-├── OnRequest / Granular
-│       当沙箱策略为受限（Restricted）时，询问用户。
-│       当沙箱策略为无限制（Full Access）时，跳过询问。
-│       Granular 还支持细粒度控制每种工具类型的审批行为。
+├── OnRequest（#[default] 默认）
+│       由模型自行决定何时请求审批。实际效果：沙箱策略为受限
+│       （Restricted）时询问用户；无限制（Full Access）时跳过。
 │
-├── UnlessTrusted（默认策略）
-│       总是询问用户，除非：
-│       - 该命令已被用户"记住"（ApprovedForSession）
-│       - ExecPolicy 明确 Allow 该命令
-│       这是最安全的默认配置。
+├── Granular(GranularApprovalConfig)
+│       与 OnRequest 同策略，但用布尔字段细粒度开关各类审批
+│       （sandbox_approval / rules / skill_approval /
+│        request_permissions / mcp_elicitations）；
+│       关闭的类别直接拒绝、不弹给用户。
 │
-└── 注：AskForApproval 中没有 Always 变体；
-    "总是询问"的语义通过 UnlessTrusted 实现，
-    而 ApprovedForSession 的记忆机制让用户不必重复批准相同命令。
+└── Never
+        从不询问；失败立即返回给模型，绝不升级给用户（即 --yolo）。
+        ⚠️ 危险：AI 可执行任何命令。
+
+注：本枚举无 Always 变体；"总是询问"由 UnlessTrusted 表达，
+    而 ReviewDecision::ApprovedForSession 的会话级记忆让用户
+    不必重复批准相同命令。
 ```
 
 ### 7.2 审批策略决策矩阵
@@ -809,24 +829,16 @@ SandboxManager::select_initial()
    kind = Restricted        kind = Unrestricted
           │                      │
           ▼                      ▼
- ┌────────────────────┐  ┌──────────────────┐
- │ 选择平台对应的      │  │  SandboxType::  │
- │ 受限沙箱:          │  │  None           │
- │                    │  │  (无沙箱限制)    │
- │  macOS:            │  └──────────────────┘
- │  SandboxType::     │
- │  Seatbelt          │
- │  (sandbox-exec)    │
- │                    │
- │  Linux:            │
- │  SandboxType::     │
- │  Landlock          │
- │  (内核级访问控制)   │
- │                    │
- │  Windows:          │
- │  SandboxType::     │
- │  WindowsSandbox    │
- └────────────────────┘
+ ┌────────────────────────────────┐  ┌──────────────────┐
+ │ 选择平台对应的受限沙箱:        │  │  SandboxType::   │
+ │   macOS   → MacosSeatbelt      │  │  None            │
+ │             (sandbox-exec)     │  │  (无沙箱限制)    │
+ │   Linux   → LinuxSeccomp       │  └──────────────────┘
+ │             (seccomp+Landlock) │
+ │   Windows → WindowsRestricted- │
+ │             Token (受限令牌)   │
+ │                                │
+ └────────────────────────────────┘
 ```
 
 ### 8.2 沙箱策略（SandboxPolicy）说明
@@ -1159,14 +1171,14 @@ Compaction 开始
    ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │  入口层 (exec / TUI / app-server)                                 │
-│  Op::UserTurn { items: [Text("帮我修复...")], cwd, ... }          │
+│  Op::UserInput { items: [Text("帮我修复...")], ... }              │
 └───────────────────────────┬──────────────────────────────────────┘
                             │  通过 channel 发送
                             ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │  Session 主循环 (spawn_internal 中的 async loop)                  │
 │                                                                  │
-│  收到 Op::UserTurn                                               │
+│  收到 Op::UserInput                                              │
 │  → 创建 TurnContext（携带此次 Turn 的所有配置快照）               │
 │  → spawn run_turn(sess, turn_context, input, ...)                │
 └───────────────────────────┬──────────────────────────────────────┘
@@ -1195,7 +1207,7 @@ Compaction 开始
 │                                                                  │
 │  ResponseEvent::OutputItemDone(FunctionCall)                     │
 │  → ToolRouter::build_tool_call()                                │
-│  → ToolCallRuntime::run_tool() (async, into FuturesOrdered)     │
+│  → ToolCallRuntime::handle_tool_call() (async, FuturesOrdered)  │
 │       ↓                                                          │
 │  ToolOrchestrator::run()                                         │
 │       ① 判断审批需求                                            │

@@ -133,8 +133,8 @@ Codex 是 OpenAI 开源的本地 AI 编码代理（Local AI Coding Agent）。
 │                            持久化层                                           │
 │                    codex-rollout / {recorder, state_db}                     │
 │                                                                             │
-│  RolloutRecorder → JSONL 文件（~/.codex/sessions/<timestamp>-<uuid>.jsonl） │
-│  StateDbHandle   → SQLite 数据库（状态索引、线程元数据）                      │
+│  RolloutRecorder → JSONL（~/.codex/sessions/<Y/M/D>/rollout-<uuid>.jsonl）   │
+│  StateDbHandle   → SQLite（state_5.sqlite：状态索引、线程元数据）            │
 └─────────────────────────────────────────────────────────────────────────────┘
 
                          ══════════════════════
@@ -429,7 +429,7 @@ AI 模型输出 FunctionCall(tool_name, call_id, arguments_json)
               │  选择沙箱类型                    │
               │  ├── SandboxType::MacosSeatbelt  │
               │  ├── SandboxType::LinuxSeccomp   │
-              │  ├── SandboxType::WindowsRestricted│
+              │  ├── SandboxType::WindowsRestrictedToken│
               │  └── SandboxType::None           │
               │  transform(request) → SandboxCommand│
               └──────────────┬──────────────────┘
@@ -842,12 +842,20 @@ NetworkAccess（SandboxPolicy 内嵌）
 
 ```
 ~/.codex/
-├── sessions/
-│   ├── 2024-01-15T10:30:00Z-<uuid>.jsonl    ← 主会话文件
-│   ├── 2024-01-15T11:00:00Z-<uuid>.jsonl
-│   └── archived/                             ← 归档会话
-└── state.db                                  ← SQLite 状态数据库
+├── sessions/                                 ← 会话 rollout 根目录（按日期分层）
+│   └── 2024/01/15/
+│       └── rollout-2024-01-15T10-30-00-<uuid>.jsonl   ← 单次会话转录
+├── archived_sessions/                        ← 归档会话
+├── history.jsonl                             ← 全局消息历史（codex-message-history）
+├── state_5.sqlite                            ← 主状态库（codex-state）
+├── logs_2.sqlite                             ← 日志运行时 DB
+├── goals_1.sqlite                            ← Goal 运行时 DB
+└── memories_1.sqlite                         ← 记忆运行时 DB
 ```
+
+> **路径说明**：rollout 文件位于 `~/.codex/sessions/YYYY/MM/DD/` 日期层级下，
+> 文件名形如 `rollout-<ISO 时间戳>-<uuid>.jsonl`；归档会话在 `~/.codex/archived_sessions/`。
+> SQLite 侧由 `codex-state` 管理 4 个运行时数据库（state/logs/goals/memories）。
 
 #### JSONL 格式（RolloutLine）
 
